@@ -64,11 +64,13 @@ class Qwen3VLTextConfig(PretrainedConfig):
         rope_parameters=None,
         attention_bias=False,
         attention_dropout=0.0,
+        pad_token_id=None,
         **kwargs,
     ):
         if rope_scaling is None and rope_parameters is not None:
             rope_scaling = dict(rope_parameters)
             rope_theta = rope_scaling.pop("rope_theta", rope_theta)
+        self.pad_token_id = pad_token_id
         self.vocab_size = vocab_size
         self.max_position_embeddings = max_position_embeddings
         self.hidden_size = hidden_size

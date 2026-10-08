@@ -650,3 +650,33 @@ user-select: text;
 .toast-wrap .toast-text, .toast-wrap .toast-text *, .gradio-container [role="alert"] * { overflow-wrap: anywhere !important; word-break: break-word !important; }
 .toast-wrap .toast-text, .gradio-container [role="alert"] .toast-text { white-space: pre-wrap !important; }
 .toast-wrap .toast-close, .gradio-container [role="alert"] button { position: sticky !important; top: 0 !important; align-self: flex-start !important; flex: 0 0 auto !important; }
+
+/* Wan2GP Execution Mode Selector & Badges */
+.wangp-execution-mode-row {
+    margin-bottom: 6px !important;
+    display: flex !important;
+    justify-content: center !important;
+}
+.wangp-execution-mode-radio {
+    width: 100% !important;
+    border: none !important;
+    background: transparent !important;
+    box-shadow: none !important;
+    padding: 0 !important;
+}
+.wangp-execution-mode-radio .wrap {
+    display: flex !important;
+    flex-direction: row !important;
+    justify-content: center !important;
+    gap: 16px !important;
+}
+.wangp-badge-cloud {
+    font-size: 0.72em;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: rgba(99, 102, 241, 0.2);
+    color: #818cf8;
+    font-weight: 600;
+    vertical-align: middle;
+    display: inline-block;
+}

@@ -1,0 +1,16 @@
+{
+    "id": "a4b5a6387ba04176bf91da59543f3778",
+    "name": "Default",
+    "gallery": {
+        "file_list": [],
+        "audio_file_list": [],
+        "selected": -1,
+        "audio_selected": -1,
+        "last_selected": true,
+        "audio_last_selected": true,
+        "current_gallery_source": "video",
+        "selected_video_time": null
+    },
+    "last_activity": 1791008440.800941,
+    "archive_protected": false
+}

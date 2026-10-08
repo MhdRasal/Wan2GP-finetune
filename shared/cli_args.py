@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from collections.abc import Sequence
 
@@ -89,7 +90,29 @@ def parse_wgp_args(config_filename: str, argv: Sequence[str] | None = None):
     add("--refresh-full-catalog", action="store_true", help="Refresh local plugin metadata for all catalog plugins")
     add("--merge-catalog", action="store_true", help="Merge plugins_local.json into plugins.json and remove plugins_local.json")
 
+    # Cloud Execution Adapter options
+    add("--mode", type=str, choices=["local", "cloud"], default=None, help="Execution mode: local (local GPU) or cloud (remote worker)")
+    add("--cloud", action="store_true", help="Launch in lightweight cloud client mode (shortcut for --mode cloud)")
+    add("--provider", type=str, choices=["auto", "modal", "runpod", "http", "mock"], default=None, help="Cloud provider for remote execution (modal, runpod, http, mock)")
+    add("--cloud-endpoint", type=str, default="", help="Remote cloud endpoint URL (for http/modal/runpod)")
+    add("--cloud-api-key", type=str, default="", help="API key or token for cloud provider")
+
     args = parser.parse_args(argv)
+
+    # Normalize cloud mode flags
+    if args.cloud or args.mode == "cloud" or os.environ.get("WAN2GP_MODE", "").strip().lower() == "cloud":
+        args.mode = "cloud"
+        os.environ["WAN2GP_MODE"] = "cloud"
+    elif args.mode is None:
+        args.mode = "local"
+
+    if args.provider:
+        os.environ["WAN2GP_CLOUD_PROVIDER"] = args.provider
+    if args.cloud_endpoint:
+        os.environ["WAN2GP_CLOUD_ENDPOINT"] = args.cloud_endpoint
+    if args.cloud_api_key:
+        os.environ["WAN2GP_CLOUD_API_KEY"] = args.cloud_api_key
+
     if args.llm_io:
         from shared.llm_io import configure_llm_io
 

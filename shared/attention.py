@@ -10,8 +10,9 @@ import warnings
 from importlib.metadata import version
 
 _is_mps = sys.platform == 'darwin' and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
+_has_cuda = hasattr(torch, "cuda") and torch.cuda.is_available()
 
-major, minor = (0, 0) if _is_mps else torch.cuda.get_device_capability(None)
+major, minor = (0, 0) if _is_mps or not _has_cuda else torch.cuda.get_device_capability(None)
 bfloat16_supported =  major >= 8
 _MASKED_ATTENTION_SDPA_WARNED = False
 _MISSING = object()

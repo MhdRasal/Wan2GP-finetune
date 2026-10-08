@@ -6,6 +6,11 @@ os.environ.setdefault("TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL", "1")
 p = os.path.dirname(os.path.abspath(__file__))
 if p not in sys.path:
     sys.path.insert(0, p)
+from shared.shims import install_cloud_shims, is_cloud_mode_active
+IS_CLOUD_MODE = is_cloud_mode_active()
+if IS_CLOUD_MODE:
+    install_cloud_shims(force=True)
+    os.environ["WAN2GP_MODE"] = "cloud"
 from shared.native_runtime import preload_preferred_libstdcxx
 preload_preferred_libstdcxx()
 from shared.default_device import set_default_cuda_device_from_arg; set_default_cuda_device_from_arg("gpu")
@@ -116,6 +121,14 @@ from shared.deepy import session_store as deepy_session_store
 from shared import extra_settings
 from shared import config_groups as model_config_groups
 from shared import resolutions as resolution_utils
+from shared.execution import (
+    ExecutionMode,
+    GenerationRequest,
+    ExecutionResult,
+    get_execution_adapter,
+    dispatch_generation,
+    CloudConfigurationError,
+)
 import torch
 import gc
 import traceback
@@ -198,8 +211,6 @@ app = None
 # All media attachment keys for queue save/load
 ATTACHMENT_KEYS = ["image_start", "image_end", "image_refs", "image_guide", "image_mask",
                    "video_guide", "video_guide2", "video_guide3", "video_mask", "video_source", "audio_guide", "audio_guide2", "audio_guide3", "audio_source", "replace_voice_sample", "replace_voice_sample2", "custom_guide"]
-PRESERVE_MEDIA_ON_SETTINGS_IMPORT = True
-
 lock = threading.Lock()
 current_task_id = None
 task_id = 0
@@ -208,23 +219,38 @@ unique_id_lock = threading.Lock()
 offloadobj = enhancer_offloadobj = wan_model = None
 loaded_config = ""
 reload_needed = True
-_HANDLER_MODULES = [
-    "shared.qtypes.scaled_fp8",
-    "shared.qtypes.nvfp4",
-    "shared.qtypes.bnb_nf4",
-    "shared.qtypes.nunchaku_int4",
-    "shared.qtypes.nunchaku_fp4",
-    "shared.qtypes.asym_w4a8_int8",
-    "shared.qtypes.int8_convrot",
-    "shared.qtypes.gguf",
-]
-quant_router.unregister_handler(".fp8_quanto_bridge")
-for handler in _HANDLER_MODULES:
-    quant_router.register_handler(handler)
-from shared.qtypes import gguf as gguf_handler
-quant_router.register_file_extension("gguf", gguf_handler)
-from shared.kernels import int8_backend, kernel_policy
-from shared import attention_kit
+
+if not IS_CLOUD_MODE:
+    from importlib.metadata import version
+    try:
+        mmgp_version = version("mmgp")
+        if mmgp_version != target_mmgp_version:
+            print(f"Incorrect version of mmgp ({mmgp_version}), version {target_mmgp_version} is needed. Please upgrade with the command 'pip install -r requirements.txt'")
+            exit()
+    except Exception:
+        pass
+    _HANDLER_MODULES = [
+        "shared.qtypes.scaled_fp8",
+        "shared.qtypes.nvfp4",
+        "shared.qtypes.bnb_nf4",
+        "shared.qtypes.nunchaku_int4",
+        "shared.qtypes.nunchaku_fp4",
+        "shared.qtypes.asym_w4a8_int8",
+        "shared.qtypes.int8_convrot",
+        "shared.qtypes.gguf",
+    ]
+    quant_router.unregister_handler(".fp8_quanto_bridge")
+    for handler in _HANDLER_MODULES:
+        quant_router.register_handler(handler)
+    from shared.qtypes import gguf as gguf_handler
+    quant_router.register_file_extension("gguf", gguf_handler)
+    from shared.kernels import int8_backend, kernel_policy
+    from shared import attention_kit
+else:
+    import types
+    int8_backend = types.SimpleNamespace(configure=lambda *a, **k: False)
+    kernel_policy = types.SimpleNamespace(configure=lambda *a, **k: False)
+    attention_kit = types.SimpleNamespace(configure=lambda *a, **k: False)
 
 
 def apply_int8_kernel_setting(selection: str, notify_disabled=False, resolved=None) -> bool:
@@ -1626,11 +1652,14 @@ def add_video_task(**inputs):
 
     start_image_data, end_image_data, start_image_labels, end_image_labels = get_preview_images(inputs)
     plugin_data = inputs.pop('plugin_data', {})
+    exec_mode = "cloud" if IS_CLOUD_MODE else (state.get("execution_mode", "local") if isinstance(state, dict) else "local")
+    inputs["execution_mode"] = exec_mode
     
     queue.append({
         "id": current_task_id,
         "params": inputs.copy(),
         "plugin_data": plugin_data,
+        "execution_mode": exec_mode,
         "repeats": inputs.get("repeat_generation",1),
         "length": inputs.get("video_length",0) or 0, 
         "steps": inputs.get("num_inference_steps",0) or 0,
@@ -1778,7 +1807,11 @@ def _save_queue_to_zip(queue, output):
             else:
                 params_copy['base_model_type'] = get_base_model_type(params_copy["model_type"])
 
-            manifest_entry = {"id": task.get('id'), "params": params_copy}
+            manifest_entry = {
+                "id": task.get('id'),
+                "params": params_copy,
+                "execution_mode": task.get('execution_mode', params_copy.get('execution_mode', 'local')),
+            }
             manifest_entry = {k: v for k, v in manifest_entry.items() if v is not None}
             queue_manifest.append(manifest_entry)
 
@@ -2455,7 +2488,9 @@ def generate_queue_html(queue):
         task_id = item['id']
         full_prompt = html.escape(item['prompt'])
         truncated_prompt = (html.escape(item['prompt'][:97]) + '...') if len(item['prompt']) > 100 else full_prompt
-        prompt_cell = f'<div class="prompt-cell" title="{full_prompt}">{truncated_prompt}</div>'
+        exec_mode = str(item.get('execution_mode') or item.get('params', {}).get('execution_mode', 'local')).lower()
+        badge_html = ' <span class="wangp-badge-cloud">Cloud</span>' if "cloud" in exec_mode else ''
+        prompt_cell = f'<div class="prompt-cell" title="{full_prompt}">{truncated_prompt}{badge_html}</div>'
         
         start_img_data = item.get('start_image_data_base64') or [None]
         start_img_uri = start_img_data[0]
@@ -2574,14 +2609,25 @@ override_attention_modes_installed = get_override_attention_modes()
 override_attention_modes_supported = get_supported_override_attention_modes()
 args = parse_wgp_args(CONFIG_FILENAME)
 if args.prevent_power_throttling: prevent_power_throttling()
+if args.mode == "cloud":
+    IS_CLOUD_MODE = True
+    os.environ["WAN2GP_MODE"] = "cloud"
 migrate_loras_layout()
 
-gpu_major, gpu_minor = torch.cuda.get_device_capability(args.gpu if len(args.gpu) > 0 else None)
-if  gpu_major < 8:
-    print("Switching to FP16 models when possible as GPU architecture doesn't support optimed BF16 Kernels")
-    bfloat16_supported = False
-else:
+if IS_CLOUD_MODE or not (hasattr(torch, "cuda") and torch.cuda.is_available()):
+    gpu_major, gpu_minor = (0, 0)
     bfloat16_supported = True
+else:
+    try:
+        gpu_major, gpu_minor = torch.cuda.get_device_capability(args.gpu if len(args.gpu) > 0 else None)
+        if gpu_major < 8:
+            print("Switching to FP16 models when possible as GPU architecture doesn't support optimed BF16 Kernels")
+            bfloat16_supported = False
+        else:
+            bfloat16_supported = True
+    except Exception:
+        gpu_major, gpu_minor = (0, 0)
+        bfloat16_supported = True
 
 args.flow_reverse = True
 processing_device = args.gpu
@@ -8871,8 +8917,17 @@ def _process_tasks(state):
                     if _is_edit_task_params(params):
                         filtered_params.setdefault("model_type", "")
                     plugin_data = task.pop('plugin_data', {})
-                    success = generate_media(task, send_cmd, plugin_data=plugin_data,  **filtered_params)
-                    write_vram_debug_report(save_path, params.get("model_type"))
+                    exec_result = dispatch_generation(
+                        task,
+                        send_cmd,
+                        state=state,
+                        filtered_params=filtered_params,
+                        plugin_data=plugin_data,
+                        local_generator_fn=generate_media,
+                    )
+                    success = exec_result.success
+                    if not IS_CLOUD_MODE:
+                        write_vram_debug_report(save_path, params.get("model_type"))
 
                 except DownloadCancelled:
                     success = True
@@ -9128,8 +9183,16 @@ def process_tasks_cli(queue, state):
                         filtered_params.setdefault("model_type", "")
                     filtered_params.setdefault("client_id", "")
                     plugin_data = task.get('plugin_data', {})
-                    generate_media(task, send_cmd, plugin_data=plugin_data, **filtered_params)
-                    write_vram_debug_report(save_path, params.get("model_type"))
+                    exec_result = dispatch_generation(
+                        task,
+                        send_cmd,
+                        state=state,
+                        filtered_params=filtered_params,
+                        plugin_data=plugin_data,
+                        local_generator_fn=generate_media,
+                    )
+                    if not IS_CLOUD_MODE:
+                        write_vram_debug_report(save_path, params.get("model_type"))
                 except Exception as e:
                     print(f"\n  [ERROR] {e}")
                     traceback.print_exc()
@@ -13081,6 +13144,26 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                 js_trigger_index = gr.Text(visible=False, elem_id="js_trigger_for_edit_refresh")
 
                 with gr.Column(elem_classes=["wangp-settings-actions"] if floating_generate_button else None):
+                    with gr.Row(elem_classes=["wangp-execution-mode-row"]):
+                        if IS_CLOUD_MODE:
+                            execution_mode = gr.Radio(
+                                choices=["Cloud"],
+                                value="Cloud",
+                                label="Execution",
+                                show_label=False,
+                                interactive=True,
+                                elem_classes=["wangp-execution-mode-radio"]
+                            )
+                        else:
+                            initial_exec_mode = "Cloud" if (isinstance(state_dict, dict) and state_dict.get("execution_mode") == "cloud") else "Local GPU"
+                            execution_mode = gr.Radio(
+                                choices=["Local GPU", "Cloud"],
+                                value=initial_exec_mode,
+                                label="Execution",
+                                show_label=False,
+                                interactive=True,
+                                elem_classes=["wangp-execution-mode-radio"]
+                            )
                     generate_btn = gr.Button("Generate")
                     with gr.Column(visible=False, elem_id=f"wangp-{tab_id}-current-actions" if floating_generate_button else None) as current_gen_column:
                         with gr.Row() as current_gen_buttons_row:
@@ -13604,6 +13687,21 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
 
                 model_choice.select(fn=change_model_choice_target, outputs=[model_choice_target], show_progress="hidden", queue=False)
             
+                def update_state_execution_mode(choice, s):
+                    choice_str = str(choice).lower()
+                    mode_val = "cloud" if (IS_CLOUD_MODE or "cloud" in choice_str) else "local"
+                    if isinstance(s, dict):
+                        s["execution_mode"] = mode_val
+                    return choice
+
+                execution_mode.change(
+                    fn=update_state_execution_mode,
+                    inputs=[execution_mode, state],
+                    outputs=[execution_mode],
+                    show_progress="hidden",
+                    queue=False,
+                )
+
                 generate_btn.click(fn = init_generate, inputs = [state, output, last_choice, audio_files_paths, audio_file_selected], outputs=[generate_trigger, mode])
                 add_to_queue_btn.click(fn = lambda : (get_unique_id(), ""), inputs = None, outputs=[add_to_queue_trigger, mode])
                 # gr.on(triggers=[add_to_queue_btn.click, add_to_queue_trigger.change],fn=validate_wizard_prompt, 
