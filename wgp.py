@@ -38,6 +38,24 @@ if is_mps:
     apply_mps_patch()
 from shared.cuda_memory import apply_startup_settings, write_vram_debug_report; apply_startup_settings(sys.argv, "wgp_config.json") # VRAM allocator and CUDA stack reserve, before anything initializes CUDA
 
+# Universal RoPE compatibility shim for transformers (fixes KeyError: 'default')
+try:
+    import transformers.modeling_rope_utils as _rope_utils
+    if hasattr(_rope_utils, "ROPE_INIT_FUNCTIONS") and "default" not in _rope_utils.ROPE_INIT_FUNCTIONS:
+        if hasattr(_rope_utils, "_compute_default_rope_parameters"):
+            _rope_utils.ROPE_INIT_FUNCTIONS["default"] = _rope_utils._compute_default_rope_parameters
+        else:
+            def _default_rope_init(config, device=None, **kwargs):
+                base = getattr(config, "rope_theta", 10000.0)
+                partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
+                head_dim = getattr(config, "head_dim", getattr(config, "hidden_size", 4096) // getattr(config, "num_attention_heads", 32))
+                dim = int(head_dim * partial_rotary_factor)
+                inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).float().to(device) / dim))
+                return inv_freq, 1.0
+            _rope_utils.ROPE_INIT_FUNCTIONS["default"] = _default_rope_init
+except Exception:
+    pass
+
 import time
 import threading
 from functools import partial

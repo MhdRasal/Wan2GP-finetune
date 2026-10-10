@@ -43,6 +43,29 @@ class ModalCloudProvider(BaseCloudProvider):
         self.api_key = api_key or os.environ.get("MODAL_API_KEY") or os.environ.get("WAN2GP_CLOUD_API_KEY", "")
         self.timeout = float(os.environ.get("WAN2GP_CLOUD_TIMEOUT", str(timeout)))
         self.poll_interval = float(poll_interval)
+        self._active_job_id: Optional[str] = None
+
+    def cancel(self, task_id: Optional[Any] = None) -> bool:
+        """Cancel an ongoing generation task on Modal."""
+        target_id = self._active_job_id or (str(task_id) if task_id else "")
+        if not target_id:
+            return False
+        return self._stop_job_http(target_id)
+
+    def _stop_job_http(self, job_id: str) -> bool:
+        if not self.endpoint_url or not job_id:
+            return False
+        try:
+            url = f"{self.endpoint_url}/stop/{job_id}"
+            headers = {"Content-Type": "application/json", "User-Agent": "Wan2GP-Modal/1.0"}
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+                headers["X-API-Key"] = self.api_key
+            req = urllib.request.Request(url, data=b"{}", headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=10.0) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
 
     @property
     def name(self) -> str:
@@ -97,6 +120,7 @@ class ModalCloudProvider(BaseCloudProvider):
         fn_send_cmd: Callable[[str, Any], None],
         start_time: float,
     ) -> ExecutionResult:
+        job_id = None
         try:
             fn_send_cmd("status", f"Modal: Submitting generation request to {self.endpoint_url}...")
             req_dict = request.to_dict()
@@ -119,6 +143,7 @@ class ModalCloudProvider(BaseCloudProvider):
                 resp_data = json.loads(resp.read().decode("utf-8"))
 
             job_id = resp_data.get("job_id") or resp_data.get("id")
+            self._active_job_id = job_id
             status = str(resp_data.get("status", "queued")).lower()
 
             # If already completed or failed synchronously
@@ -207,6 +232,8 @@ class ModalCloudProvider(BaseCloudProvider):
                         )
 
                     if state in ("failed", "error", "stopped"):
+                        # Ensure remote worker is confirmed stopped immediately (true serverless)
+                        self._stop_job_http(job_id)
                         err_msg = s_data.get("error") or f"Job {job_id} {state} on Modal"
                         fn_send_cmd("error", f"Modal generation error: {err_msg}")
                         return ExecutionResult(
@@ -217,6 +244,9 @@ class ModalCloudProvider(BaseCloudProvider):
                             execution_time=time.time() - start_time,
                         )
 
+                # Deadline reached
+                if job_id:
+                    self._stop_job_http(job_id)
                 timeout_msg = f"Modal generation timed out after {self.timeout}s"
                 fn_send_cmd("error", timeout_msg)
                 return ExecutionResult(
@@ -228,6 +258,8 @@ class ModalCloudProvider(BaseCloudProvider):
                 )
 
             err = resp_data.get("error", "Modal execution returned non-success.")
+            if job_id:
+                self._stop_job_http(job_id)
             fn_send_cmd("error", f"Modal generation error: {err}")
             return ExecutionResult(
                 success=False,
@@ -238,13 +270,25 @@ class ModalCloudProvider(BaseCloudProvider):
             )
 
         except urllib.error.URLError as exc:
+            if job_id:
+                self._stop_job_http(job_id)
             err_msg = f"Modal connection error: {exc.reason}"
             fn_send_cmd("error", err_msg)
             return ExecutionResult(success=False, status="failed", task_id=request.task_id, error=err_msg, execution_time=time.time() - start_time)
+        except (KeyboardInterrupt, GeneratorExit):
+            if job_id:
+                self._stop_job_http(job_id)
+            err_msg = "Generation cancelled / disconnected."
+            fn_send_cmd("error", err_msg)
+            return ExecutionResult(success=False, status="failed", task_id=request.task_id, error=err_msg, execution_time=time.time() - start_time)
         except Exception as exc:
+            if job_id:
+                self._stop_job_http(job_id)
             err_msg = f"Modal error: {exc}"
             fn_send_cmd("error", err_msg)
             return ExecutionResult(success=False, status="failed", task_id=request.task_id, error=err_msg, execution_time=time.time() - start_time)
+        finally:
+            self._active_job_id = None
 
     def _execute_sdk(
         self,

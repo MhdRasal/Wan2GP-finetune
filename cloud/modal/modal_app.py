@@ -147,12 +147,44 @@ def apply_source_patches(wgp_dir: Path, log_fn=print):
         except Exception as e:
             log_fn(f"[PATCH-WARN] Failed to patch download_progress.py: {e}")
 
-    # 4. wgp.py: Add torch.accelerator compatibility shim
+    # 0. Restore any altered files in models/ back to pristine upstream git state
+    if (wgp_dir / ".git").exists():
+        try:
+            subprocess.run(["git", "checkout", "--", "models/"], cwd=str(wgp_dir), capture_output=True)
+            log_fn("[PATCH] Restored models/ in Wan2GP git directory to pristine state")
+        except Exception:
+            pass
+
+    # 4. wgp.py: Add torch.accelerator & universal RoPE compatibility shim
     wgp_py = wgp_dir / "wgp.py"
     if wgp_py.exists():
         try:
             wgp_code = wgp_py.read_text(encoding="utf-8")
             shim = (
+                "# --- Torch Accelerator & RoPE Compat Shim ---\n"
+                "import torch\n"
+                "if not hasattr(torch, 'accelerator'):\n"
+                "    class _TorchAccShim:\n"
+                "        @staticmethod\n"
+                "        def is_available(): return False\n"
+                "    torch.accelerator = _TorchAccShim\n"
+                "try:\n"
+                "    import transformers.modeling_rope_utils as _rope_utils\n"
+                "    if hasattr(_rope_utils, 'ROPE_INIT_FUNCTIONS') and 'default' not in _rope_utils.ROPE_INIT_FUNCTIONS:\n"
+                "        def _default_rope_fn(cfg, dev=None, **_kw):\n"
+                "            base = getattr(cfg, 'rope_theta', 10000.0)\n"
+                "            partial_factor = getattr(cfg, 'partial_rotary_factor', 1.0)\n"
+                "            h_dim = getattr(cfg, 'head_dim', getattr(cfg, 'hidden_size', 4096) // getattr(cfg, 'num_attention_heads', 32))\n"
+                "            dim = int(h_dim * partial_factor)\n"
+                "            inv_f = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).float().to(dev) / dim))\n"
+                "            return inv_f, 1.0\n"
+                "        _rope_utils.ROPE_INIT_FUNCTIONS['default'] = getattr(_rope_utils, '_compute_default_rope_parameters', _default_rope_fn)\n"
+                "except Exception:\n"
+                "    pass\n"
+                "# ----------------------------------------------\n"
+            )
+            # Remove legacy shim if present to avoid duplicate headers
+            legacy_shim = (
                 "# --- Torch Accelerator Compat Shim ---\n"
                 "import torch\n"
                 "if not hasattr(torch, 'accelerator'):\n"
@@ -162,9 +194,12 @@ def apply_source_patches(wgp_dir: Path, log_fn=print):
                 "    torch.accelerator = _TorchAccShim\n"
                 "# --------------------------------------\n"
             )
-            if "_TorchAccShim" not in wgp_code:
+            if legacy_shim in wgp_code:
+                wgp_code = wgp_code.replace(legacy_shim, "")
+            
+            if "_default_rope_fn" not in wgp_code:
                 wgp_py.write_text(shim + wgp_code, encoding="utf-8")
-                log_fn("[PATCH] Added torch.accelerator compatibility shim to wgp.py")
+                log_fn("[PATCH] Injected torch.accelerator & RoPE compatibility shim into wgp.py")
         except Exception as e:
             log_fn(f"[PATCH-WARN] Failed to patch wgp.py: {e}")
 
@@ -223,7 +258,38 @@ def apply_source_patches(wgp_dir: Path, log_fn=print):
             except Exception as e:
                 pass
 
-    # 6. sitecustomize.py shim
+    # 6. sitecustomize.py shim (Universal compatibility for PyTorch & Transformers across all models)
+    sitecustomize_code = (
+        "import sys\n"
+        "# 1. Torch Accelerator compat shim\n"
+        "try:\n"
+        "    import torch\n"
+        "    if not hasattr(torch, 'accelerator'):\n"
+        "        class _TorchAccShim:\n"
+        "            @staticmethod\n"
+        "            def is_available(): return False\n"
+        "        torch.accelerator = _TorchAccShim\n"
+        "except Exception:\n"
+        "    pass\n\n"
+        "# 2. Universal RoPE compatibility shim for transformers (fixes KeyError: 'default')\n"
+        "try:\n"
+        "    import transformers.modeling_rope_utils as _rope_utils\n"
+        "    if hasattr(_rope_utils, 'ROPE_INIT_FUNCTIONS') and 'default' not in _rope_utils.ROPE_INIT_FUNCTIONS:\n"
+        "        if hasattr(_rope_utils, '_compute_default_rope_parameters'):\n"
+        "            _rope_utils.ROPE_INIT_FUNCTIONS['default'] = _rope_utils._compute_default_rope_parameters\n"
+        "        else:\n"
+        "            import torch\n"
+        "            def _default_rope_init(config, device=None, **kwargs):\n"
+        "                base = getattr(config, 'rope_theta', 10000.0)\n"
+        "                partial_rotary_factor = getattr(config, 'partial_rotary_factor', 1.0)\n"
+        "                head_dim = getattr(config, 'head_dim', getattr(config, 'hidden_size', 4096) // getattr(config, 'num_attention_heads', 32))\n"
+        "                dim = int(head_dim * partial_rotary_factor)\n"
+        "                inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).float().to(device) / dim))\n"
+        "                return inv_freq, 1.0\n"
+        "            _rope_utils.ROPE_INIT_FUNCTIONS['default'] = _default_rope_init\n"
+        "except Exception:\n"
+        "    pass\n"
+    )
     for site_dir in [
         Path("/usr/local/lib/python3.11/site-packages"),
         Path(MODELS_MOUNT) / "venv/lib/python3.11/site-packages"
@@ -231,15 +297,8 @@ def apply_source_patches(wgp_dir: Path, log_fn=print):
         if site_dir.exists():
             try:
                 sc = site_dir / "sitecustomize.py"
-                sc.write_text(
-                    "import torch\n"
-                    "if not hasattr(torch, 'accelerator'):\n"
-                    "    class _TorchAccShim:\n"
-                    "        @staticmethod\n"
-                    "        def is_available(): return False\n"
-                    "    torch.accelerator = _TorchAccShim\n",
-                    encoding="utf-8"
-                )
+                sc.write_text(sitecustomize_code, encoding="utf-8")
+                log_fn(f"[PATCH] Injected universal sitecustomize.py into {site_dir}")
             except Exception as e:
                 pass
 
@@ -685,24 +744,50 @@ def execute_wan2gp_job(job_id: str, batch_uuid: Optional[str] = None, requested_
             bufsize=1
         )
 
+        stopped_by_user = False
         last_commit_time = time.time()
         with open(log_file, "a") as log:
-            for line in proc.stdout:
-                log.write(line)
-                log.flush()
+            while True:
+                line = proc.stdout.readline()
+                if line:
+                    log.write(line)
+                    log.flush()
+                elif proc.poll() is not None:
+                    break
+
                 now = time.time()
                 if now - last_commit_time >= 2.0:
                     try:
+                        outputs_volume.reload()
+                        if (job_dir / "STOP").exists():
+                            stopped_by_user = True
+                            log.write("\n[STOP] Cancellation requested by client. Terminating Wan2GP worker process...\n")
+                            log.flush()
+                            proc.terminate()
+                            try:
+                                proc.wait(timeout=5)
+                            except subprocess.TimeoutExpired:
+                                proc.kill()
+                            break
                         outputs_volume.commit()
                     except Exception:
                         pass
                     last_commit_time = now
 
-        proc.wait()
         try:
             outputs_volume.commit()
         except Exception:
             pass
+
+        if stopped_by_user:
+            update_status("stopped", error_msg="Job stopped by user")
+            with open(log_file, "a") as log:
+                log.write(f"\n[STOP] Job {job_id} terminated.\n")
+            try:
+                outputs_volume.commit()
+            except Exception:
+                pass
+            return
 
         if proc.returncode != 0:
             raise RuntimeError(f"Wan2GP exited with error code {proc.returncode}")
@@ -765,7 +850,10 @@ def execute_wan2gp_job(job_id: str, batch_uuid: Optional[str] = None, requested_
     image=wan2gp_image,
     gpu="H100",
     volumes={OUTPUTS_MOUNT: outputs_volume, MODELS_MOUNT: models_volume, CACHE_MOUNT: cache_volume},
-    timeout=3600
+    timeout=3600,
+    single_use_containers=True,
+    scaledown_window=2,
+    retries=0
 )
 def run_worker_h100(job_id: str, batch_uuid: Optional[str] = None):
     execute_wan2gp_job(job_id, batch_uuid, requested_gpu="H100")
@@ -774,7 +862,10 @@ def run_worker_h100(job_id: str, batch_uuid: Optional[str] = None):
     image=wan2gp_image,
     gpu="A100-80GB",
     volumes={OUTPUTS_MOUNT: outputs_volume, MODELS_MOUNT: models_volume, CACHE_MOUNT: cache_volume},
-    timeout=3600
+    timeout=3600,
+    single_use_containers=True,
+    scaledown_window=2,
+    retries=0
 )
 def run_worker_a100_80gb(job_id: str, batch_uuid: Optional[str] = None):
     execute_wan2gp_job(job_id, batch_uuid, requested_gpu="A100-80GB")
@@ -783,7 +874,10 @@ def run_worker_a100_80gb(job_id: str, batch_uuid: Optional[str] = None):
     image=wan2gp_image,
     gpu="A100-40GB",
     volumes={OUTPUTS_MOUNT: outputs_volume, MODELS_MOUNT: models_volume, CACHE_MOUNT: cache_volume},
-    timeout=3600
+    timeout=3600,
+    single_use_containers=True,
+    scaledown_window=2,
+    retries=0
 )
 def run_worker_a100_40gb(job_id: str, batch_uuid: Optional[str] = None):
     execute_wan2gp_job(job_id, batch_uuid, requested_gpu="A100-40GB")
@@ -792,7 +886,10 @@ def run_worker_a100_40gb(job_id: str, batch_uuid: Optional[str] = None):
     image=wan2gp_image,
     gpu="L40S",
     volumes={OUTPUTS_MOUNT: outputs_volume, MODELS_MOUNT: models_volume, CACHE_MOUNT: cache_volume},
-    timeout=3600
+    timeout=3600,
+    single_use_containers=True,
+    scaledown_window=2,
+    retries=0
 )
 def run_worker_l40s(job_id: str, batch_uuid: Optional[str] = None):
     execute_wan2gp_job(job_id, batch_uuid, requested_gpu="L40S")
@@ -801,7 +898,10 @@ def run_worker_l40s(job_id: str, batch_uuid: Optional[str] = None):
     image=wan2gp_image,
     gpu="L4",
     volumes={OUTPUTS_MOUNT: outputs_volume, MODELS_MOUNT: models_volume, CACHE_MOUNT: cache_volume},
-    timeout=3600
+    timeout=3600,
+    single_use_containers=True,
+    scaledown_window=2,
+    retries=0
 )
 def run_worker_l4(job_id: str, batch_uuid: Optional[str] = None):
     execute_wan2gp_job(job_id, batch_uuid, requested_gpu="L4")
@@ -810,7 +910,10 @@ def run_worker_l4(job_id: str, batch_uuid: Optional[str] = None):
     image=wan2gp_image,
     gpu="T4",
     volumes={OUTPUTS_MOUNT: outputs_volume, MODELS_MOUNT: models_volume, CACHE_MOUNT: cache_volume},
-    timeout=3600
+    timeout=3600,
+    single_use_containers=True,
+    scaledown_window=2,
+    retries=0
 )
 def run_worker_t4(job_id: str, batch_uuid: Optional[str] = None):
     execute_wan2gp_job(job_id, batch_uuid, requested_gpu="T4")
@@ -1109,13 +1212,20 @@ def stop_endpoint(job_id: str, x_api_key: Optional[str] = Header(None)):
 
     job_dir = Path(OUTPUTS_MOUNT) / job_id
     if not job_dir.exists():
-        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+        job_dir.mkdir(parents=True, exist_ok=True)
 
     status_file = job_dir / "status.json"
-    st = {"status": "stopped", "job_id": job_id}
+    st = {"status": "stopped", "job_id": job_id, "error": "Stopped by client"}
     with open(status_file, "w") as f:
         json.dump(st, f, indent=2)
-    outputs_volume.commit()
+
+    stop_file = job_dir / "STOP"
+    stop_file.touch()
+
+    try:
+        outputs_volume.commit()
+    except Exception:
+        pass
 
     return {"job_id": job_id, "status": "stopped"}
 
@@ -1130,7 +1240,8 @@ web_image = modal.Image.debian_slim(python_version="3.11").pip_install(
 
 @app.function(
     image=web_image,
-    volumes={OUTPUTS_MOUNT: outputs_volume}
+    volumes={OUTPUTS_MOUNT: outputs_volume},
+    scaledown_window=10
 )
 @modal.asgi_app()
 def fastapi_app():

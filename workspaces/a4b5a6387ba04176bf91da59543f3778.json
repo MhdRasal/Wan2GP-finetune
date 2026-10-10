@@ -8,7 +8,7 @@
         "audio_selected": -1,
         "last_selected": true,
         "audio_last_selected": true,
-        "current_gallery_source": "video",
+        "current_gallery_source": "audio",
         "selected_video_time": null
     },
     "last_activity": 1791008440.800941,
