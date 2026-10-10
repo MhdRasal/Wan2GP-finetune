@@ -8944,6 +8944,36 @@ def _process_tasks(state):
                         local_generator_fn=generate_media,
                     )
                     success = exec_result.success
+
+                    # If cloud execution produced downloaded files, register them in gallery and metadata
+                    if success and exec_result.output_files and task.get("execution_mode") == "cloud":
+                        for out_f in exec_result.output_files:
+                            if not os.path.exists(out_f) or out_f.endswith(".json") or out_f.endswith(".log"):
+                                continue
+                            try:
+                                is_img = out_f.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
+                                is_aud = out_f.lower().endswith((".wav", ".mp3", ".flac", ".ogg", ".aac"))
+                                media_configs = prepare_inputs_dict("metadata", params, params.get("model_type", ""))
+                                media_configs["generation_time"] = round(exec_result.execution_time or 0)
+                                media_configs["creation_date"] = datetime.now().isoformat(timespec="seconds")
+                                media_configs["creation_timestamp"] = int(time.time())
+                                media_configs["provider"] = "modal"
+                                record_file_metadata(
+                                    out_f,
+                                    media_configs,
+                                    is_img,
+                                    is_aud,
+                                    gen,
+                                    notify_generation=True,
+                                    write_metadata=True,
+                                    record_notification=True,
+                                )
+                            except Exception as reg_err:
+                                print(f"[Cloud] Warning registering gallery metadata for {out_f}: {reg_err}")
+
+                        # Trigger gallery UI refresh to show new media
+                        send_cmd("output", exec_result.output_files[0])
+
                     if not IS_CLOUD_MODE:
                         write_vram_debug_report(save_path, params.get("model_type"))
 

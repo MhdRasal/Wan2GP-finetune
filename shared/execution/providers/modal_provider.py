@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 import time
 import urllib.error
 import urllib.parse
@@ -202,7 +203,18 @@ class ModalCloudProvider(BaseCloudProvider):
                     if state == "completed":
                         fn_send_cmd("status", "Modal: Cloud generation completed. Downloading output files...")
                         output_files = s_data.get("files", [])
-                        out_dir = Path("outputs")
+                        if not output_files:
+                            try:
+                                dl_list_url = f"{self.endpoint_url}/download/{job_id}"
+                                dl_list_req = urllib.request.Request(dl_list_url, headers=headers, method="GET")
+                                with urllib.request.urlopen(dl_list_req, timeout=15.0) as dl_list_resp:
+                                    dl_list_data = json.loads(dl_list_resp.read().decode("utf-8"))
+                                    output_files = dl_list_data.get("files", [])
+                            except Exception:
+                                pass
+
+                        save_dir_setting = os.environ.get("WAN2GP_OUTPUT_DIR") or (request.settings.get("save_path") if hasattr(request, "settings") and isinstance(request.settings, dict) else None) or "outputs"
+                        out_dir = Path(save_dir_setting)
                         out_dir.mkdir(parents=True, exist_ok=True)
                         downloaded_paths = []
 
@@ -213,10 +225,10 @@ class ModalCloudProvider(BaseCloudProvider):
                             dl_url = f"{self.endpoint_url}/download/{job_id}/{urllib.parse.quote(fname)}"
                             dl_req = urllib.request.Request(dl_url, headers=headers, method="GET")
                             try:
-                                with urllib.request.urlopen(dl_req, timeout=60.0) as dl_resp:
+                                with urllib.request.urlopen(dl_req, timeout=120.0) as dl_resp:
                                     with open(dest_file, "wb") as f_out:
                                         f_out.write(dl_resp.read())
-                                downloaded_paths.append(str(dest_file))
+                                downloaded_paths.append(str(dest_file.resolve()))
                             except Exception as dl_err:
                                 fn_send_cmd("status", f"Modal: Warning downloading {fname}: {dl_err}")
 
