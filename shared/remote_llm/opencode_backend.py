@@ -116,7 +116,13 @@ class OpenCodeBackend:
                 return
             except RuntimeError:
                 continue
-        raise RuntimeError("OpenCode server did not become ready.")
+        err = RuntimeError(
+            f"OpenCode server is not running and could not be started at {self.base_url}.\n"
+            "To use OpenCode with Deepy, start it in terminal: 'opencode serve --port 4096' or configure a valid model in ~/.config/opencode/opencode.jsonc.\n"
+            "Or switch Deepy to another provider in Wan2GP settings."
+        )
+        setattr(err, "user_action_required", True)
+        raise err
 
     def list_models(self) -> list[dict[str, Any]]:
         self._ensure_server()

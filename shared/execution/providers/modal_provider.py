@@ -191,10 +191,29 @@ class ModalCloudProvider(BaseCloudProvider):
                                 new_logs = logs_text[last_log_len:].strip()
                                 last_log_len = len(logs_text)
                                 if new_logs:
+                                    import re
                                     for line in new_logs.splitlines():
                                         clean_l = line.strip()
                                         if clean_l:
                                             print(f"[Modal] {clean_l}", flush=True)
+                                            # Match Wan2GP phase progress like "[3/8] Denoising First Phase | 29.7s"
+                                            # or "[12/27] VAE Decoding | 1m 37s"
+                                            m_prog = re.search(r"\[(\d+)/(\d+)\]\s+([^|\n]+)", clean_l)
+                                            if m_prog:
+                                                curr_step = int(m_prog.group(1))
+                                                total_steps = int(m_prog.group(2))
+                                                phase_name = m_prog.group(3).strip()
+                                                if total_steps > 0:
+                                                    fn_send_cmd("progress", [(curr_step, total_steps), f"Cloud GPU: {phase_name}", total_steps])
+                                            else:
+                                                # Match percentage progress like "38%|███▊      | 3/8"
+                                                m_pct = re.search(r"(\d+)%\|.*\|\s*(\d+)/(\d+)", clean_l)
+                                                if m_pct:
+                                                    curr_step = int(m_pct.group(2))
+                                                    total_steps = int(m_pct.group(3))
+                                                    if total_steps > 0:
+                                                        fn_send_cmd("progress", [(curr_step, total_steps), f"Cloud GPU: Denoising ({m_pct.group(1)}%)", total_steps])
+
                                     last_line = new_logs.splitlines()[-1]
                                     fn_send_cmd("status", f"Modal GPU: {last_line[:120]}")
                     except Exception:
@@ -232,15 +251,43 @@ class ModalCloudProvider(BaseCloudProvider):
                             except Exception as dl_err:
                                 fn_send_cmd("status", f"Modal: Warning downloading {fname}: {dl_err}")
 
-                        fn_send_cmd("status", f"Modal: Outputs successfully downloaded to {out_dir}")
+                        total_exec_time = time.time() - start_time
+                        gpu_chosen = str(resp_data.get("gpu_selected", "L40S")).upper()
+                        # Modal pricing per hour (USD)
+                        modal_rates = {
+                            "T4": 0.59,
+                            "L4": 0.80,
+                            "L40S": 1.95,
+                            "A100_40GB": 2.10,
+                            "A100_80GB": 2.80,
+                            "H100": 4.50,
+                        }
+                        rate_key = "L40S"
+                        for k in modal_rates:
+                            if k in gpu_chosen.replace("-", "_"):
+                                rate_key = k
+                                break
+                        hourly_rate = modal_rates.get(rate_key, 1.95)
+                        cost_usd = (total_exec_time / 3600.0) * hourly_rate
+
+                        cost_summary = f"${cost_usd:.3f} USD ({rate_key} @ ${hourly_rate:.2f}/hr, {int(total_exec_time)}s)"
+                        print(f"[Modal Cost] {cost_summary}", flush=True)
+                        fn_send_cmd("status", f"Modal: Done in {int(total_exec_time)}s on {rate_key} | Estimated Cost: ${cost_usd:.3f}")
                         fn_send_cmd("output", downloaded_paths[0] if downloaded_paths else None)
                         return ExecutionResult(
                             success=True,
                             status="completed",
                             task_id=request.task_id or job_id,
                             output_files=downloaded_paths,
-                            metadata={"provider": "modal", "endpoint": self.endpoint_url, "job_id": job_id},
-                            execution_time=time.time() - start_time,
+                            metadata={
+                                "provider": "modal",
+                                "endpoint": self.endpoint_url,
+                                "job_id": job_id,
+                                "gpu": rate_key,
+                                "cost_usd": round(cost_usd, 4),
+                                "hourly_rate": hourly_rate
+                            },
+                            execution_time=total_exec_time,
                         )
 
                     if state in ("failed", "error", "stopped"):
