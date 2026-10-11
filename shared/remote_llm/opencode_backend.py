@@ -236,7 +236,6 @@ class OpenCodeBackend:
         body: dict[str, Any] = {
             "parts": [{"type": "text", "text": str(text or "")}],
             "system": "\n\n".join(part for part in (str(system_prompt or "").strip(), OPENCODE_PROGRESS_INSTRUCTIONS) if part),
-            "tools": {name: False for name in ("bash", "shell", "read", "write", "edit", "patch", "glob", "grep", "list", "webfetch", "websearch", "task")},
         }
         if llm_io_enabled():
             log_llm_io("OUT", self.engine, "turn-context", {"system_prompt": system_prompt, "user_text": str(text or ""), "images": [media_descriptor(path) for path in images], "tools": list(tools), "model": self._model() or "Automatic"})
@@ -382,6 +381,12 @@ class OpenCodeBackend:
         if error_box and not self._abort:
             self._call_tool = None
             raise error_box[0]
+        info_err = result_box.get("info", {}).get("error") if isinstance(result_box, dict) else None
+        if info_err and not self._abort:
+            self._call_tool = None
+            err_data = info_err.get("data", {}) if isinstance(info_err, dict) else {}
+            msg = err_data.get("message") or info_err.get("message") or str(info_err)
+            raise RuntimeError(f"OpenCode API error: {msg}")
         answer = self._answer_text(result_box)
         final_parts = [part for part in result_box.get("parts", []) if isinstance(part, dict) and part.get("type") == "text"]
         if final_parts:
