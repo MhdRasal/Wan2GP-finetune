@@ -192,7 +192,8 @@ class OpenCodeBackend:
                 raise
 
     def _model(self) -> dict[str, str] | None:
-        provider, model = str(self.profile.get("provider", "") or "").strip(), str(self.profile.get("model", "") or "").strip()
+        provider = str(self.profile.get("provider", "") or os.environ.get("OPENCODE_PROVIDER", "opencode")).strip()
+        model = str(self.profile.get("model", "") or os.environ.get("OPENCODE_MODEL", "")).strip()
         return {"providerID": provider, "modelID": model} if provider and model else None
 
     def _context_window(self, info: dict[str, Any] | None = None) -> int:
