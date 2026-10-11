@@ -10,6 +10,12 @@ cd "$SCRIPT_DIR"
 
 export PATH="$HOME/.local/bin:$PATH"
 
+if [ -f ".env" ]; then
+    set -a
+    source ".env"
+    set +a
+fi
+
 echo "============================================================"
 echo "          Starting Wan2GP in Cloud Mode (Modal GPU)         "
 echo "============================================================"

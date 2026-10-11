@@ -52,7 +52,13 @@ class OpenCodeBackend:
 
     def __init__(self, profile: dict[str, Any], toolbox: Any | None = None) -> None:
         self.profile = dict(profile or {})
-        self.base_url = str(self.profile.get("base_url", "http://127.0.0.1:4096") or "").rstrip("/")
+        base_url = (
+            self.profile.get("base_url")
+            or os.environ.get("OPENCODE_SERVER_URL")
+            or os.environ.get("OPENCODE_URL")
+            or "http://127.0.0.1:4096"
+        )
+        self.base_url = str(base_url).rstrip("/")
         self.toolbox = toolbox
         self._process: subprocess.Popen[str] | None = None
         self._session_id = ""
@@ -61,10 +67,16 @@ class OpenCodeBackend:
         self._call_tool: ToolCallback | None = None
         self._model_catalog = list(self.profile.get("model_catalog", []) or [])
 
-    @staticmethod
-    def _auth():
-        password = os.environ.get("OPENCODE_SERVER_PASSWORD", "")
-        return (os.environ.get("OPENCODE_SERVER_USERNAME", "opencode"), password) if password else None
+    def _auth(self):
+        password = (
+            str(self.profile.get("password") or self.profile.get("server_password") or "")
+            or os.environ.get("OPENCODE_SERVER_PASSWORD", "")
+        )
+        username = (
+            str(self.profile.get("username") or self.profile.get("server_username") or "")
+            or os.environ.get("OPENCODE_SERVER_USERNAME", "opencode")
+        )
+        return (username, password) if password else None
 
     def _request(self, method: str, path: str, **kwargs):
         request_payload = {"method": method, "path": path}
@@ -117,8 +129,9 @@ class OpenCodeBackend:
             except RuntimeError:
                 continue
         err = RuntimeError(
-            f"OpenCode server is not running and could not be started at {self.base_url}.\n"
-            "To use OpenCode with Deepy, start it in terminal: 'opencode serve --port 4096' or configure a valid model in ~/.config/opencode/opencode.jsonc.\n"
+            f"OpenCode server is not running and could not be reached at {self.base_url}.\n"
+            f"If your server is running with password protection, verify OPENCODE_SERVER_PASSWORD in .env.\n"
+            f"To start OpenCode manually: 'opencode serve --port {parsed.port or 5000}'\n"
             "Or switch Deepy to another provider in Wan2GP settings."
         )
         setattr(err, "user_action_required", True)
