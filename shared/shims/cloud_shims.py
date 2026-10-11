@@ -119,6 +119,10 @@ class KarrasDiffusionSchedulers(Enum):
 class MockModule(types.ModuleType):
     """Dynamic mock module that safely creates missing attributes and submodules."""
     def __getattr__(self, name: str) -> Any:
+        if name == "__file__":
+            return f"/mock/{self.__name__.replace('.', '/')}.py"
+        if name == "__path__":
+            return []
         if name.startswith("__"):
             raise AttributeError(name)
         if name == "AutoConfig":
@@ -134,6 +138,7 @@ class MockModule(types.ModuleType):
             setattr(self, name, cls)
             return cls
         val = MockModule(f"{self.__name__}.{name}")
+        val.__file__ = f"/mock/{self.__name__.replace('.', '/')}/{name}.py"
         setattr(self, name, val)
         return val
 
@@ -149,6 +154,7 @@ class MockLoader(Loader):
     def create_module(self, spec: ModuleSpec) -> types.ModuleType:
         mod = MockModule(spec.name)
         mod.__path__ = []
+        mod.__file__ = f"/mock/{spec.name.replace('.', '/')}.py"
         mod.ConfigMixin = ConfigMixin
         mod.SchedulerMixin = SchedulerMixin
         mod.KarrasDiffusionSchedulers = KarrasDiffusionSchedulers
@@ -534,16 +540,22 @@ def _create_mock_mmgp() -> types.ModuleType:
             }
             return mapping.get(int(v) if isinstance(v, (int, float)) else 4, "LowRAM_LowVRAM")
 
+    mmgp_mod.__file__ = "/mock/mmgp/__init__.py"
+    mmgp_mod.__path__ = []
+
     p_type = ProfileType
     mmgp_mod.profile_type = p_type
 
     # offload
     offload_mod = types.ModuleType("mmgp.offload")
+    offload_mod.__file__ = "/mock/mmgp/offload.py"
+    offload_mod.__path__ = []
     offload_mod.PROFILE_DEFAULT = "default"
     offload_mod.PROFILE_FAST = "fast"
     offload_mod.PROFILE_OFF = "off"
     offload_mod.profile_type = p_type
     offload_mod.qtypes = {}
+    offload_mod.shared_state = {}
     offload_mod.QEmbedding = type("QEmbedding", (), {})
     offload_mod.QLinear = type("QLinear", (), {})
     offload_mod.QConv2d = type("QConv2d", (), {})
@@ -552,23 +564,47 @@ def _create_mock_mmgp() -> types.ModuleType:
     offload_mod.is_main_process = lambda: True
     offload_mod.get_cache = lambda *a, **k: None
     offload_mod.clear_caches = lambda *a, **k: None
-    offload_mod.__getattr__ = lambda name: (lambda *a, **k: None)
+    def _safe_offload_getattr(name: str):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return lambda *a, **k: None
+    offload_mod.__getattr__ = _safe_offload_getattr
     mmgp_mod.offload = offload_mod
 
     # safetensors2
     st2_mod = types.ModuleType("mmgp.safetensors2")
-    st2_mod.safe_open = lambda *a, **k: None
+    st2_mod.__file__ = "/mock/mmgp/safetensors2.py"
+    st2_mod.__path__ = []
+    st2_mod.safe_open = lambda *a, **k: _DummyContextManager()
     mmgp_mod.safetensors2 = st2_mod
 
     # quant_router
     qr_mod = types.ModuleType("mmgp.quant_router")
+    qr_mod.__file__ = "/mock/mmgp/quant_router.py"
+    qr_mod.__path__ = []
     qr_mod.unregister_handler = lambda *a, **k: None
     qr_mod.register_handler = lambda *a, **k: None
     qr_mod.register_file_extension = lambda *a, **k: None
     qr_mod.get_quantization_tokens = lambda *a, **k: []
     qr_mod.get_handler = lambda *a, **k: None
     qr_mod.get_handlers = lambda *a, **k: []
-    qr_mod.__getattr__ = lambda name: (lambda *a, **k: [] if "token" in name or "list" in name else None)
+    qr_mod.detect_quantization_label_from_filename = lambda *a, **k: ""
+    qr_mod.get_quantization_label = lambda *a, **k: ""
+    qr_mod.detect_quantization_kind_for_file = lambda *a, **k: ""
+    qr_mod.get_cached_quantization_for_file = lambda *a, **k: None
+    qr_mod.cache_quantization_for_file = lambda *a, **k: None
+    qr_mod.detect_and_convert = lambda *a, **k: None
+    qr_mod.get_available_qtype_aliases = lambda *a, **k: []
+    qr_mod.get_available_qtypes = lambda *a, **k: []
+    def _safe_qr_getattr(name: str):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        if "token" in name or "list" in name or "aliases" in name or "types" in name or "handlers" in name:
+            return lambda *a, **k: []
+        if "label" in name or "kind" in name:
+            return lambda *a, **k: ""
+        return lambda *a, **k: None
+    qr_mod.__getattr__ = _safe_qr_getattr
     mmgp_mod.quant_router = qr_mod
 
     return mmgp_mod
@@ -635,15 +671,78 @@ def install_cloud_shims(force: bool = False) -> bool:
             sys.modules["torch.utils._device"] = torch_mock.utils._device
             sys.modules["torch.overrides"] = torch_mock.overrides
 
+    # 2b. Shield real torch.cuda so local client never crashes on CUDA calls in cloud mode
+    try:
+        import torch
+        if hasattr(torch, "cuda"):
+            _orig_get_device_capability = getattr(torch.cuda, "get_device_capability", None)
+            def _safe_get_device_capability(device=None):
+                if hasattr(torch.cuda, "is_available") and torch.cuda.is_available():
+                    try:
+                        return _orig_get_device_capability(device)
+                    except Exception:
+                        pass
+                return (8, 0)
+            torch.cuda.get_device_capability = _safe_get_device_capability
+
+            _orig_current_device = getattr(torch.cuda, "current_device", None)
+            def _safe_current_device():
+                if hasattr(torch.cuda, "is_available") and torch.cuda.is_available():
+                    try:
+                        return _orig_current_device()
+                    except Exception:
+                        pass
+                return 0
+            torch.cuda.current_device = _safe_current_device
+
+            class _CloudDummyDeviceProperties:
+                total_memory = 24 * (1024 ** 3)
+                multi_processor_count = 80
+                major = 8
+                minor = 0
+                name = "Cloud GPU Client"
+                L2_cache_size = 32 * 1024 * 1024
+
+            _orig_get_device_properties = getattr(torch.cuda, "get_device_properties", None)
+            def _safe_get_device_properties(device=None):
+                if hasattr(torch.cuda, "is_available") and torch.cuda.is_available():
+                    try:
+                        return _orig_get_device_properties(device)
+                    except Exception:
+                        pass
+                return _CloudDummyDeviceProperties()
+            torch.cuda.get_device_properties = _safe_get_device_properties
+            torch.cuda.get_device_name = lambda device=None: "Cloud GPU Client"
+            torch.cuda.empty_cache = lambda: None
+            torch.cuda.ipc_collect = lambda: None
+            torch.cuda.synchronize = lambda *a, **k: None
+            torch.cuda.set_device = lambda *a, **k: None
+            torch.cuda.memory_allocated = lambda *a, **k: 0
+            torch.cuda.memory_reserved = lambda *a, **k: 0
+            torch.cuda.max_memory_allocated = lambda *a, **k: 0
+    except Exception:
+        pass
+
     # Safetensors torch shim
     try:
         import safetensors
-        st_torch = types.ModuleType("safetensors.torch")
-        st_torch.load_file = lambda *a, **k: {}
-        st_torch.save_file = lambda *a, **k: None
-        st_torch.safe_open = lambda *a, **k: _DummyContextManager()
-        safetensors.torch = st_torch
-        sys.modules["safetensors.torch"] = st_torch
+        try:
+            import safetensors.torch as st_torch
+            if not hasattr(st_torch, "load_model"):
+                st_torch.load_model = lambda *a, **k: None
+            if not hasattr(st_torch, "save_model"):
+                st_torch.save_model = lambda *a, **k: None
+        except Exception:
+            st_torch = types.ModuleType("safetensors.torch")
+            st_torch.__file__ = "/mock/safetensors/torch.py"
+            st_torch.__path__ = []
+            st_torch.load_file = lambda *a, **k: {}
+            st_torch.save_file = lambda *a, **k: None
+            st_torch.load_model = lambda *a, **k: None
+            st_torch.save_model = lambda *a, **k: None
+            st_torch.safe_open = lambda *a, **k: _DummyContextManager()
+            safetensors.torch = st_torch
+            sys.modules["safetensors.torch"] = st_torch
         if not hasattr(safetensors, "safe_open"):
             safetensors.safe_open = lambda *a, **k: _DummyContextManager()
     except Exception:
@@ -655,5 +754,4 @@ def install_cloud_shims(force: bool = False) -> bool:
     sys.modules["mmgp.offload"] = mmgp_mock.offload
     sys.modules["mmgp.safetensors2"] = mmgp_mock.safetensors2
     sys.modules["mmgp.quant_router"] = mmgp_mock.quant_router
-
     return True

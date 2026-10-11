@@ -257,7 +257,7 @@ def get_attention_modes():
 
 def get_supported_attention_modes():
     # MPS compatibility: only SDPA is supported on Apple Silicon
-    if _is_mps:
+    if _is_mps or not _has_cuda:
         return ["sdpa", "auto"]
     ret = get_attention_modes()
     major, minor = torch.cuda.get_device_capability()

@@ -39,4 +39,9 @@ fi
 
 # Launch Wan2GP in Cloud Client Mode
 echo "[*] Launching Wan2GP Web UI..."
-"$PY_BIN" wgp.py --cloud --provider modal --open-browser "$@"
+BROWSER_FLAG="--open-browser"
+if [ -z "$DISPLAY" ] && [ -z "$WAYLAND_DISPLAY" ]; then
+    BROWSER_FLAG="--listen"
+fi
+
+"$PY_BIN" wgp.py --cloud --provider modal $BROWSER_FLAG "$@"

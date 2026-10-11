@@ -4375,7 +4375,8 @@ def generate_header(model_type, compile, attention_mode, override_attention=""):
     else:
         header += ", Data Type <B>BF16</B>"
 
-    quant_label = quant_router.detect_quantization_label_from_filename(fl.get_local_model_filename(full_filename))
+    detect_fn = getattr(quant_router, "detect_quantization_label_from_filename", None)
+    quant_label = detect_fn(fl.get_local_model_filename(full_filename)) if callable(detect_fn) else ""
     if quant_label:
         header += f", Quantization <B>{quant_label}</B>"
     header += "</DIV>"
