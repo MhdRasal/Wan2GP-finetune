@@ -15,6 +15,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable, Dict, Optional
 
+from shared.execution.packaging import package_generation_request_to_zip
 from shared.execution.providers.base import BaseCloudProvider
 from shared.execution.types import ExecutionResult, GenerationRequest
 
@@ -123,23 +124,23 @@ class ModalCloudProvider(BaseCloudProvider):
     ) -> ExecutionResult:
         job_id = None
         try:
-            fn_send_cmd("status", f"Modal: Submitting generation request to {self.endpoint_url}...")
-            req_dict = request.to_dict()
             gpu_type = os.environ.get("MODAL_DEFAULT_GPU", "L40S")
-            if "settings" in req_dict and isinstance(req_dict["settings"], dict):
-                req_dict["settings"]["model_type"] = request.model_type or req_dict.get("model_type", "t2v")
-                gpu_type = req_dict["settings"].pop("gpu_type", None) or gpu_type
-                if "resolution" in req_dict["settings"]:
-                    req_dict["settings"].pop("width", None)
-                    req_dict["settings"].pop("height", None)
+            if isinstance(request.settings, dict):
+                gpu_type = request.settings.get("gpu_type") or gpu_type
+
+            # Package request and any media inputs (images, control videos, audio) into a self-contained ZIP bundle
+            fn_send_cmd("status", "Modal: Packaging generation bundle and media attachments...")
+            zip_payload = package_generation_request_to_zip(request)
+            payload_size_mb = len(zip_payload) / (1024 * 1024)
+
+            fn_send_cmd("status", f"Modal: Submitting bundle ({payload_size_mb:.2f} MB) to {self.endpoint_url} (GPU: {gpu_type})...")
             url = f"{self.endpoint_url}/generate?gpu_type={gpu_type}"
-            payload = json.dumps(req_dict).encode("utf-8")
-            headers = {"Content-Type": "application/json", "User-Agent": "Wan2GP-Modal/1.0"}
+            headers = {"Content-Type": "application/zip", "User-Agent": "Wan2GP-Modal/1.0"}
             if self.api_key:
                 headers["Authorization"] = f"Bearer {self.api_key}"
                 headers["X-API-Key"] = self.api_key
 
-            req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
+            req = urllib.request.Request(url, data=zip_payload, headers=headers, method="POST")
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 resp_data = json.loads(resp.read().decode("utf-8"))
 

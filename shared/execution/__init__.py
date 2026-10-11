@@ -29,6 +29,7 @@ from shared.execution.registry import (
     get_execution_adapter,
     register_adapter,
 )
+from shared.execution.packaging import package_generation_request_to_zip
 from shared.execution.types import (
     ATTACHMENT_KEYS,
     CloudConfigurationError,
@@ -49,4 +50,5 @@ __all__ = [
     "register_adapter",
     "CloudConfigurationError",
     "ATTACHMENT_KEYS",
+    "package_generation_request_to_zip",
 ]

@@ -1180,6 +1180,11 @@ async def generate_endpoint(
                     if k in json_obj and k not in task_params:
                         task_params[k] = json_obj[k]
 
+                if "inputs" in json_obj and isinstance(json_obj["inputs"], dict):
+                    for in_k, in_v in json_obj["inputs"].items():
+                        if in_k not in task_params and in_v is not None:
+                            task_params[in_k] = in_v
+
                 tasks = [{
                     "id": 1,
                     "meta_id": str(json_obj.get("task_id", uuid.uuid4())),
