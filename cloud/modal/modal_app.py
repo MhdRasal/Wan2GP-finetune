@@ -169,6 +169,17 @@ def apply_source_patches(wgp_dir: Path, log_fn=print):
                 "        def is_available(): return False\n"
                 "    torch.accelerator = _TorchAccShim\n"
                 "try:\n"
+                "    import transformers.integrations.heterogeneity.configuration_utils as _hetero_cfg\n"
+                "    _hetero_cfg.HeterogeneousConfigMixin.__getattribute__ = object.__getattribute__\n"
+                "    _hetero_cfg.HeterogeneousConfigMixin.allow_global_per_layer_attribute_access = True\n"
+                "except Exception:\n"
+                "    pass\n"
+                "try:\n"
+                "    from transformers.configuration_utils import PretrainedConfig\n"
+                "    PretrainedConfig.allow_global_per_layer_attribute_access = True\n"
+                "except Exception:\n"
+                "    pass\n"
+                "try:\n"
                 "    import transformers.modeling_rope_utils as _rope_utils\n"
                 "    if hasattr(_rope_utils, 'ROPE_INIT_FUNCTIONS') and 'default' not in _rope_utils.ROPE_INIT_FUNCTIONS:\n"
                 "        def _default_rope_fn(cfg, dev=None, **_kw):\n"
@@ -288,6 +299,18 @@ def apply_source_patches(wgp_dir: Path, log_fn=print):
         "                return inv_freq, 1.0\n"
         "            _rope_utils.ROPE_INIT_FUNCTIONS['default'] = _default_rope_init\n"
         "except Exception:\n"
+        "    pass\n\n"
+        "# 3. Universal Transformers Heterogeneity compat shim\n"
+        "try:\n"
+        "    import transformers.integrations.heterogeneity.configuration_utils as _hetero_cfg\n"
+        "    _hetero_cfg.HeterogeneousConfigMixin.__getattribute__ = object.__getattribute__\n"
+        "    _hetero_cfg.HeterogeneousConfigMixin.allow_global_per_layer_attribute_access = True\n"
+        "except Exception:\n"
+        "    pass\n"
+        "try:\n"
+        "    from transformers.configuration_utils import PretrainedConfig\n"
+        "    PretrainedConfig.allow_global_per_layer_attribute_access = True\n"
+        "except Exception:\n"
         "    pass\n"
     )
     for site_dir in [
@@ -301,6 +324,60 @@ def apply_source_patches(wgp_dir: Path, log_fn=print):
                 log_fn(f"[PATCH] Injected universal sitecustomize.py into {site_dir}")
             except Exception as e:
                 pass
+
+    # 7. LTX-2 Gemma4UnifiedTextConfig heterogeneity compatibility
+    gemma4_path = wgp_dir / "models" / "ltx2" / "ltx_core" / "text_encoders" / "gemma" / "gemma4_unified.py"
+    if gemma4_path.exists():
+        try:
+            content = gemma4_path.read_text(encoding="utf-8")
+            original = content
+            if "allow_global_per_layer_attribute_access = True" not in content:
+                content = content.replace(
+                    'class Gemma4UnifiedTextConfig(PretrainedConfig):\n    model_type = "gemma4_unified_text"',
+                    'class Gemma4UnifiedTextConfig(PretrainedConfig):\n    model_type = "gemma4_unified_text"\n    allow_global_per_layer_attribute_access = True'
+                )
+            if 'config.__dict__.pop("_heterogeneity_spec", None)' not in content:
+                content = content.replace(
+                    'class Gemma4UnifiedTextRotaryEmbedding(nn.Module):\n    def __init__(self, config: Gemma4UnifiedTextConfig):\n        super().__init__()',
+                    'class Gemma4UnifiedTextRotaryEmbedding(nn.Module):\n    def __init__(self, config: Gemma4UnifiedTextConfig):\n        super().__init__()\n        config.__dict__.pop("_heterogeneity_spec", None)\n        config.__dict__["allow_global_per_layer_attribute_access"] = True'
+                )
+                content = content.replace(
+                    'class Gemma4UnifiedTextAttention(nn.Module):\n    def __init__(self, config: Gemma4UnifiedTextConfig, layer_idx: int):\n        super().__init__()',
+                    'class Gemma4UnifiedTextAttention(nn.Module):\n    def __init__(self, config: Gemma4UnifiedTextConfig, layer_idx: int):\n        super().__init__()\n        config.__dict__.pop("_heterogeneity_spec", None)\n        config.__dict__["allow_global_per_layer_attribute_access"] = True'
+                )
+                content = content.replace(
+                    'class Gemma4UnifiedTextModel(Gemma4UnifiedPreTrainedModel):\n    def __init__(self, config: Gemma4UnifiedTextConfig):\n        super().__init__(config)',
+                    'class Gemma4UnifiedTextModel(Gemma4UnifiedPreTrainedModel):\n    def __init__(self, config: Gemma4UnifiedTextConfig):\n        config.__dict__.pop("_heterogeneity_spec", None)\n        config.__dict__["allow_global_per_layer_attribute_access"] = True\n        super().__init__(config)'
+                )
+                content = content.replace(
+                    'class Gemma4UnifiedForCausalLM(Gemma4UnifiedPreTrainedModel):\n    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}\n\n    def __init__(self, config: Gemma4UnifiedTextConfig):\n        super().__init__(config)',
+                    'class Gemma4UnifiedForCausalLM(Gemma4UnifiedPreTrainedModel):\n    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}\n\n    def __init__(self, config: Gemma4UnifiedTextConfig):\n        config.__dict__.pop("_heterogeneity_spec", None)\n        config.__dict__["allow_global_per_layer_attribute_access"] = True\n        super().__init__(config)'
+                )
+                content = content.replace(
+                    "num_key_value_heads = config.num_global_key_value_heads if self.use_alternative_attention else config.num_key_value_heads",
+                    "num_key_value_heads = (config.__dict__.get('num_global_key_value_heads') or getattr(config, 'num_global_key_value_heads', 1)) if self.use_alternative_attention else (config.__dict__.get('num_key_value_heads') or getattr(config, 'num_key_value_heads', 4))"
+                )
+                content = content.replace(
+                    "num_key_value_heads = config.num_global_key_value_heads if self.use_alternative_attention else (config.__dict__.get('num_key_value_heads') or getattr(config, 'num_key_value_heads', 4))",
+                    "num_key_value_heads = (config.__dict__.get('num_global_key_value_heads') or getattr(config, 'num_global_key_value_heads', 1)) if self.use_alternative_attention else (config.__dict__.get('num_key_value_heads') or getattr(config, 'num_key_value_heads', 4))"
+                )
+                content = content.replace(
+                    "self.head_dim = config.head_dim if self.is_sliding else config.global_head_dim",
+                    "self.head_dim = (config.__dict__.get('head_dim') or getattr(config, 'head_dim', 256)) if self.is_sliding else getattr(config, 'global_head_dim', 512)"
+                )
+                content = content.replace(
+                    'head_dim = config.global_head_dim if layer_type == "full_attention" else config.head_dim',
+                    'head_dim = (config.__dict__.get("global_head_dim") or getattr(config, "global_head_dim", 512)) if layer_type == "full_attention" else (config.__dict__.get("head_dim") or getattr(config, "head_dim", 256))'
+                )
+                content = content.replace(
+                    'head_dim = config.global_head_dim if layer_type == "full_attention" else (config.__dict__.get("head_dim") or getattr(config, "head_dim", 256))',
+                    'head_dim = (config.__dict__.get("global_head_dim") or getattr(config, "global_head_dim", 512)) if layer_type == "full_attention" else (config.__dict__.get("head_dim") or getattr(config, "head_dim", 256))'
+                )
+            if content != original:
+                gemma4_path.write_text(content, encoding="utf-8")
+                log_fn("[PATCH] Patched gemma4_unified.py for complete heterogeneity compat")
+        except Exception as e:
+            log_fn(f"[PATCH-WARN] Failed to patch gemma4_unified.py: {e}")
 
 
 def _bake_patches():

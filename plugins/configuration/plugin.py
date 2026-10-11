@@ -809,6 +809,8 @@ class ConfigTabPlugin(WAN2GPPlugin):
             active = {resolve_role_engine(runtime_config, "deepy")}
             quantization_choices, quantization_value, quantization_visible = prompt_enhancer_quantization_ui_state(local_enhancer_id(deepy_engine), enhancer_quantization)
             qwen_local = not deepy_remote and local_enhancer_id(deepy_engine) in QWEN_PROMPT_ENHANCER_IDS
+            if deepy_remote and deepy_type != DEEPY_TYPE_DISABLED and deepy_type != DEEPY_TYPE_PRIME:
+                deepy_type = DEEPY_TYPE_PRIME
             deepy_enabled = deepy_type != DEEPY_TYPE_DISABLED
             return (
                 privacy_warning(runtime_config),
@@ -817,6 +819,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
                 gr.update(value=local_enhancer_id(deepy_engine), visible=False), gr.update(choices=quantization_choices, value=quantization_value, visible=quantization_visible and not deepy_remote),
                 gr.update(visible=qwen_local), gr.update(visible=qwen_local), gr.update(visible=not deepy_remote), gr.update(visible=deepy_enabled and not deepy_remote),
                 gr.update(visible=deepy_enabled and qwen_local), gr.update(visible=deepy_enabled and qwen_local), gr.update(visible=deepy_enabled), gr.update(visible=qwen_local),
+                gr.update(value=deepy_type),
             )
 
         remote_engine_state_inputs = [self.deepy_llm_engine_choice, self.enhancer_quantization_choice, self.deepy_type_choice]
@@ -825,6 +828,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             self.enhancer_enabled_choice, self.enhancer_quantization_choice,
             self.enhancer_speculative_row, self.enhancer_decoding_row, self.enhancer_sampling_row, self.deepy_vram_row,
             self.deepy_context_row, self.deepy_compaction_column, self.deepy_options_group, self.deepy_repetition_penalty_choice,
+            self.deepy_type_choice,
         ]
         self.deepy_llm_engine_choice.input(fn=update_remote_engine_ui, inputs=remote_engine_state_inputs, outputs=remote_engine_outputs, show_progress="hidden")
         self.deepy_type_choice.change(fn=update_remote_engine_ui, inputs=remote_engine_state_inputs, outputs=remote_engine_outputs, show_progress="hidden")

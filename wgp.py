@@ -2810,9 +2810,21 @@ temporal_upsampler_api.register_temporal_upsamplers(server_config, fl)
 migrate_extension_defaults(server_config, server_config_filename)
 
 def _normalize_profile_defaults(config):
+    profile_name_to_no = {
+        "HighRAM_HighVRAM": 1,
+        "HighRAM_LowVRAM": 2,
+        "LowRAM_HighVRAM": 3,
+        "VeryLowRAM_HighVRAM": 3.5,
+        "LowRAM_LowVRAM": 4,
+        "LowRAM_LowVRAM+": 4.5,
+        "VerylowRAM_LowVRAM": 5,
+    }
+    for k in ("profile", "video_profile", "image_profile"):
+        if k in config and isinstance(config[k], str) and config[k] in profile_name_to_no:
+            config[k] = profile_name_to_no[config[k]]
     if "profile" not in config:
-        config["profile"] = profile_type.LowRAM_LowVRAM
-    base_profile = config.get("profile", profile_type.LowRAM_LowVRAM)
+        config["profile"] = 4
+    base_profile = config.get("profile", 4)
     config.setdefault("video_profile", base_profile)
     config.setdefault("image_profile", base_profile)
     config.setdefault("audio_profile", 3.5)

@@ -459,6 +459,17 @@ def build_gemma_text_encoder(
     if gemma4:
         from ..gemma4_unified import Gemma4UnifiedForCausalLM, register_gemma4_config
         register_gemma4_config()
+        try:
+            import transformers.integrations.heterogeneity.configuration_utils as _hetero_cfg
+            _hetero_cfg.HeterogeneousConfigMixin.__getattribute__ = object.__getattribute__
+            _hetero_cfg.HeterogeneousConfigMixin.allow_global_per_layer_attribute_access = True
+        except Exception:
+            pass
+        try:
+            from transformers.configuration_utils import PretrainedConfig
+            PretrainedConfig.allow_global_per_layer_attribute_access = True
+        except Exception:
+            pass
         model_class = Gemma4UnifiedForCausalLM
     else:
         model_class = Gemma3ForCausalLM

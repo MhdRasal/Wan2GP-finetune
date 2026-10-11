@@ -169,6 +169,13 @@ class MockLoader(Loader):
         mod.init_empty_weights = _DummyContextManager
         mod.fix_text = lambda text: text
 
+        class TensorType(str, Enum):
+            PYTORCH = "pt"
+            TENSORFLOW = "tf"
+            NUMPY = "np"
+            JAX = "jax"
+        mod.TensorType = TensorType
+
         # Wire whisper LANGUAGES and TO_LANGUAGE_CODE
         whisper_langs = {
             "en": "english", "zh": "chinese", "de": "german", "es": "spanish",
@@ -204,7 +211,6 @@ MOCK_HEAVY_PACKAGES = {
     "torchaudio",
     "einops",
     "rembg",
-    "ffmpeg",
     "whisper",
     "transformers",
     "optimum",
@@ -219,6 +225,7 @@ MOCK_HEAVY_PACKAGES = {
     "librosa",
     "av",
     "segment_anything",
+    "timm",
 }
 
 KNOWN_SYSTEM_PACKAGES = {
@@ -356,7 +363,29 @@ def _create_mock_torch() -> types.ModuleType:
     jit_mod.export = lambda f: f
     jit_mod.ignore = lambda f: f
     jit_mod.script = lambda f: f
+    jit_mod.unused = lambda f: f
+    try:
+        from typing import Final
+        jit_mod.Final = Final
+    except ImportError:
+        jit_mod.Final = Any
     torch_mod.jit = jit_mod
+
+    # fx submodule
+    fx_mod = types.ModuleType("torch.fx")
+    fx_mod.wrap = lambda f: f
+    torch_mod.fx = fx_mod
+
+    # autograd submodule
+    autograd_mod = types.ModuleType("torch.autograd")
+    class _Function:
+        @classmethod
+        def apply(cls, *args, **kwargs):
+            return None
+    autograd_mod.Function = _Function
+    autograd_mod.no_grad = _DummyContextManager
+    autograd_mod.enable_grad = _DummyContextManager
+    torch_mod.autograd = autograd_mod
 
     # ops submodule
     torch_mod.ops = MockModule("torch.ops")
@@ -484,14 +513,28 @@ def _create_mock_mmgp() -> types.ModuleType:
     mmgp_mod = types.ModuleType("mmgp")
     mmgp_mod.__version__ = "3.8.2"
 
-    class ProfileType:
-        default = "default"
-        fast = "fast"
-        off = "off"
-        def __getattr__(self, name):
-            return name
+    class ProfileType(int, Enum):
+        HighRAM_HighVRAM = 1
+        HighRAM_LowVRAM = 2
+        LowRAM_HighVRAM = 3
+        LowRAM_LowVRAM = 4
+        VerylowRAM_LowVRAM = 5
+        default = 4
+        fast = 2
+        off = 0
 
-    p_type = ProfileType()
+        @staticmethod
+        def tostr(v):
+            mapping = {
+                1: "HighRAM_HighVRAM",
+                2: "HighRAM_LowVRAM",
+                3: "LowRAM_HighVRAM",
+                4: "LowRAM_LowVRAM",
+                5: "VerylowRAM_LowVRAM",
+            }
+            return mapping.get(int(v) if isinstance(v, (int, float)) else 4, "LowRAM_LowVRAM")
+
+    p_type = ProfileType
     mmgp_mod.profile_type = p_type
 
     # offload

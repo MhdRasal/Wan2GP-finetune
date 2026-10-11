@@ -21,6 +21,7 @@ from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutpu
 class Gemma4UnifiedTextConfig(PretrainedConfig):
     model_type = "gemma4_unified_text"
     keys_to_ignore_at_inference = ["past_key_values"]
+    allow_global_per_layer_attribute_access = True
 
     def __init__(
         self,
@@ -88,7 +89,9 @@ class Gemma4UnifiedTextConfig(PretrainedConfig):
         self.attention_k_eq_v = attention_k_eq_v
         self.num_kv_shared_layers = num_kv_shared_layers
         self.use_double_wide_mlp = use_double_wide_mlp
-        super().__init__(pad_token_id=pad_token_id, eos_token_id=eos_token_id, bos_token_id=bos_token_id, tie_word_embeddings=tie_word_embeddings, **kwargs)
+        self.allow_global_per_layer_attribute_access = True
+        super().__init__(pad_token_id=pad_token_id, eos_token_id=eos_token_id, bos_token_id=bos_token_id, tie_word_embeddings=tie_word_embeddings, allow_global_per_layer_attribute_access=True, **kwargs)
+        self.allow_global_per_layer_attribute_access = True
 
 
 class Gemma4UnifiedRMSNorm(nn.Module):
@@ -129,9 +132,11 @@ def _repeat_kv(hidden_states: torch.Tensor, repetitions: int) -> torch.Tensor:
 class Gemma4UnifiedTextRotaryEmbedding(nn.Module):
     def __init__(self, config: Gemma4UnifiedTextConfig):
         super().__init__()
+        config.__dict__.pop("_heterogeneity_spec", None)
+        config.__dict__["allow_global_per_layer_attribute_access"] = True
         for layer_type in set(config.layer_types):
             params = config.rope_parameters[layer_type]
-            head_dim = config.global_head_dim if layer_type == "full_attention" else config.head_dim
+            head_dim = (config.__dict__.get("global_head_dim") or getattr(config, "global_head_dim", 512)) if layer_type == "full_attention" else (config.__dict__.get("head_dim") or getattr(config, "head_dim", 256))
             if params["rope_type"] == "proportional":
                 rotary_angles = int(params.get("partial_rotary_factor", 1.0) * head_dim // 2)
                 inv_freq = 1.0 / (
@@ -158,13 +163,15 @@ class Gemma4UnifiedTextRotaryEmbedding(nn.Module):
 class Gemma4UnifiedTextAttention(nn.Module):
     def __init__(self, config: Gemma4UnifiedTextConfig, layer_idx: int):
         super().__init__()
+        config.__dict__.pop("_heterogeneity_spec", None)
+        config.__dict__["allow_global_per_layer_attribute_access"] = True
         self.layer_type = config.layer_types[layer_idx]
         self.is_sliding = self.layer_type == "sliding_attention"
-        self.head_dim = config.head_dim if self.is_sliding else config.global_head_dim
-        self.num_attention_heads = config.num_attention_heads
+        self.head_dim = (config.__dict__.get("head_dim") or getattr(config, "head_dim", 256)) if self.is_sliding else getattr(config, "global_head_dim", 512)
+        self.num_attention_heads = config.__dict__.get("num_attention_heads") or getattr(config, "num_attention_heads", 8)
         self.use_alternative_attention = config.attention_k_eq_v and not self.is_sliding
-        num_key_value_heads = config.num_global_key_value_heads if self.use_alternative_attention else config.num_key_value_heads
-        self.num_key_value_groups = config.num_attention_heads // num_key_value_heads
+        num_key_value_heads = (config.__dict__.get("num_global_key_value_heads") or getattr(config, "num_global_key_value_heads", 1)) if self.use_alternative_attention else (config.__dict__.get("num_key_value_heads") or getattr(config, "num_key_value_heads", 4))
+        self.num_key_value_groups = self.num_attention_heads // num_key_value_heads
         self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias)
         self.q_norm = Gemma4UnifiedRMSNorm(self.head_dim, config.rms_norm_eps)
         self.k_proj = nn.Linear(config.hidden_size, num_key_value_heads * self.head_dim, bias=config.attention_bias)
@@ -251,6 +258,8 @@ class Gemma4UnifiedPreTrainedModel(PreTrainedModel):
 
 class Gemma4UnifiedTextModel(Gemma4UnifiedPreTrainedModel):
     def __init__(self, config: Gemma4UnifiedTextConfig):
+        config.__dict__.pop("_heterogeneity_spec", None)
+        config.__dict__["allow_global_per_layer_attribute_access"] = True
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -322,6 +331,9 @@ class Gemma4UnifiedForCausalLM(Gemma4UnifiedPreTrainedModel):
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config: Gemma4UnifiedTextConfig):
+        config.__dict__.pop("_heterogeneity_spec", None)
+        config.__dict__["allow_global_per_layer_attribute_access"] = True
+        config.allow_global_per_layer_attribute_access = True
         super().__init__(config)
         self.model = Gemma4UnifiedTextModel(config)
         self.vocab_size = config.vocab_size
@@ -377,6 +389,17 @@ def register_gemma4_config() -> None:
 
     if Gemma4UnifiedTextConfig.model_type not in CONFIG_MAPPING:
         AutoConfig.register(Gemma4UnifiedTextConfig.model_type, Gemma4UnifiedTextConfig)
+    try:
+        import transformers.integrations.heterogeneity.configuration_utils as _hetero_cfg
+        _hetero_cfg.HeterogeneousConfigMixin.__getattribute__ = object.__getattribute__
+        _hetero_cfg.HeterogeneousConfigMixin.allow_global_per_layer_attribute_access = True
+    except Exception:
+        pass
+    try:
+        from transformers.configuration_utils import PretrainedConfig
+        PretrainedConfig.allow_global_per_layer_attribute_access = True
+    except Exception:
+        pass
 
 
 __all__ = ["Gemma4UnifiedForCausalLM", "Gemma4UnifiedTextConfig", "register_gemma4_config"]
