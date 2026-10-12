@@ -41,7 +41,7 @@ from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse
 # Configuration & Volumes
 # ---------------------------------------------------------------------------
 APP_NAME = os.environ.get("MODAL_APP_NAME", "wan2gp-prod3")
-EXPECTED_API_KEY = os.environ.get("MODAL_API_KEY", "as-eRxoMxE95CgoFOZ7o98iBp")
+EXPECTED_API_KEY = os.environ.get("MODAL_API_KEY", "")
 
 OUTPUTS_VOL_NAME = os.environ.get("MODAL_VOLUME_NAME", "wan2gp-outputs")
 MODELS_VOL_NAME = os.environ.get("MODAL_MODELS_VOLUME_NAME", "wan2gp-models")

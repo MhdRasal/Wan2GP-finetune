@@ -93,7 +93,7 @@ def parse_wgp_args(config_filename: str, argv: Sequence[str] | None = None):
     # Cloud Execution Adapter options
     add("--mode", type=str, choices=["local", "cloud"], default=None, help="Execution mode: local (local GPU) or cloud (remote worker)")
     add("--cloud", action="store_true", help="Launch in lightweight cloud client mode (shortcut for --mode cloud)")
-    add("--provider", type=str, choices=["auto", "modal", "runpod", "http", "mock"], default=None, help="Cloud provider for remote execution (modal, runpod, http, mock)")
+    add("--provider", type=str, choices=["auto", "modal", "runpod", "http", "mock"], default=None, help="Cloud provider for remote execution: modal (stable), runpod (beta preview), http, mock")
     add("--cloud-endpoint", type=str, default="", help="Remote cloud endpoint URL (for http/modal/runpod)")
     add("--cloud-api-key", type=str, default="", help="API key or token for cloud provider")
 

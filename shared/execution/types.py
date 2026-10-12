@@ -330,6 +330,7 @@ class GenerationRequest:
         explicit_provider = (
             task.get("provider")
             or params_copy.pop("provider", None)
+            or params_copy.pop("cloud_provider", None)
             or (state.get("cloud_provider") if isinstance(state, dict) else None)
             or os.environ.get("WAN2GP_CLOUD_PROVIDER")
         )

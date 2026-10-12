@@ -13058,6 +13058,24 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                                 config_group_dropdowns.append(gr.Dropdown(choices=config_choices, value=config_group_values[index], visible=bool(group_configs), label=config_group_labels[index]))
                         config = gr.Text(value=config_value, interactive=False, visible=False)
 
+                    if IS_CLOUD_MODE:
+                        with gr.Column():
+                            gr.Markdown("<B>☁️ Cloud Execution Provider</B><BR>Select where remote cloud generations run:")
+                            current_prov = os.environ.get("WAN2GP_CLOUD_PROVIDER", os.environ.get("WAN2GP_DEFAULT_PROVIDER", "modal")).lower()
+                            cloud_provider_selector = gr.Radio(
+                                choices=[
+                                    ("Modal Cloud (1-Click Serverless, L40S/A100/H100) [Stable]", "modal"),
+                                    ("RunPod Serverless (RTX 4090 / L40S, 70 GB Container Disk) [Beta]", "runpod"),
+                                ],
+                                value="runpod" if current_prov == "runpod" else "modal",
+                                label="Active Cloud Provider",
+                                interactive=True
+                            )
+                            def _on_cloud_provider_change(val):
+                                os.environ["WAN2GP_CLOUD_PROVIDER"] = val
+                                return val
+                            cloud_provider_selector.change(_on_cloud_provider_change, inputs=[cloud_provider_selector], outputs=[])
+
             if not update_form:
                 with gr.Row(visible=(tab_id == 'edit'), elem_classes=["wangp-settings-actions"] if floating_generate_button else None):
                     edit_btn = gr.Button("Apply Edits", elem_id="edit_tab_apply_button")
@@ -14126,7 +14144,17 @@ def create_ui():
         stats_app = None
 
     with ui_studio.Blocks(css=css, js=js, theme=theme, title="WanGP", fill_width=True) as main:
-        gr.Markdown(f'<div align=center><H1>Wan<SUP style="color: #2563eb;">GP</SUP> v{WanGP_version} <FONT SIZE=4>by <I>DeepBeepMeep</I></FONT> <FONT SIZE=3>') # (<A HREF='https://github.com/deepbeepmeep/Wan2GP'>Updates</A>)</FONT SIZE=3></H1></div>")
+        cloud_badge = ""
+        if IS_CLOUD_MODE:
+            raw_prov = os.environ.get("WAN2GP_CLOUD_PROVIDER", os.environ.get("WAN2GP_DEFAULT_PROVIDER", "modal")).lower()
+            if raw_prov == "runpod":
+                prov = "RunPod (Beta)"
+                cloud_gpu = os.environ.get("RUNPOD_DEFAULT_GPU", "RTX 4090 / L40S")
+            else:
+                prov = raw_prov.capitalize()
+                cloud_gpu = os.environ.get("MODAL_DEFAULT_GPU", "L40S")
+            cloud_badge = f' <span style="background: linear-gradient(135deg, #2563eb, #7c3aed); color: white; padding: 3px 10px; border-radius: 12px; font-size: 13px; font-weight: 600; vertical-align: middle; box-shadow: 0 2px 4px rgba(0,0,0,0.15);">☁️ Cloud Mode: {prov} ({cloud_gpu})</span>'
+        gr.Markdown(f'<div align=center><H1>Wan<SUP style="color: #2563eb;">GP</SUP> v{WanGP_version} <FONT SIZE=4>by <I>DeepBeepMeep</I></FONT>{cloud_badge} <FONT SIZE=3>') # (<A HREF='https://github.com/deepbeepmeep/Wan2GP'>Updates</A>)</FONT SIZE=3></H1></div>")
         global model_list
 
         tab_state = gr.State({ "tab_no":0 }) 

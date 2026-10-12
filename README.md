@@ -245,9 +245,33 @@ See full changelog: **[Changelog](docs/CHANGELOG.md)**
 
 ## 🚀 Quick Start
 
-### One-click Bat/SH Script Auto-installer:
+### ☁️ Option A: 1-Click Cloud Mode (Zero Local GPU / Serverless Cloud)
 
-The 1-click automated scripts for both **Windows (`.bat`)** and **Linux/macOS (`.sh`)** make installation, environment management, and updates as seamless as possible. These scripts will not only install WanGP but also best acceleration kernels (Triton, Sage, Flash, GGuf, Lightx2v, Nunchaku) available for your config.
+Run Wan2GP from any machine (including laptops, MacBooks, or systems without Nvidia GPUs) using serverless cloud GPUs.
+
+You have two real backend provider options:
+* **Modal Cloud (Default / Stable)**: Automated 1-click browser setup, serverless L40S / A100 / H100.
+* **RunPod Serverless [Beta Preview]**: Run on RTX 4090 (~$0.44/hr) or L40S (~$0.74/hr) using **70 GB Ephemeral Container Disk** ($0.00 ongoing idle cost). See [RunPod Setup Guide](docs/RUNPOD_SETUP.md).
+
+1. **Clone the repository:**
+   ```bash
+   git clone https://github.com/MhdRasal/Wan2GP-finetune.git
+   cd Wan2GP-finetune
+   ```
+2. **Install lightweight client dependencies:**
+   ```bash
+   pip install -r requirements-cloud.txt
+   ```
+3. **Launch the Cloud Runner:**
+   - **Windows:** Double-click `run_cloud.bat` (or `run_cloud.bat --provider runpod`)
+   - **Linux / macOS:** Run `./run_cloud.sh` (or `./run_cloud.sh --provider runpod`)
+   *(On first run with Modal, the automated wizard connects your account and launches the Web UI. You can also switch between Modal and RunPod directly in the Web UI under the "Misc." tab).*
+
+---
+
+### 🖥️ Option B: Local Installation (Bat / SH Auto-installer)
+
+The 1-click automated scripts for both **Windows (`.bat`)** and **Linux/macOS (`.sh`)** make local installation, environment management, and updates as seamless as possible. These scripts will not only install WanGP but also best acceleration kernels (Triton, Sage, Flash, GGuf, Lightx2v, Nunchaku) available for your config.
 
 *👉 **Windows Users:** Double-click the `.bat` files. **Linux Users:** Run the `.sh` files in your terminal.*
 
