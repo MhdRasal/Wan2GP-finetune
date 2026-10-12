@@ -67,12 +67,23 @@ class _DummyTensor:
         return f"DummyTensor(shape={self.shape}, dtype={self.dtype})"
 
 
-class MockClass:
+class MockMeta(type):
+    def __getattr__(cls, name: str) -> Any:
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return lambda *args, **kwargs: cls()
+
+
+class MockClass(metaclass=MockMeta):
     """Universal base class for dynamically mocked classes."""
     def __init__(self, *args, **kwargs):
         pass
     def __init_subclass__(cls, **kwargs):
         pass
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return lambda *args, **kwargs: None
     @classmethod
     def register(cls, *args, **kwargs):
         pass
@@ -607,6 +618,67 @@ def _create_mock_mmgp() -> types.ModuleType:
     qr_mod.__getattr__ = _safe_qr_getattr
     mmgp_mod.quant_router = qr_mod
 
+    # cuda_graphs
+    cg_mod = types.ModuleType("mmgp.cuda_graphs")
+    cg_mod.__file__ = "/mock/mmgp/cuda_graphs.py"
+    cg_mod.__path__ = []
+    cg_mod.scope = lambda *a, **k: _DummyContextManager()
+    cg_mod.ready = lambda *a, **k: False
+    cg_mod.invalidate = lambda *a, **k: None
+    cg_mod.register_key_provider = lambda *a, **k: None
+    cg_mod.register_gate = lambda *a, **k: None
+    cg_mod.register_capture_setup = lambda *a, **k: None
+    cg_mod.register_constant = lambda *a, **k: None
+    def _safe_cg_getattr(name: str):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        if name in ("scope", "capture_scope"):
+            return lambda *a, **k: _DummyContextManager()
+        return lambda *a, **k: None
+    cg_mod.__getattr__ = _safe_cg_getattr
+    mmgp_mod.cuda_graphs = cg_mod
+
+    # allocator
+    alloc_mod = types.ModuleType("mmgp.allocator")
+    alloc_mod.__file__ = "/mock/mmgp/allocator/__init__.py"
+    alloc_mod.__path__ = []
+    ram_mod = types.ModuleType("mmgp.allocator.ram")
+    ram_mod.__file__ = "/mock/mmgp/allocator/ram.py"
+    ram_mod.install = lambda *a, **k: None
+    ram_mod.uninstall = lambda *a, **k: None
+    ram_mod.release = lambda *a, **k: None
+    ram_mod.installed = lambda: False
+    ram_mod.__getattr__ = lambda name: (lambda *a, **k: None)
+    alloc_mod.ram = ram_mod
+
+    ram_debug_mod = types.ModuleType("mmgp.allocator.ram_debug")
+    ram_debug_mod.__file__ = "/mock/mmgp/allocator/ram_debug.py"
+    ram_debug_mod.start = lambda *a, **k: None
+    ram_debug_mod.stop = lambda *a, **k: None
+    ram_debug_mod.write_report = lambda *a, **k: None
+    ram_debug_mod.__getattr__ = lambda name: (lambda *a, **k: None)
+    alloc_mod.ram_debug = ram_debug_mod
+    mmgp_mod.allocator = alloc_mod
+
+    # read_ahead & auto_preload
+    ra_mod = types.ModuleType("mmgp.read_ahead")
+    ra_mod.__file__ = "/mock/mmgp/read_ahead.py"
+    ra_mod.__getattr__ = lambda name: (lambda *a, **k: None)
+    mmgp_mod.read_ahead = ra_mod
+
+    ap_mod = types.ModuleType("mmgp.auto_preload")
+    ap_mod.__file__ = "/mock/mmgp/auto_preload.py"
+    ap_mod.__getattr__ = lambda name: (lambda *a, **k: None)
+    mmgp_mod.auto_preload = ap_mod
+
+    def _safe_mmgp_getattr(name: str):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        dummy = types.ModuleType(f"mmgp.{name}")
+        dummy.__getattr__ = lambda n: (lambda *a, **k: None)
+        return dummy
+    mmgp_mod.__getattr__ = _safe_mmgp_getattr
+
     return mmgp_mod
 
 
@@ -754,4 +826,10 @@ def install_cloud_shims(force: bool = False) -> bool:
     sys.modules["mmgp.offload"] = mmgp_mock.offload
     sys.modules["mmgp.safetensors2"] = mmgp_mock.safetensors2
     sys.modules["mmgp.quant_router"] = mmgp_mock.quant_router
+    sys.modules["mmgp.cuda_graphs"] = mmgp_mock.cuda_graphs
+    sys.modules["mmgp.allocator"] = mmgp_mock.allocator
+    sys.modules["mmgp.allocator.ram"] = mmgp_mock.allocator.ram
+    sys.modules["mmgp.allocator.ram_debug"] = mmgp_mock.allocator.ram_debug
+    sys.modules["mmgp.read_ahead"] = mmgp_mock.read_ahead
+    sys.modules["mmgp.auto_preload"] = mmgp_mock.auto_preload
     return True
