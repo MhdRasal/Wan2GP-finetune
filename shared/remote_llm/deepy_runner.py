@@ -126,7 +126,8 @@ def run_remote_deepy_turn(server_config: dict[str, Any], session, text: str, sys
     if backend is None:
         backend = create_backend(engine, server_config, toolbox=toolbox)
         backends[engine] = backend
-        session.remote_history_pending.add(engine)
+        if hasattr(session, "remote_history_pending"):
+            session.remote_history_pending.add(engine)
     assistant_id = assistant_chat.create_assistant_turn(session)
     mark_assistant_turn_message(session, assistant_id)
     assistant_badge = str(session.current_turn.get("assistant_badge", "") or "") if isinstance(session.current_turn, dict) else ""
@@ -134,7 +135,8 @@ def run_remote_deepy_turn(server_config: dict[str, Any], session, text: str, sys
         _send(send_cmd, assistant_chat.set_message_badge(session, assistant_id, assistant_badge))
     user_message = assistant_chat.build_user_model_message(session, text, toolbox=toolbox)
     prompt = user_message.get("model_content", user_message["content"])
-    if engine in session.remote_history_pending and session.messages:
+    pending = getattr(session, "remote_history_pending", set())
+    if engine in pending and session.messages:
         # A fresh backend has no provider conversation to resume. Restore Deepy's
         # saved messages and tool results before sending the current request.
         history = []
@@ -388,7 +390,8 @@ def run_remote_deepy_turn(server_config: dict[str, Any], session, text: str, sys
                 commentary["block_id"], payload = assistant_chat.upsert_assistant_content_block(session, assistant_id, commentary["block_id"], "".join(commentary["parts"]), streaming=False)
                 _send(send_cmd, payload)
         if not session.interrupt_requested:
-            session.remote_history_pending.discard(engine)
+            if hasattr(session, "remote_history_pending"):
+                session.remote_history_pending.discard(engine)
             final_answer = "".join(answer_parts).strip()
             if final_answer:
                 session.messages.append({"role": "assistant", "content": final_answer})

@@ -13313,10 +13313,11 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                                 label="Active Cloud Provider",
                                 interactive=True
                             )
-                            def _on_cloud_provider_change(val):
-                                os.environ["WAN2GP_CLOUD_PROVIDER"] = val
-                                return val
-                            cloud_provider_selector.change(_on_cloud_provider_change, inputs=[cloud_provider_selector], outputs=[])
+                            if not update_form:
+                                def _on_cloud_provider_change(val):
+                                    os.environ["WAN2GP_CLOUD_PROVIDER"] = val
+                                    return val
+                                cloud_provider_selector.change(_on_cloud_provider_change, inputs=[cloud_provider_selector], outputs=[])
 
             if not update_form:
                 with gr.Row(visible=(tab_id == 'edit'), elem_classes=["wangp-settings-actions"] if floating_generate_button else None):

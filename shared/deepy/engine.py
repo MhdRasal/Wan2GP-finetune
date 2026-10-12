@@ -602,7 +602,7 @@ class AssistantRuntimeHooks:
 
 def get_or_create_assistant_session(state) -> AssistantSessionState:
     session = state.get("assistant_session", None)
-    if isinstance(session, AssistantSessionState):
+    if isinstance(session, AssistantSessionState) and hasattr(session, "remote_history_pending"):
         return session
     session = AssistantSessionState()
     state["assistant_session"] = session
@@ -615,7 +615,8 @@ def clear_assistant_session(session: AssistantSessionState) -> None:
         if callable(close_backend):
             close_backend()
     session.remote_backends.clear()
-    session.remote_history_pending.clear()
+    if hasattr(session, "remote_history_pending"):
+        session.remote_history_pending.clear()
     if session.file_list_pages is not None:
         session.file_list_pages.close()
         session.file_list_pages = None
