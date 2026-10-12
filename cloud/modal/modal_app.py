@@ -397,12 +397,6 @@ def _bake_patches():
         "https://github.com/deepbeepmeep/smplfitter/releases/download/v0.2.10/smplfitter-0.2.10-py3-none-any.whl",
         "https://github.com/deepbeepmeep/chumpy/releases/download/v0.71/chumpy-0.71-py3-none-any.whl"
     ], check=False)
-
-    # 5. Remove conflicting hf-xet
-    subprocess.run(
-        [sys.executable, "-m", "pip", "uninstall", "-y", "hf_xet", "hf-xet"],
-        check=False
-    )
 # ---------------------------------------------------------------------------
 # Base Container Image Definition
 # ---------------------------------------------------------------------------
@@ -422,7 +416,9 @@ wan2gp_image = (
         "xz-utils",
         "build-essential",
         "ninja-build",
-        "cmake"
+        "cmake",
+        "clang",
+        "libsox-dev"
     )
     .env({
         "TORCH_CUDA_ARCH_LIST": "8.0;8.9;9.0+PTX",
@@ -482,7 +478,7 @@ wan2gp_image = (
         "imageio>=2.36.0",
         "imageio-ffmpeg>=0.5.1",
         "opencv-python-headless>=4.10.0",
-        "numpy>=1.26.0,<2.0.0",
+        "numpy==2.1.2",
         "optimum-quanto>=0.2.6",
         "hf-transfer>=0.1.8",
         "huggingface-hub>=0.28.1",
@@ -512,6 +508,32 @@ wan2gp_image = (
         "matplotlib",
         "pandas",
         "taichi",
+        # Complete media, reference, and audio separation stack
+        "audio-separator==0.36.1",
+        "pyannote.audio==3.3.2",
+        "sherpa-onnx==1.13.2",
+        "speechbrain==1.0.3",
+        "torchcodec==0.10.0",
+        "insightface==0.7.3",
+        "facexlib==0.3.0",
+        "mir_eval==0.8.2",
+        "pretty_midi==0.2.11.post0",
+        "mido==1.3.3",
+        "symusic==0.6.0",
+        "fugashi>=1.2.0",
+        "unidic-lite>=1.0.0",
+        "num2words==0.5.14",
+        "s3tokenizer",
+        "spacy_pkuseg",
+        "spacy",
+        "pycocotools",
+        "segment-anything",
+        "iopath>=0.1.10",
+        "phonemizer-fork",
+        "espeakng-loader",
+        "wetext==0.1.2",
+        "hf_xet>=1.5.2",
+        "runpod>=1.7.0",
         extra_options="--extra-index-url https://download.pytorch.org/whl/cu124 --progress-bar off"
     )
     .run_commands(
@@ -569,34 +591,62 @@ def ensure_volume_venv(log_file: Optional[Path] = None, allow_install: bool = Fa
         
         log("[VENV] Created /models/venv successfully.")
 
-    # Step 2: Synchronize requirements if changed (only allowed on CPU update endpoint)
-    if req_file.exists() and allow_install:
-        current_hash = compute_requirements_hash(req_file)
-        saved_hash = hash_file.read_text().strip() if hash_file.exists() else ""
+    def _is_missing_core_pkgs(py_bin: Path) -> bool:
+        test_script = "import audio_separator, insightface, facexlib"
+        chk = subprocess.run([str(py_bin), "-c", test_script], capture_output=True)
+        return chk.returncode != 0
 
-        if current_hash != saved_hash:
-            log(f"[VENV] Syncing dependencies from {req_file} (hash: {current_hash})...")
-            uv_cmd = shutil.which("uv")
-            if uv_cmd:
-                install_cmd = [
-                    uv_cmd, "pip", "install",
-                    "--python", str(venv_py),
-                    "-r", str(req_file)
-                ]
-            else:
-                install_cmd = [
-                    str(venv_py), "-m", "pip", "install",
-                    "-r", str(req_file)
-                ]
+    # Step 2: Synchronize requirements if changed, missing, or explicitly requested
+    missing_core = _is_missing_core_pkgs(venv_py)
+    current_hash = compute_requirements_hash(req_file) if req_file.exists() else ""
+    saved_hash = hash_file.read_text().strip() if hash_file.exists() else ""
+    needs_sync = allow_install or missing_core or (current_hash and current_hash != saved_hash)
 
+    if req_file.exists() and needs_sync:
+        log(f"[VENV] Syncing all dependencies from {req_file} (missing_core={missing_core}, allow_install={allow_install})...")
+        uv_cmd = shutil.which("uv")
+        uv_ok = False
+        if uv_cmd:
+            install_cmd = [
+                uv_cmd, "pip", "install",
+                "--python", str(venv_py),
+                "-r", str(req_file)
+            ]
             res = subprocess.run(install_cmd, capture_output=True, text=True)
-            if res.returncode == 0:
-                hash_file.write_text(current_hash)
-                log("[VENV] Successfully updated dependencies in /models/venv.")
-            else:
-                log(f"[VENV-WARN] Dependency update returned code {res.returncode}: {res.stderr[:300]}")
+            uv_ok = (res.returncode == 0)
+            if not uv_ok:
+                log(f"[VENV-WARN] uv pip install returned code {res.returncode}: {res.stderr[:200]}")
+
+        # Fallback to standard pip if uv failed or had dependency conflicts
+        if not uv_ok:
+            log("[VENV] Running standard pip install for full requirements...")
+            fallback_cmd = [
+                str(venv_py), "-m", "pip", "install", "--no-cache-dir",
+                "-r", str(req_file)
+            ]
+            subprocess.run(fallback_cmd, capture_output=True, text=True)
+
+        # Explicitly ensure critical media separation and face analysis packages + wheels
+        critical_pkgs = [
+            "audio-separator==0.36.1",
+            "insightface==0.7.3",
+            "facexlib==0.3.0",
+            "pyannote.audio==3.3.2",
+            "sherpa-onnx==1.13.2",
+            "speechbrain==1.0.3",
+            "torchcodec==0.10.0",
+            "runpod>=1.7.0",
+            "hf-transfer",
+            "https://github.com/deepbeepmeep/smplfitter/releases/download/v0.2.10/smplfitter-0.2.10-py3-none-any.whl",
+            "https://github.com/deepbeepmeep/chumpy/releases/download/v0.71/chumpy-0.71-py3-none-any.whl"
+        ]
+        subprocess.run([str(venv_py), "-m", "pip", "install", "--no-cache-dir", *critical_pkgs], capture_output=True)
+
+        if current_hash:
+            hash_file.write_text(current_hash)
+        log("[VENV] Successfully verified and updated all dependencies in /models/venv.")
     elif req_file.exists():
-        log("[VENV] Using volume venv (fast startup, 0 setup overhead).")
+        log("[VENV] Using volume venv (fast startup, verified dependencies).")
 
     try:
         models_volume.commit()
@@ -1044,14 +1094,14 @@ def patch_volume_repo() -> Dict[str, Any]:
 @app.function(
     image=wan2gp_image,
     volumes={MODELS_MOUNT: models_volume},
-    timeout=600
+    timeout=900
 )
 def update_wan2gp_volume_repo() -> Dict[str, str]:
     """
     CPU-Only update worker ($0 GPU cost):
-    1. Git pull Wan2GP source into /models/Wan2GP
-    2. Synchronizes /models/venv via uv pip install
-    3. Verifies packages
+    1. Git pull official Wan2GP source into /models/Wan2GP
+    2. Synchronizes /models/venv via pip install (all packages)
+    3. Re-applies source patches to Wan2GP
     """
     target_dir = Path(MODELS_MOUNT) / "Wan2GP"
     if not target_dir.exists():
@@ -1059,21 +1109,24 @@ def update_wan2gp_volume_repo() -> Dict[str, str]:
             ["git", "clone", "--depth", "1", "https://github.com/deepbeepmeep/Wan2GP.git", str(target_dir)],
             capture_output=True, text=True
         )
-        git_msg = f"Cloned fresh repo: {res.stdout or res.stderr}"
+        git_msg = f"Cloned fresh official repo: {res.stdout or res.stderr}"
     else:
+        # Reset altered files so git pull succeeds cleanly without conflict
+        subprocess.run(["git", "checkout", "--", "."], cwd=str(target_dir), capture_output=True)
+        subprocess.run(["git", "fetch", "origin", "main"], cwd=str(target_dir), capture_output=True)
         res = subprocess.run(
-            ["git", "pull"],
+            ["git", "pull", "origin", "main"],
             cwd=str(target_dir),
             capture_output=True, text=True
         )
-        git_msg = f"Pulled latest updates: {res.stdout or res.stderr}"
+        git_msg = f"Pulled latest official updates: {res.stdout or res.stderr}"
 
-    # Apply patches directly to volume repo
+    # Sync volume venv with ALL requirements (installing full requirements.txt)
+    venv_py = ensure_volume_venv(allow_install=True)
+
+    # Re-apply source patches directly to volume repo
     apply_source_patches(target_dir, log_fn=print)
 
-    # Sync volume venv with requirements
-    venv_py = ensure_volume_venv(allow_install=True)
-    
     models_volume.commit()
     return {
         "status": "ok",
