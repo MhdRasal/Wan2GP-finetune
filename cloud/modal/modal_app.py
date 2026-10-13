@@ -169,6 +169,21 @@ def apply_source_patches(wgp_dir: Path, log_fn=print):
                 "        def is_available(): return False\n"
                 "    torch.accelerator = _TorchAccShim\n"
                 "try:\n"
+                "    import flash_attn_2_cuda\n"
+                "except Exception:\n"
+                "    import sys\n"
+                "    for _k in list(sys.modules.keys()):\n"
+                "        if _k == 'flash_attn' or _k.startswith('flash_attn.'):\n"
+                "            sys.modules.pop(_k, None)\n"
+                "    sys.modules['flash_attn'] = None\n"
+                "    sys.modules['flash_attn_2_cuda'] = None\n"
+                "    try:\n"
+                "        import transformers.utils.import_utils as _iu\n"
+                "        _iu.is_flash_attn_2_available = lambda: False\n"
+                "        _iu.is_flash_attn_greater_or_equal_2_10 = lambda: False\n"
+                "    except Exception:\n"
+                "        pass\n"
+                "try:\n"
                 "    import transformers.integrations.heterogeneity.configuration_utils as _hetero_cfg\n"
                 "    _hetero_cfg.HeterogeneousConfigMixin.__getattribute__ = object.__getattribute__\n"
                 "    _hetero_cfg.HeterogeneousConfigMixin.allow_global_per_layer_attribute_access = True\n"
@@ -213,6 +228,22 @@ def apply_source_patches(wgp_dir: Path, log_fn=print):
                 log_fn("[PATCH] Injected torch.accelerator & RoPE compatibility shim into wgp.py")
         except Exception as e:
             log_fn(f"[PATCH-WARN] Failed to patch wgp.py: {e}")
+
+    # 4a. shared/attention.py: exception safety for flash_attn import
+    attn_py = wgp_dir / "shared" / "attention.py"
+    if attn_py.exists():
+        try:
+            content = attn_py.read_text(encoding="utf-8")
+            if "except ModuleNotFoundError:" in content and "FLASH_ATTN_2_AVAILABLE = False" in content:
+                content = content.replace(
+                    "except ModuleNotFoundError:\n    FLASH_ATTN_2_AVAILABLE = False",
+                    "except (ModuleNotFoundError, ImportError, Exception):\n    FLASH_ATTN_2_AVAILABLE = False"
+                )
+                attn_py.write_text(content, encoding="utf-8")
+                log_fn("[PATCH] Patched shared/attention.py for safe flash_attn import")
+        except Exception as e:
+            log_fn(f"[PATCH-WARN] Failed to patch shared/attention.py: {e}")
+
 
     # 4b. Qwen3VL pad_token_id compatibility for Hugging Face Transformers
     for q_rel in [
@@ -311,12 +342,38 @@ def apply_source_patches(wgp_dir: Path, log_fn=print):
         "    from transformers.configuration_utils import PretrainedConfig\n"
         "    PretrainedConfig.allow_global_per_layer_attribute_access = True\n"
         "except Exception:\n"
-        "    pass\n"
+        "    pass\n\n"
+        "# 4. Flash Attention integrity check & safe SDPA fallback\n"
+        "try:\n"
+        "    import torch\n"
+        "    import flash_attn_2_cuda\n"
+        "except Exception:\n"
+        "    import sys\n"
+        "    for _k in list(sys.modules.keys()):\n"
+        "        if _k == 'flash_attn' or _k.startswith('flash_attn.'):\n"
+        "            sys.modules.pop(_k, None)\n"
+        "    sys.modules['flash_attn'] = None\n"
+        "    sys.modules['flash_attn_2_cuda'] = None\n"
+        "    try:\n"
+        "        import transformers.utils.import_utils as _iu\n"
+        "        _iu.is_flash_attn_2_available = lambda: False\n"
+        "        _iu.is_flash_attn_greater_or_equal_2_10 = lambda: False\n"
+        "    except Exception:\n"
+        "        pass\n"
     )
-    for site_dir in [
-        Path("/usr/local/lib/python3.11/site-packages"),
-        Path(MODELS_MOUNT) / "venv/lib/python3.11/site-packages"
-    ]:
+    target_site_dirs = set()
+    try:
+        import site
+        if hasattr(site, "getsitepackages"):
+            target_site_dirs.update(Path(p) for p in site.getsitepackages())
+    except Exception:
+        pass
+    target_site_dirs.add(Path("/usr/local/lib/python3.11/site-packages"))
+    venv_lib = Path(MODELS_MOUNT) / "venv" / "lib"
+    if venv_lib.exists():
+        for sp in venv_lib.glob("python*/site-packages"):
+            target_site_dirs.add(sp)
+    for site_dir in target_site_dirs:
         if site_dir.exists():
             try:
                 sc = site_dir / "sitecustomize.py"
@@ -508,6 +565,7 @@ wan2gp_image = (
         "matplotlib",
         "pandas",
         "taichi",
+        "sageattention",
         # Complete media, reference, and audio separation stack
         "audio-separator==0.36.1",
         "pyannote.audio==3.3.2",
@@ -538,7 +596,7 @@ wan2gp_image = (
     )
     .run_commands(
         "git clone --depth 1 https://github.com/deepbeepmeep/Wan2GP.git /root/Wan2GP",
-        "pip install flash-attn --no-build-isolation || echo 'Flash-attn build failed, non-fatal'"
+        "pip install 'https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.5cxx11abiFALSE-cp311-cp311-linux_x86_64.whl' --no-build-isolation || echo 'Flash-attn wheel install failed, non-fatal'"
     )
     .run_function(_bake_patches)
 )
@@ -648,6 +706,17 @@ def ensure_volume_venv(log_file: Optional[Path] = None, allow_install: bool = Fa
     elif req_file.exists():
         log("[VENV] Using volume venv (fast startup, verified dependencies).")
 
+    # Verify flash_attn link integrity on persistent volume venv
+    if venv_py.exists():
+        test_fa = subprocess.run([str(venv_py), "-c", "import torch; import flash_attn_2_cuda"], capture_output=True)
+        if test_fa.returncode != 0:
+            chk_installed = subprocess.run([str(venv_py), "-m", "pip", "show", "flash-attn"], capture_output=True)
+            if chk_installed.returncode == 0:
+                log("[VENV] Incompatible flash-attn detected in volume venv; uninstalling to prevent symbol mismatch...")
+                subprocess.run([str(venv_py), "-m", "pip", "uninstall", "-y", "flash-attn"], capture_output=True)
+                fa_wheel = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.5cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
+                subprocess.run([str(venv_py), "-m", "pip", "install", "--no-deps", fa_wheel], capture_output=True)
+
     try:
         models_volume.commit()
     except Exception:
@@ -705,10 +774,17 @@ def resolve_gpu_tuning(requested_gpu: str) -> Tuple[int, str, str]:
             import sageattention
         except Exception:
             try:
-                import flash_attn
+                import torch
+                import flash_attn_2_cuda
                 attention = "flash"
             except Exception:
                 attention = "sdpa"
+    elif attention == "flash":
+        try:
+            import torch
+            import flash_attn_2_cuda
+        except Exception:
+            attention = "sdpa"
 
     return tuning["profile"], attention, detected_device
 
