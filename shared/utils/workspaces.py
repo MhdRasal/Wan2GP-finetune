@@ -81,7 +81,18 @@ class WorkspaceStore:
             if not isinstance(record, dict) or not isinstance(record.get('id'), str) or not record['id'] or not isinstance(record.get('name'), str) or not isinstance(record.get('gallery'), dict):
                 raise ValueError(f'Invalid workspace: {path.name}')
             if record['id'] in self.records:
-                raise ValueError(f'Duplicate workspace ID: {path.name}')
+                existing_path = self._paths.get(record['id'])
+                if existing_path and path.stat().st_mtime > existing_path.stat().st_mtime:
+                    try:
+                        existing_path.unlink()
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        path.unlink()
+                    except Exception:
+                        pass
+                    continue
             # Older manifests have no content-activity timestamp. Seed it from
             # their last saved date without rewriting every file at startup.
             record.setdefault('last_activity', path.stat().st_mtime)

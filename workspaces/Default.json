@@ -2,16 +2,19 @@
     "id": "a4b5a6387ba04176bf91da59543f3778",
     "name": "Default",
     "gallery": {
+        "current_gallery_source": "video",
+        "selected_video_time": 0.0,
         "file_list": [
             "/run/media/rasal/FAFF-6A46/dirve Rasal/work/wan2gp fine tuned/Wan2GP/outputs/2026-10-10-12h37m04s_seed658611633_summary [reference generation] Place the subject on a deserted midnight railway platform where a pa.mp4"
         ],
-        "audio_file_list": [],
-        "selected": 0,
-        "audio_selected": -1,
+        "selected": -1,
         "last_selected": true,
+        "audio_file_list": [],
+        "audio_selected": -1,
         "audio_last_selected": true,
-        "current_gallery_source": "video",
-        "selected_video_time": 0.0
+        "mesh_file_list": [],
+        "mesh_selected": -1,
+        "mesh_last_selected": true
     },
     "last_activity": 1791635859.4159694,
     "archive_protected": false
