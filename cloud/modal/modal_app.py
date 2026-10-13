@@ -820,6 +820,18 @@ def setup_wan2gp_environment(wgp_dir: Path, profile_num: int, attention_mode: st
                 except Exception as e:
                     log_line(f"[WARN] Failed to symlink {item.name}: {e}")
 
+    # Also pull model weights from volume's Wan2GP/models/ (ckpts live there)
+    volume_wgp_models = models_volume_path / "Wan2GP" / "models"
+    if volume_wgp_models.is_dir():
+        for item in volume_wgp_models.iterdir():
+            target_link = wgp_models_dir / item.name
+            if not target_link.exists():
+                try:
+                    target_link.symlink_to(item)
+                    linked_count += 1
+                except Exception as e:
+                    log_line(f"[WARN] Failed to symlink volume models/{item.name}: {e}")
+
     config_data = {
         "attention_mode": attention_mode,
         "compile": "",
@@ -899,17 +911,14 @@ def execute_wan2gp_job(job_id: str, batch_uuid: Optional[str] = None, requested_
         with open(queue_file, "r") as f:
             queue_data = json.load(f)
 
-        # 1. Resolve Wan2GP root (persistent volume override takes priority)
-        custom_volume_wgp = Path(MODELS_MOUNT) / "Wan2GP"
-        if custom_volume_wgp.is_dir() and (custom_volume_wgp / "wgp.py").is_file():
-            wan2gp_dir = custom_volume_wgp
-            with open(log_file, "a") as log:
-                log.write(f"[INFO] Using custom Wan2GP from volume: {custom_volume_wgp}\n")
-        else:
-            wan2gp_dir = Path("/root/Wan2GP")
+        # 1. Always use baked-in /root/Wan2GP (pre-patched at build time, matches container packages)
+        # Volume /models/Wan2GP only provides model weights via symlinks — never code.
+        wan2gp_dir = Path("/root/Wan2GP")
+        with open(log_file, "a") as log:
+            log.write(f"[INFO] Using baked-in Wan2GP: {wan2gp_dir} (container-native, pre-patched)\n")
 
-        # 2. Resolve Python interpreter (Volume Venv with system site-packages)
-        python_exec = ensure_volume_venv(log_file=log_file)
+        # 2. Use system Python (matches container packages exactly) — no venv version drift
+        python_exec = Path(sys.executable)
         with open(log_file, "a") as log:
             log.write(f"[INFO] Active Python environment: {python_exec}\n")
 
