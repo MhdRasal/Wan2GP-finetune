@@ -155,7 +155,9 @@ class MockModule(types.ModuleType):
             return f"/mock/{self.__name__.replace('.', '/')}.py"
         if name == "__path__":
             return []
-        if name.startswith("__"):
+        if name == "__version__":
+            return "3.0.0"
+        if name.startswith("__") and name.endswith("__"):
             raise AttributeError(name)
         if name == "AutoConfig":
             return AutoConfigMock
@@ -171,6 +173,7 @@ class MockModule(types.ModuleType):
             return cls
         val = MockModule(f"{self.__name__}.{name}")
         val.__file__ = f"/mock/{self.__name__.replace('.', '/')}/{name}.py"
+        val.__version__ = "3.0.0"
         setattr(self, name, val)
         return val
 
