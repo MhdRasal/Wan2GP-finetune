@@ -1,6 +1,7 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 from __future__ import annotations
 
+import glob
 import hashlib
 import mimetypes
 import os
@@ -131,6 +132,7 @@ class FileAccessPolicy:
         else:
             return None
         alias, separator, remainder = reference.partition("/")
+        alias = re.sub(r"^workspace(\d*)$", r"documents\1", alias, flags=re.IGNORECASE)  # the documents root was named @workspace before
         root = next((path for name, path in self.mounts if name.casefold() == alias.casefold()), None)
         if root is None:
             raise ValueError(f"Unknown virtual filesystem root: {alias or '(empty)'}. List authorized roots without a path first.")
@@ -214,7 +216,8 @@ class FileAccessPolicy:
         if not self.can_read(target):
             raise PermissionError(f"Filesystem read is not authorized for: {self.virtualize_path(target)}")
         if file and not target.is_file():
-            raise FileNotFoundError(f"Path is not an existing file: {self.virtualize_path(target)}")
+            named = sorted(target.parent.glob(f"{glob.escape(target.name)}.*")) if not target.suffix and target.parent.is_dir() else []
+            raise FileNotFoundError(f"Path is not an existing file: {self.virtualize_path(target)}" + (f" (did you mean {', '.join(self.virtualize_path(item) for item in named[:3])}?)" if named else ""))
         if directory and not target.is_dir():
             raise FileNotFoundError(f"Path is not an existing directory: {self.virtualize_path(target)}")
         if not file and not directory and not target.exists():
@@ -355,6 +358,21 @@ def _rate(value: Any) -> float | None:
     return _float(text)
 
 
+def _stream_summary(stream: dict[str, Any]) -> dict[str, Any]:
+    tags = stream.get("tags", {})
+    title = tags.get("title") or tags.get("handler_name", "")  # MP4 keeps track names as handler_name
+    summary = {"type": stream["codec_type"], "codec": stream.get("codec_name")}
+    if stream["codec_type"] == "audio":
+        summary.update(sample_rate=_integer(stream.get("sample_rate")), channels=_integer(stream.get("channels")), layout=stream.get("channel_layout"))
+    if tags.get("language", "und") != "und":
+        summary["language"] = tags["language"]
+    if title and not re.fullmatch(r"\w*Handler", title):  # FFmpeg's VideoHandler / SoundHandler defaults name nothing
+        summary["title"] = title
+    if stream["codec_type"] == "subtitle" and stream.get("disposition", {}).get("default"):
+        summary["default"] = True
+    return {key: value for key, value in summary.items() if value is not None}
+
+
 def _probe_media(path: Path, media_type: str) -> dict[str, Any]:
     probe = ffmpeg.probe(str(path), cmd=resolve_media_binary("ffprobe") or "ffprobe")
     streams = probe.get("streams", [])
@@ -364,6 +382,7 @@ def _probe_media(path: Path, media_type: str) -> dict[str, Any]:
     result = {
         "status": "done", "path": str(path), "filename": path.name, "size_bytes": path.stat().st_size, "file_type": media_type,
         "duration_seconds": duration, "has_audio": bool(audio_streams), "audio_track_count": len(audio_streams), "error": "",
+        "streams": [_stream_summary(stream) for stream in streams if stream.get("codec_type") in {"video", "audio", "subtitle"}],
     }
     if media_type == "video":
         video_stream = next((stream for stream in streams if stream.get("codec_type") == "video"), {})
@@ -494,16 +513,17 @@ def search_text(policy: FileAccessPolicy, path: str, query: str, pattern: str = 
 
 def write_text(policy: FileAccessPolicy, path: str, text: str, mode: str = "create", encoding: str = "utf-8") -> dict[str, Any]:
     file_path = policy.require_write(path)
-    if not file_path.parent.is_dir():
-        raise FileNotFoundError(f"Parent directory does not exist: {file_path.parent}")
     mode = str(mode or "create").strip().lower()
     open_mode = {"create": "x", "overwrite": "w", "append": "a"}.get(mode)
     if open_mode is None:
         raise ValueError("mode must be create, overwrite, or append.")
     if policy.create_only(file_path):
         open_mode = "x"
+    if open_mode == "x" and file_path.exists():
+        raise FileExistsError(f"{path} already exists and cannot be replaced here: write a new file name." if policy.create_only(file_path) else f"{path} already exists: pass mode \"overwrite\" to replace it, or use append_text to add to it.")
     content = str(text)
-    with file_path.open(open_mode, encoding=_encoding(encoding)) as writer:
+    file_path.parent.mkdir(parents=True, exist_ok=True)  # inside the authorized write area, like the file itself
+    with file_path.open(open_mode, encoding=_encoding(encoding), newline="") as writer:  # the text as given: no Windows newline translation
         writer.write(content)
     digest = hashlib.sha256()
     with file_path.open("rb") as reader:

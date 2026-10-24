@@ -97,22 +97,17 @@ def main():
 
     # -------------------------------------------------------------------------
     # 1. Update Modal App (Original deepbeepmeep/Wan2GP + Full Requirements)
-    # -------------------------------------------------------------------------
+    env = os.environ.copy()
+    if env_vars.get("MODAL_APP_NAME"):
+        env["MODAL_APP_NAME"] = env_vars["MODAL_APP_NAME"]
+    if env_vars.get("MODAL_API_KEY"):
+        env["MODAL_API_KEY"] = env_vars["MODAL_API_KEY"]
+
     print_step("Step 1: Updating Modal App Volume to Latest Official Wan2GP...")
-    if not endpoint:
-        print_warn("MODAL_ENDPOINT not configured in .env. Checking Modal CLI...")
-        try:
-            res = subprocess.run(
-                ["modal", "run", "cloud/modal/modal_app.py::update_wan2gp_volume_repo"],
-                cwd=str(wgp_dir), capture_output=True, text=True
-            )
-            if res.returncode == 0:
-                print_ok("Modal volume updated via Modal CLI!")
-            else:
-                print_err(f"Modal CLI update failed: {res.stderr}")
-        except Exception as e2:
-            print_err(f"Could not reach Modal: {e2}")
-    else:
+    updated_modal = False
+
+    # Attempt via HTTP endpoint if configured
+    if endpoint:
         update_url = f"{endpoint}/admin/update-wan2gp"
         headers = {"User-Agent": "Wan2GP-Sync/1.0"}
         if api_key:
@@ -122,24 +117,29 @@ def main():
         try:
             print(f"   Calling update endpoint: {update_url} ...")
             req = urllib.request.Request(update_url, data=b"{}", headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=600.0) as resp:
+            with urllib.request.urlopen(req, timeout=60.0) as resp:
                 result = json.loads(resp.read().decode("utf-8"))
-            print_ok("Modal volume updated successfully!")
+            print_ok("Modal volume updated successfully via HTTP endpoint!")
             print(f"   Git result: {result.get('git_message', '').strip()}")
             print(f"   Python env: {result.get('venv_python', '').strip()}")
+            updated_modal = True
         except Exception as e:
-            print_warn(f"Failed to update Modal via HTTP endpoint ({e}). Falling back to Modal CLI...")
-            try:
-                res = subprocess.run(
-                    ["modal", "run", "cloud/modal/modal_app.py::update_wan2gp_volume_repo"],
-                    cwd=str(wgp_dir), capture_output=True, text=True
-                )
-                if res.returncode == 0:
-                    print_ok("Modal volume updated via Modal CLI!")
-                else:
-                    print_err(f"Modal CLI update failed: {res.stderr}")
-            except Exception as e2:
-                print_err(f"Could not reach Modal: {e2}")
+            print_warn(f"HTTP update endpoint returned {e}. Running update via Modal CLI with live progress...")
+
+    if not updated_modal:
+        print("   Launching Modal CLI function (cloud/modal/modal_app.py::update_wan2gp_volume_repo)...")
+        try:
+            res = subprocess.run(
+                ["modal", "run", "cloud/modal/modal_app.py::update_wan2gp_volume_repo"],
+                cwd=str(wgp_dir),
+                env=env
+            )
+            if res.returncode == 0:
+                print_ok("Modal volume updated successfully via Modal CLI!")
+            else:
+                print_err(f"Modal CLI exited with code {res.returncode}")
+        except Exception as e2:
+            print_err(f"Could not execute Modal CLI: {e2}")
 
     # -------------------------------------------------------------------------
     # 2. Update Local Wan2GP-finetune with exact same upstream

@@ -122,7 +122,7 @@ class family_handler:
             "text_prompt_enhancer_max_tokens1": 1536,
             "image_prompt_enhancer_max_tokens1": 1536,
             "profiles_dir": [_PROFILE_FOLDER],
-            "resolutions_categories": ["<=4096sq"],
+            "resolution_budget": "4096x4096",
             "skip_prompt_template": True,
             "vae_block_size": 32,
         }
@@ -141,7 +141,7 @@ class family_handler:
 
     @staticmethod
     def query_family_infos():
-        return {"sensenova": (1160, "SenseNova")}
+        return {"sensenova": (1170, "SenseNova")}
 
     @staticmethod
     def get_lora_dir(base_model_type):

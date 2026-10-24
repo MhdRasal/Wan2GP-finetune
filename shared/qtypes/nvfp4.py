@@ -58,9 +58,12 @@ _NVFP4_LAYOUT_TENSORCORE = "tensorcore"
 _NVFP4_BACKEND_AUTO = "auto"
 _NVFP4_BACKEND_COMFY = "comfy"
 _NVFP4_BACKEND_LIGHTX2V = "lightx2v"
+_NVFP4_BACKEND_TRITON = "triton"  # weight-only Triton kernels for every product (GPUs without FP4 tensor cores)
 
 _NVFP4_KERNEL_LOGGED = False
 _NVFP4_FALLBACK_LOGGED = False
+_NVFP4_TRITON_LOGGED = False
+_TRITON_W4A16 = None
 _NVFP4_LOAD_LOGGED = False
 _NVFP4_KERNEL_AVAILABLE = False
 _NVFP4_KERNEL_CHECKED = False
@@ -95,7 +98,9 @@ def _normalize_nvfp4_backend(name):
         return _NVFP4_BACKEND_COMFY
     if norm in ("lightx2v", "lightx2v_kernel", "lightx2v-kernel", "lx"):
         return _NVFP4_BACKEND_LIGHTX2V
-    if norm in ("off", "none", "fallback", "disable", "disabled"):
+    if norm in ("triton", "w4a16"):
+        return _NVFP4_BACKEND_TRITON
+    if norm in ("off", "none", "fallback", "disable", "disabled", "pytorch"):
         return "fallback"
     return norm
 
@@ -361,6 +366,36 @@ def _nvfp4_swap_nibbles(tensor):
     return ((tensor & 0x0F) << 4) | ((tensor & 0xF0) >> 4)
 
 
+_ROW_SLICE_BYTES = 64 << 20  # scratch of the activation rows quantized and multiplied at a time: FP4 values and block scales
+_ROW_SLICE_MIN = 16384  # rows per FP4 GEMM, which lose tensor core throughput on fewer rows
+
+
+def _nvfp4_rows(x2d, out_shape, out_dtype, quantize, gemm):
+    """gemm(quantize(x), out rows) (FP4 activations multiplied into their rows of the output) by slices of 128-row tiles when x2d
+    spans two or more: the FP4 copy of x2d never exceeds one slice. Its scales are per block of 16 values of a row with a fixed
+    tensor scale, so the slices quantize as the whole tensor does."""
+    rows, k = x2d.shape
+    step = max(_ROW_SLICE_MIN, _ROW_SLICE_BYTES // (k // 2 + k // 16) // 128 * 128)
+    step = -(-rows // (max(1, rows // step) * 128)) * 128  # slices of even size, none below the minimum
+    out = None
+    for start in range(0, rows, step):
+        prepared = quantize(x2d[start:start + step])
+        if out is None:  # allocated once the temporaries of the first quantization are released
+            out = torch.empty(out_shape, dtype=out_dtype, device=x2d.device)
+        gemm(prepared, out[start:start + step])
+        del prepared
+    return out
+
+
+def _kitchen_scaled_mm_nvfp4(out, qx, weight_fp4, qx_scale, weight_scale, alpha, bias):
+    """comfy-kitchen 0.2.35 scaled_mm_nvfp4 (cuBLAS FP4 GEMM) written to out, rows of a larger output (the wrapper allocates its own)."""
+    wrap = _ck_cuda._wrap_for_dlpack
+    bias = torch.empty(0, device=qx.device, dtype=torch.float16) if bias is None else bias
+    _ck_cuda._C.cublas_gemm_blockwise_fp4(wrap(weight_fp4), wrap(weight_scale.view(torch.uint8)), wrap(qx), wrap(qx_scale.view(torch.uint8)),
+                                          wrap(out), _ck_cuda.DTYPE_TO_CODE[out.dtype], wrap(bias), wrap(_ck_cuda.get_cublas_workspace()),
+                                          False, wrap(alpha), torch.cuda.current_stream(qx.device).cuda_stream)
+
+
 def _nvfp4_linear_cuda_comfy(input, weight, bias=None):
     _nvfp4_note_kernel(_NVFP4_BACKEND_COMFY)
     x2d = input.reshape(-1, input.shape[-1])
@@ -390,42 +425,18 @@ def _nvfp4_linear_cuda_comfy(input, weight, bias=None):
         alpha = alpha.to(device)
     if bias is not None and torch.is_tensor(bias) and bias.dtype != out_dtype:
         bias = bias.to(out_dtype)
-    orig_rows = x2d.shape[0]
-    pad_16x = (orig_rows % 16) != 0
     if layout == _NVFP4_LAYOUT_TENSORCORE:
-        input_scale = input_scale.to(torch.float32)
-        tensor_scale = alpha.to(torch.float32)
-        qx, qx_scale = _ck_cuda.quantize_nvfp4(x2d, input_scale, 0.0, pad_16x)
-        out = _ck_cuda.scaled_mm_nvfp4(
-            qx,
-            weight_fp4,
-            tensor_scale_a=input_scale,
-            tensor_scale_b=tensor_scale,
-            block_scale_a=qx_scale,
-            block_scale_b=weight_scale,
-            bias=bias,
-            out_dtype=out_dtype,
-        )
+        act_scale = input_scale.to(torch.float32)
+        alpha = act_scale * alpha.to(torch.float32)
     else:
         alpha = alpha * input_scale
-        if alpha.dtype != torch.float32:
-            alpha = alpha.to(torch.float32)
         act_scale = _nvfp4_get_act_scale(device)
-        qx, qx_scale = _ck_cuda.quantize_nvfp4(x2d, act_scale, 0.0, pad_16x)
         weight_fp4 = _nvfp4_swap_nibbles(weight_fp4)
-        out = _ck_cuda.scaled_mm_nvfp4(
-            qx,
-            weight_fp4,
-            act_scale,
-            input_scale,
-            qx_scale,
-            weight_scale,
-            bias=bias,
-            out_dtype=out_dtype,
-            alpha=alpha,
-        )
-    if pad_16x:
-        out = out[:orig_rows]
+    alpha = alpha.to(torch.float32).reshape(1)
+    # cuBLAS takes the activations padded to 16 rows, written to the output rows padded the same way
+    out = _nvfp4_rows(x2d, (-(-x2d.shape[0] // 16) * 16, weight.size(0)), out_dtype,
+                      lambda x: _ck_cuda.quantize_nvfp4(x, act_scale, 0.0, x.shape[0] % 16 != 0),
+                      lambda q, out: _kitchen_scaled_mm_nvfp4(out[:q[0].shape[0]], q[0], weight_fp4, q[1], weight_scale, alpha, bias))[:x2d.shape[0]]
     if out.dtype != orig_dtype:
         out = out.to(orig_dtype)
     return out.reshape(*input.shape[:-1], weight.size(0))
@@ -476,21 +487,18 @@ def _nvfp4_linear_cuda_lightx2v(input, weight, bias=None):
         alpha = alpha * input_scale
     else:
         quant_scale = input_scale
-    qx, qx_scale = _lx_gemm.scaled_nvfp4_quant(x2d, quant_scale)
-    if layout == _NVFP4_LAYOUT_TENSORCORE:
-        qx = _nvfp4_swap_nibbles(qx)
-    if not qx.is_contiguous():
-        qx = qx.contiguous()
-    if not qx_scale.is_contiguous():
-        qx_scale = qx_scale.contiguous()
-    out = _lx_gemm.cutlass_scaled_nvfp4_mm(
-        qx,
-        weight_fp4,
-        qx_scale,
-        weight_scale,
-        alpha=alpha,
-        bias=bias,
-    )
+
+    def quantize(x):
+        qx, qx_scale = _lx_gemm.scaled_nvfp4_quant(x, quant_scale)
+        if layout == _NVFP4_LAYOUT_TENSORCORE:  # nibbles of the uint8 activations swapped in place: one temporary
+            low = qx & 0x0F
+            qx.bitwise_right_shift_(4).bitwise_or_(low.bitwise_left_shift_(4))
+            del low
+        return qx.contiguous(), qx_scale.contiguous()
+
+    # the op behind lightx2v's cutlass_scaled_nvfp4_mm, which allocates its own BF16 output
+    out = _nvfp4_rows(x2d, (x2d.shape[0], weight.size(0)), torch.bfloat16, quantize,
+                      lambda q, out: torch.ops.lightx2v_kernel.cutlass_scaled_nvfp4_mm_sm120.default(out, q[0], weight_fp4, q[1], weight_scale, alpha, bias))
     if out.dtype != orig_dtype:
         out = out.to(orig_dtype)
     return out.reshape(*input.shape[:-1], weight.size(0))
@@ -502,15 +510,53 @@ def _nvfp4_linear_cuda(input, weight, bias=None):
     return _nvfp4_linear_cuda_comfy(input, weight, bias=bias)
 
 
+def _triton_w4a16():
+    """The weight-only Triton kernels (GPUs without FP4 tensor cores), None when Triton is unavailable or the backend disables them."""
+    global _TRITON_W4A16
+    if _TRITON_W4A16 is None:
+        _TRITON_W4A16 = False
+        if _NVFP4_BACKEND not in ("pytorch", "fallback"):
+            try:
+                from shared.kernels import nvfp4_w4a16_triton
+                _TRITON_W4A16 = nvfp4_w4a16_triton
+            except ImportError:
+                pass
+    return _TRITON_W4A16 or None
+
+
+def _nvfp4_note_triton():
+    global _NVFP4_TRITON_LOGGED
+    if not _NVFP4_TRITON_LOGGED:
+        _NVFP4_TRITON_LOGGED = True
+        print("NVFP4: Triton W4A16 kernels (weight-only, no FP4 tensor cores on this GPU)")
+
+
+_TRITON_W4A16_MAX_ROWS = 256  # measured crossover on an RTX 4090: above it, Kitchen's CUDA dequantization + cuBLAS BF16 is faster
+
+
+def _prefer_triton_w4a16(input, weight):
+    """The weight-only Triton kernel beats dequantize + matmul when the product is memory-bound (few rows), when Kitchen's CUDA
+    dequantization is unavailable (the PyTorch expansion is slow) or for the legacy layout it does not expand."""
+    if _NVFP4_BACKEND == _NVFP4_BACKEND_TRITON:
+        return True
+    rows = input.numel() // input.shape[-1]
+    return rows <= _TRITON_W4A16_MAX_ROWS or not _ck_cuda_available or weight._layout != _NVFP4_LAYOUT_TENSORCORE
+
+
 @torch.compiler.disable()
 def _nvfp4_linear(input, weight, bias=None, op=None):
     if _nvfp4_can_use_kernel(input, weight):
         if _is_fake_tensor(input):
             return input.new_empty((*input.shape[:-1], weight.size(0)))
         return _nvfp4_linear_cuda(input, weight, bias=bias)
-    _nvfp4_note_fallback()
     if _is_fake_tensor(input):
         return input.new_empty((*input.shape[:-1], weight.size(0)))
+    triton_w4a16 = _triton_w4a16() if torch.is_tensor(input) and weight._pre_quant_scale is None else None
+    if (triton_w4a16 is not None and triton_w4a16.supported(weight, input) and weight._data.device == input.device
+            and _prefer_triton_w4a16(input, weight)):
+        _nvfp4_note_triton()
+        return triton_w4a16.linear(input, weight, bias)
+    _nvfp4_note_fallback()
 
     if torch.is_tensor(input):
         qweight = weight.dequantize(dtype=input.dtype, device=input.device)
@@ -532,6 +578,9 @@ _FP4_LUT_BASE = torch.tensor(
 )
 _FP4_LUT_CACHE = {}
 _FP4_BYTE_LUT_CACHE = {}
+
+
+_DEQUANT_SLICE_BYTES = 32 << 20  # temporaries of the portable dequantization for one slice of rows
 
 
 def _get_fp4_lut(device, dtype):
@@ -593,36 +642,31 @@ def _dequantize_nvfp4_weight(
         alpha = alpha.to(device)
     if input_global_scale.device != device:
         input_global_scale = input_global_scale.to(device)
-    if layout == _NVFP4_LAYOUT_TENSORCORE and device.type == "cuda" and _ck_cuda_available:
-        try:
-            return _ck_cuda.dequantize_nvfp4(weight_u8, alpha.to(torch.float32), scale, output_type=dtype)
-        except Exception:
-            pass
+    # Kitchen's dequantize_nvfp4 contract: contiguous input, rows and unpacked columns in multiples of 16, FP32/FP16/BF16 output
+    if (layout == _NVFP4_LAYOUT_TENSORCORE and device.type == "cuda" and _ck_cuda_available and weight_u8.shape[0] % 16 == 0
+            and weight_u8.shape[1] % 8 == 0 and weight_u8.is_contiguous() and dtype in (torch.float32, torch.float16, torch.bfloat16)):
+        return _ck_cuda.dequantize_nvfp4(weight_u8, alpha.to(torch.float32), scale, output_type=dtype)
 
     m, k_bytes = weight_u8.shape
-    byte_lut = _get_fp4_byte_lut(device, dtype)
+    if scale.shape[0] < m:
+        raise RuntimeError(f"NVFP4 scale row mismatch: expected at least {m} rows, got {scale.shape[0]}")
+    # FP4 value * block scale is exact in FP32 (FP64 for an FP64 output); the per-tensor factor rounds it once more, then the output dtype
+    compute = torch.promote_types(dtype, torch.float32)
+    byte_lut = _get_fp4_byte_lut(device, compute)
     if layout == _NVFP4_LAYOUT_TENSORCORE:
-        idx = _nvfp4_swap_nibbles(weight_u8).to(torch.int32)
+        byte_lut = byte_lut.flip(1)  # tensorcore packing stores the first value of a byte in its high nibble
+        factor = alpha.to(compute)
     else:
-        idx = weight_u8.to(torch.int32)
-    out = byte_lut[idx].reshape(m, k_bytes * 2)
-
-    scale = _deswizzle_nvfp4_scale(scale, out.shape[1], block_size=block_size, dtype=dtype)
-    if scale.shape[0] < out.shape[0]:
-        raise RuntimeError(
-            f"NVFP4 scale row mismatch: expected at least {out.shape[0]} rows, got {scale.shape[0]}"
-        )
-    if scale.shape[0] != out.shape[0]:
-        scale = scale[:out.shape[0]]
-    out = out.view(out.shape[0], scale.shape[1], block_size)
-    out.mul_(scale.unsqueeze(-1))
-    out = out.view(out.shape[0], -1)
-
-    if layout == _NVFP4_LAYOUT_TENSORCORE:
-        scale_factor = alpha.to(dtype)
-    else:
-        scale_factor = alpha.to(dtype) * input_global_scale.to(dtype)
-    out.mul_(scale_factor)
+        factor = alpha.to(compute) * input_global_scale.to(compute)
+    block_scale = _deswizzle_nvfp4_scale(scale, k_bytes * 2, block_size=block_size)[:m]
+    out = torch.empty((m, k_bytes * 2), dtype=dtype, device=device)
+    step = max(1, _DEQUANT_SLICE_BYTES // (k_bytes * (4 + 2 * compute.itemsize)))  # int32 indices and two compute values per packed byte
+    for start in range(0, m, step):
+        rows = min(step, m - start)
+        values = torch.nn.functional.embedding(weight_u8[start:start + rows].to(torch.int32), byte_lut).view(rows, -1, block_size)
+        values.mul_(block_scale[start:start + rows].to(compute).unsqueeze(-1))
+        torch.mul(values.view(rows, -1), factor, out=out[start:start + rows])
+        del values
     return out
 
 
@@ -709,6 +753,12 @@ def convert_nvfp4_to_quanto(state_dict, default_dtype=None, verboseLevel=1):
     return {"state_dict": state_dict, "quant_map": quant_map}
 
 
+def cpu_compute_supported(tensor):
+    """Whether linears with this weight compute on the CPU in its storage when MMGP leaves their block there (cpuCompute)."""
+    from shared.kernels import cpu_linear
+    return isinstance(tensor, NVFP4WeightTensor) and cpu_linear.supported(tensor)
+
+
 def detect(state_dict, verboseLevel=1):
     matched = detect_nvfp4_state_dict(state_dict)
     details = describe_nvfp4_state_dict(state_dict) if matched else {}
@@ -720,6 +770,85 @@ def convert_to_quanto(state_dict, default_dtype, verboseLevel=1, detection=None)
         return {"state_dict": state_dict, "quant_map": {}}
     _nvfp4_note_reset()    
     return convert_nvfp4_to_quanto(state_dict, default_dtype=default_dtype, verboseLevel=verboseLevel)
+
+
+class _NVFP4RowProjection:
+    @staticmethod
+    def supports(module, x):
+        weight = getattr(module, "weight", None)
+        return isinstance(weight, NVFP4WeightTensor) and not _is_fake_tensor(x) and x.dtype in (torch.float16, torch.bfloat16)
+
+    @staticmethod
+    def key(module):
+        weight = module.weight
+        backend = _nvfp4_select_backend(weight, weight) if _nvfp4_can_use_kernel(weight, weight) else None
+        scale = weight._input_global_scale if backend != _NVFP4_BACKEND_COMFY or weight._layout == _NVFP4_LAYOUT_TENSORCORE else None
+        return "nvfp4_rows", backend, weight._layout, weight.dtype, scale, weight._pre_quant_scale
+
+    @staticmethod
+    def prepare(module, x):
+        weight = module.weight
+        if weight._pre_quant_scale is not None:
+            x = x * weight._pre_quant_scale.to(x.dtype)
+        backend = _NVFP4RowProjection.key(module)[1]
+        if backend is None:
+            return x
+        x = x.contiguous()
+        if backend == _NVFP4_BACKEND_COMFY:
+            scale = weight._input_global_scale.float() if weight._layout == _NVFP4_LAYOUT_TENSORCORE else _nvfp4_get_act_scale(x.device)
+            q, scales = _ck_cuda.quantize_nvfp4(x, scale, 0.0, x.shape[0] % 16 != 0)
+        else:
+            scale = weight._input_global_scale.float()
+            if weight._layout == _NVFP4_LAYOUT_TENSORCORE:
+                scale = torch.reciprocal(torch.clamp(scale, min=1e-8))
+            q, scales = _lx_gemm.scaled_nvfp4_quant(x, scale)
+            if weight._layout == _NVFP4_LAYOUT_TENSORCORE:
+                q = _nvfp4_swap_nibbles(q)
+        return q, scales, x.shape[0], x.dtype
+
+    @staticmethod
+    def rows(module, prepared, start, stop):
+        weight = module.weight
+        # Swizzled block scales store contiguous groups of 128 output rows.
+        first, last = start // 128 * 128, min((stop + 127) // 128 * 128, weight.shape[0])
+        data = weight._data[first:last]
+        scales = weight._scale[first:(last + 127) // 128 * 128]
+        bias = None if module.bias is None else module.bias[first:last]
+        backend = _NVFP4RowProjection.key(module)[1]
+        if backend is None:
+            triton_w4a16 = _triton_w4a16() if weight._pre_quant_scale is None else None
+            if (triton_w4a16 is not None and triton_w4a16.supported(weight, prepared) and (last - first) % 128 == 0
+                    and _prefer_triton_w4a16(prepared, weight)):
+                _nvfp4_note_triton()
+                out = triton_w4a16.linear(prepared, triton_w4a16.RowSlice(weight, first, last), bias)
+            else:
+                dense = _dequantize_nvfp4_weight(data, scales, weight._input_global_scale, weight._alpha, prepared.dtype, prepared.device, layout=weight._layout)
+                out = torch.nn.functional.linear(prepared, dense, bias)
+        else:
+            q, qs, rows, dtype = prepared
+            input_scale, alpha = weight._input_global_scale, weight._alpha
+            if backend == _NVFP4_BACKEND_COMFY:
+                if weight._layout == _NVFP4_LAYOUT_TENSORCORE:
+                    out = _ck_cuda.scaled_mm_nvfp4(q, data, input_scale.float(), alpha.float(), qs, scales,
+                                                  bias=None if bias is None else bias.to(dtype), out_dtype=dtype)
+                else:
+                    out = _ck_cuda.scaled_mm_nvfp4(q, _nvfp4_swap_nibbles(data), _nvfp4_get_act_scale(q.device), input_scale,
+                                                  qs, scales, bias=None if bias is None else bias.to(dtype), out_dtype=dtype,
+                                                  alpha=(alpha * input_scale).float())
+            else:
+                alpha = alpha.float()
+                if weight._layout == _NVFP4_LAYOUT_TENSORCORE:
+                    alpha = alpha * input_scale.float()
+                out = _lx_gemm.cutlass_scaled_nvfp4_mm(q.contiguous(), data.contiguous(), qs.contiguous(), scales.contiguous(),
+                                                       alpha=alpha, bias=None if bias is None else bias.to(torch.bfloat16).contiguous())
+            out = out[:rows].to(dtype)
+        return out[:, start - first:stop - first]
+
+
+from mmgp import offload
+
+_NVFP4_ROW_PROJECTION = _NVFP4RowProjection()
+offload.register_row_projection(_NVFP4_ROW_PROJECTION)
 
 
 class Int8TensorwiseEmbedding(torch.nn.Embedding):
@@ -1114,7 +1243,11 @@ class QLinearNVFP4(QModuleMixin, torch.nn.Linear):
         pre_quant_scale = getattr(self.qweight, "_pre_quant_scale", None)
         if pre_quant_scale is not None:
             input = input * pre_quant_scale.to(device=input.device, dtype=input.dtype)
-        return torch.nn.functional.linear(input, self.qweight, bias=self.bias)
+        qweight = self.qweight
+        if getattr(qweight, "_mm_cpu_compute", False) and qweight._data.device.type == "cpu":  # a block that MMGP leaves on the CPU (cpuCompute)
+            from shared.kernels import cpu_linear
+            return cpu_linear.linear(qweight, input, self.bias, input.dtype)
+        return torch.nn.functional.linear(input, qweight, bias=self.bias)
 
     def _load_from_state_dict(
         self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs

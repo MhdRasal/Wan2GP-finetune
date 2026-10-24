@@ -6,8 +6,6 @@
   WAC.readEventSource = () => {};
   WAC.handleEventNodeMutation = () => {};
   WAC.observeEventSourceValue = () => {};
-  clearInterval(WAC.pollTimer);
-  WAC.pollTimer = null;
   let started = false;
   function boot() {
     const marker = document.querySelector('[data-deepy-hybrid]');
@@ -17,7 +15,7 @@
     observer.disconnect();
     const legacyInput = WAC.eventSource();
     if (legacyInput?.__wangpAssistantEventValueObserved) delete legacyInput.value;
-    let galleryRevision = -1, settingsRevision = -1, previewRevision = -1, generating = false, noticeTimer = null, unauthorized = false;
+    let galleryRevision = -1, settingsRevision = -1, previewRevision = -1, noticeTimer = null, unauthorized = false;
     let restoration = null, restoredId = null;
     const base = marker.dataset.deepyHybrid;
     const openApp = document.createElement('a');
@@ -26,6 +24,21 @@
     openApp.title = 'Continue this conversation in the Web app';
     document.querySelector('#assistant_chat_settings_panel .chat__template-modal-titlebar')?.append(openApp);
     function click(id) { document.querySelector('#' + id + ' button, button#' + id)?.click(); }
+    let galleryPending = false, galleryDirty = false, galleryTask = null;
+    function flushGallery() {
+      if (!galleryDirty || galleryPending || document.hidden) return;
+      // Claim the request before Gradio defers the click to its next frame.
+      // Otherwise suspended tabs can dispatch a whole backlog concurrently.
+      galleryPending = true;
+      galleryDirty = false;
+      click('deepy_hybrid_gallery_sync');
+    }
+    function requestGallery() {
+      galleryDirty = true;
+      // Run after Gradio finishes mounting its event listeners, and combine
+      // snapshot/restoration/focus notifications from the same browser task.
+      if (galleryTask === null) galleryTask = setTimeout(() => {galleryTask = null; flushGallery();}, 0);
+    }
     let errorSequence = 0;
     function showError(data) {
       // Let Gradio render its native popup, including duration/title/visibility.
@@ -46,7 +59,7 @@
     function refresh(view) {
       const gallery = view.gallery !== galleryRevision, settings = view.settings !== settingsRevision;
       galleryRevision = view.gallery; settingsRevision = view.settings;
-      if (gallery) {click('deepy_hybrid_gallery_sync'); viewer.invalidate();}
+      if (gallery) {requestGallery(); viewer.invalidate();}
       if (settings) click('deepy_hybrid_settings_sync');
       if (view.preview !== previewRevision) {previewRevision = view.preview; click('deepy_hybrid_preview_sync');}
     }
@@ -58,25 +71,30 @@
       const pending = value && (value.pending || restoredId !== value.id);
       WAC.setRestoration(pending ? value : null);
       // Readiness is per browser: retain loading until Gradio applies its gallery outputs.
-      if (pending && !value.pending) click('deepy_hybrid_gallery_sync');
+      if (pending && !value.pending) requestGallery();
     }
     WAC.galleryRestored = (value, appliedRevision) => {
       // A selection can discard the response after its host revision was seen.
       // Complete that refresh even if no further host notification is coming.
-      if (appliedRevision < galleryRevision) click('deepy_hybrid_gallery_sync');
+      if (appliedRevision < galleryRevision) requestGallery();
       if (value && !value.pending && value.id === restoration?.id && !restoration.pending) {
         restoredId = value.id;
         WAC.setRestoration(null);
       }
     };
-    function progress(data) {
-      if (data && !generating) WAC.setBridgeValue('#wangp_main_status_trigger textarea, #wangp_main_status_trigger input', String(Date.now()));
-      generating = !!data;
+    // Always release, including failed requests. Retry failures on the next
+    // notification or focus, rather than looping while the server is down.
+    WAC.galleryRefreshFinished = () => {
+      galleryPending = false;
+      if (galleryDirty) requestGallery();
+    };
+    function generationSnapshot(state) {
+      window.WanGPGenerationState.receive(state.generation_state, true);
     }
     const transport = new DeepyConnection(base, {
-      snapshot: state => {WAC.applyDisplaySettings(state.display_settings); renderWorkspaces(state.workspaces, true); restoring(state.restoration); WAC.consumePayload(state.chat); catalog(state); galleryRevision = settingsRevision = previewRevision = -1; refresh(state.host_view); progress(state.progress); window.WanGPFormSync.refresh(state.forms);},
+      snapshot: state => {generationSnapshot(state); WAC.applyDisplaySettings(state.display_settings); renderWorkspaces(state.workspaces, true); restoring(state.restoration); WAC.consumePayload(state.chat); catalog(state); galleryRevision = settingsRevision = previewRevision = -1; refresh(state.host_view); window.WanGPFormSync.refresh(state.forms);},
       event: event => {
-        if (event.type === 'snapshot') {WAC.applyDisplaySettings(event.data.display_settings); renderWorkspaces(event.data.workspaces); restoring(event.data.restoration); WAC.consumePayload(event.data.chat); catalog(event.data); refresh(event.data.host_view); progress(event.data.progress); window.WanGPFormSync.refresh(event.data.forms);}
+        if (event.type === 'snapshot') {generationSnapshot(event.data); WAC.applyDisplaySettings(event.data.display_settings); renderWorkspaces(event.data.workspaces); restoring(event.data.restoration); WAC.consumePayload(event.data.chat); catalog(event.data); refresh(event.data.host_view); window.WanGPFormSync.refresh(event.data.forms);}
         else if (event.type === 'workspaces') {renderWorkspaces(event.data); viewer.invalidate();}
         else if (event.type === 'forms') window.WanGPFormSync.refresh(event.data);
         else if (event.type === 'display_settings') WAC.applyDisplaySettings(event.data);
@@ -85,7 +103,7 @@
         else if (event.type === 'chat') WAC.consumePayload(event.data);
         else if (event.type === 'host_view') refresh(event.data);
         else if (event.type === 'sessions') catalog(event.data);
-        else if (event.type === 'progress') progress(event.data);
+        else if (event.type === 'generation_state') window.WanGPGenerationState.receive(event.data);
         else if (event.type === 'error') showError(event.data);
       },
       connection: connected => {if (connected) unauthorized = false; notice(connected ? '' : unauthorized ? 'Sign in to the Web app, then return here.' : 'Connection to server lost. Reconnecting…', true);},
@@ -132,7 +150,8 @@
     };
     WAC.prefillResumedSession = () => {};
     window.addEventListener('online', () => transport.connect());
-    window.addEventListener('focus', () => {if (!transport.source) transport.connect();});
+    window.addEventListener('focus', () => {if (!transport.source) transport.connect(); requestGallery();});
+    document.addEventListener('visibilitychange', () => {if (!document.hidden) requestGallery();});
     window.addEventListener('pagehide', () => transport.close());
     window.addEventListener('pageshow', event => {if (event.persisted) transport.connect();});
     WAC.mountChatUpload((path, body) => transport.request(path, body), notice);

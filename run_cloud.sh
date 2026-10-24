@@ -24,6 +24,8 @@ echo "============================================================"
 # Choose best available Python interpreter
 if [ -f "$SCRIPT_DIR/.venv/bin/python" ]; then
     PY_BIN="$SCRIPT_DIR/.venv/bin/python"
+elif [ -f "$HOME/.wan2gp_venv/bin/python" ]; then
+    PY_BIN="$HOME/.wan2gp_venv/bin/python"
 elif [ -f "$HOME/.wan2gp-cloud-venv/bin/python" ]; then
     PY_BIN="$HOME/.wan2gp-cloud-venv/bin/python"
 elif [ -n "$VIRTUAL_ENV" ] && [ -f "$VIRTUAL_ENV/bin/python" ]; then

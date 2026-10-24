@@ -17,6 +17,14 @@ from shared.utils.gallery_sources import GALLERY_SOURCES, STRIP_SOURCES
 from shared.utils.gallery_view import gallery_offset, gallery_window
 
 
+def bind_generation_state(tab_id, status, pause, resume):
+    """Apply the ordered shared stream locally, with no status HTTP requests."""
+    elem_id = f'wangp-generation-state-{tab_id}'
+    trigger = gr.Textbox(visible=False, elem_id=elem_id)
+    trigger.input(fn=None, inputs=[trigger], outputs=[status, pause, resume], js='() => window.WanGPGenerationState.updates()', queue=False, show_progress='hidden', trigger_mode='always_last', api_name=False)
+    gr.context.Context.root_block.load(fn=None, js=f'() => window.WanGPGenerationState.register({json.dumps(elem_id)})')
+
+
 def bind_workspace_extract(service, state, validate_prompt, prompt_inputs, save_inputs, save_values, use_settings, outputs):
     from shared.deepy.workspace_viewer_api import ViewerAction
 
@@ -97,7 +105,7 @@ def bind_gallery_sync(service, state, render_gallery, outputs, *, gallery, strip
             video, selected, video_offset = gallery_window(gen['file_list'], gen['selected'], limit, keep_selected=True)
             if video_offset != gallery_offset(len(gen['file_list']), limit):
                 updates[outputs.index(gallery)] = gr.update(value=video, selected_index=selected)
-            gallery_view = {'session': session, 'workspace': service.workspace_id, 'sources': [{'id': source.id, 'label': source.tab_label} for source in GALLERY_SOURCES], 'video': video, 'video_offset': video_offset, 'selected': selected}
+            gallery_view = {'session': session, 'revision': current, 'workspace': service.workspace_id, 'sources': [{'id': source.id, 'label': source.tab_label} for source in GALLERY_SOURCES], 'video': video, 'video_offset': video_offset, 'selected': selected}
             for source in STRIP_SOURCES:
                 gallery_view[source.id], _, gallery_view[source.id + '_offset'] = gallery_window(gen[source.files_key], gen[source.selected_key], limit)
                 gallery_view[source.id + '_selected'] = gen[source.selected_key]
@@ -115,7 +123,11 @@ def bind_gallery_sync(service, state, render_gallery, outputs, *, gallery, strip
 
     # The patched Gallery applies explicit indices with the value, including its
     # first population. A second response can restore an already obsolete index.
-    gr.on([main.load, trigger.click], refresh, inputs=[state, revision, restored, view], outputs=[*outputs, revision, restored, view], queue=False, show_progress='hidden', trigger_mode='always_last').success(fn=None, inputs=[restored, revision], outputs=None, js='(payload, revision) => window.__wangpAssistantChatNS.galleryRestored?.(JSON.parse(payload), revision)')
+    # The transport's initial snapshot also requests the first view. A separate
+    # load request could race it before Gradio marks either request as pending.
+    refreshed = trigger.click(refresh, inputs=[state, revision, restored, view], outputs=[*outputs, revision, restored, view], queue=False, show_progress='hidden', trigger_mode='always_last')
+    refreshed.success(fn=None, inputs=[restored, revision], outputs=None, js='(payload, revision) => window.__wangpAssistantChatNS.galleryRestored?.(JSON.parse(payload), revision)')
+    refreshed.then(fn=None, inputs=None, outputs=None, js='() => window.__wangpAssistantChatNS.galleryRefreshFinished?.()')
 
     # Reuse the existing preview renderer without requiring a generation request
     # in this page. New/reconnected pages also read the current shared preview.

@@ -1,5 +1,43 @@
 /* Copyright (c) 2025-2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt) */ function() {
     console.log("[WanGP] main JS initialized");
+    function positionDropdown(menu) {
+        const trigger = menu.parentElement.querySelector('.wrap-inner');
+        if (!trigger) return;
+        const bounds = trigger.getBoundingClientRect();
+        const viewport = window.visualViewport;
+        const width = Math.min(document.documentElement.clientWidth, viewport?.width || window.innerWidth);
+        const left = viewport?.offsetLeft || 0, top = viewport?.offsetTop || 0;
+        const height = viewport?.height || window.innerHeight;
+        menu.style.setProperty('--wangp-dropdown-viewport-width', width + 'px');
+        menu.style.setProperty('--wangp-dropdown-width', bounds.width + 'px');
+        menu.style.left = Math.max(left + 8, Math.min(bounds.left, left + width - menu.getBoundingClientRect().width - 8)) + 'px';
+        const anchorTop = Math.max(top, Math.min(bounds.top, top + height));
+        const anchorBottom = Math.max(top, Math.min(bounds.bottom, top + height));
+        const below = top + height - anchorBottom, above = anchorTop - top;
+        menu.style.top = below >= above ? anchorBottom + 'px' : 'auto';
+        menu.style.bottom = below >= above ? 'auto' : window.innerHeight - anchorTop + 'px';
+        menu.style.maxHeight = Math.max(0, Math.max(below, above) - 8) + 'px';
+    }
+    let dropdownFrame = 0;
+    function scheduleDropdownLayout() {
+        if (dropdownFrame) return;
+        dropdownFrame = requestAnimationFrame(() => {
+            dropdownFrame = 0;
+            document.querySelectorAll('.options[role="listbox"]').forEach(positionDropdown);
+        });
+    }
+    document.addEventListener('animationstart', event => {
+        if (event.animationName === 'wangp-dropdown-ready') scheduleDropdownLayout();
+    });
+    window.addEventListener('resize', scheduleDropdownLayout);
+    window.visualViewport?.addEventListener('resize', scheduleDropdownLayout);
+    window.visualViewport?.addEventListener('scroll', scheduleDropdownLayout);
+    document.addEventListener('scroll', event => {
+        if (!event.target.closest?.('.options[role="listbox"]')) scheduleDropdownLayout();
+    }, {capture: true, passive: true});
+    document.addEventListener('input', event => {
+        if (event.target.matches('input[role="listbox"]')) scheduleDropdownLayout();
+    });
     const settingsSeparatorRoots = new Set();
     let settingsSeparatorFrame = 0;
     function scheduleSettingsSeparators(root) {
@@ -242,17 +280,37 @@
     window.addEventListener('resize', scheduleGenerationReferences, {passive: true});
     document.fonts.addEventListener('loadingdone', scheduleGenerationReferences);
     scheduleGenerationReferences();
-    // CSS positions the bars; this only distinguishes floating from landed.
+    // Share the existing action lifecycle for generation and media panels.
     let actionFrame = 0;
     const actionResize = new ResizeObserver(scheduleActionAppearance);
     const observedActionNodes = new Set();
+    const mediaActionSlots = new Map();
     function scheduleActionAppearance() {
         if (!actionFrame) actionFrame = requestAnimationFrame(updateActionAppearance);
     }
     function updateActionAppearance() {
         actionFrame = 0;
-        const bars = document.querySelectorAll('.wangp-settings-actions');
+        const bars = document.querySelectorAll('.wangp-settings-actions, .wangp-media-actions');
+        for (const [bar, slot] of mediaActionSlots) {
+            if (!bar.isConnected) {
+                slot.remove();
+                mediaActionSlots.delete(bar);
+            }
+        }
         const nodes = new Set([...bars].flatMap(bar => [bar, bar.parentElement]));
+        const gallery = document.getElementById('wangp-gallery-tabs');
+        if (gallery) {
+            const column = gallery.closest('.wangp-actions-column');
+            const generationBar = column?.querySelector('.wangp-settings-actions');
+            if (generationBar) {
+                nodes.add(gallery);
+                const mediaHeight = [...column.querySelectorAll('.wangp-media-actions')].reduce((height, bar) => {
+                    const rect = bar.getBoundingClientRect();
+                    return height + (rect.height ? rect.height + 8 : 0);
+                }, 0);
+                generationBar.style.setProperty('--wangp-actions-gallery-top', gallery.getBoundingClientRect().bottom + mediaHeight + 8 + 'px');
+            }
+        }
         for (const node of observedActionNodes) {
             if (!nodes.has(node)) {
                 actionResize.unobserve(node);
@@ -266,6 +324,10 @@
             }
         }
         for (const bar of bars) {
+            if (bar.classList.contains('wangp-media-actions')) {
+                updateMediaActionAppearance(bar);
+                continue;
+            }
             const rect = bar.getBoundingClientRect();
             if (!rect.width || !rect.height) {
                 bar.classList.toggle('is-floating', false);
@@ -282,6 +344,47 @@
             bar.classList.toggle('is-floating', rect.top < naturalTop - 1);
         }
     }
+    function updateMediaActionAppearance(bar) {
+        let slot = mediaActionSlots.get(bar);
+        const rect = bar.getBoundingClientRect();
+        if (!rect.width || !rect.height) {
+            bar.classList.remove('is-floating');
+            if (slot) slot.hidden = true;
+            return;
+        }
+        const column = bar.closest('.wangp-actions-column');
+        const generationBar = column.querySelector('.wangp-settings-actions');
+        const generationRect = generationBar?.getBoundingClientRect();
+        const viewport = window.visualViewport;
+        const viewportBottom = (viewport?.offsetTop || 0) + (viewport?.height || window.innerHeight);
+        let bottom = Math.max(8, window.innerHeight - viewportBottom + 8,
+            generationRect?.height && generationRect.top < viewportBottom && generationRect.bottom > 0
+                ? window.innerHeight - generationRect.top + 8 : 0);
+        const gallery = column.querySelector('#wangp-gallery-tabs');
+        if (gallery) bottom = Math.min(bottom, window.innerHeight - gallery.getBoundingClientRect().bottom - 8 - rect.height);
+        const anchor = slot && !slot.hidden ? slot.getBoundingClientRect() : rect;
+        // Float only before the natural slot. Once reached (or scrolled past),
+        // leave the actions in the document, just like the generation controls.
+        const floating = anchor.bottom > window.innerHeight - bottom + 1;
+        if (floating) {
+            if (!slot) {
+                slot = document.createElement('div');
+                slot.className = 'wangp-media-actions-slot';
+                slot.setAttribute('aria-hidden', 'true');
+                bar.before(slot);
+                mediaActionSlots.set(bar, slot);
+            }
+            slot.style.setProperty('--wangp-media-actions-height', rect.height + 'px');
+            slot.hidden = false;
+            const bounds = slot.getBoundingClientRect();
+            bar.style.setProperty('--wangp-media-actions-left', bounds.left + 'px');
+            bar.style.setProperty('--wangp-media-actions-width', bounds.width + 'px');
+            bar.style.setProperty('--wangp-media-actions-bottom', bottom + 'px');
+        } else if (slot) {
+            slot.hidden = true;
+        }
+        bar.classList.toggle('is-floating', floating);
+    }
     document.addEventListener('scroll', event => {
         for (const node of observedActionNodes) {
             if (event.target.contains(node)) {
@@ -291,6 +394,8 @@
         }
     }, {capture: true, passive: true});
     window.addEventListener('resize', scheduleActionAppearance, {passive: true});
+    window.visualViewport?.addEventListener('resize', scheduleActionAppearance);
+    window.visualViewport?.addEventListener('scroll', scheduleActionAppearance);
     // Form rebuilds register their new bars; resize handles visibility and geometry.
     window.wangpRefreshActionBars = scheduleActionAppearance;
     scheduleActionAppearance();
@@ -337,6 +442,7 @@
         }
     };
     window.closeImageModal = function() {
+        document.querySelectorAll('#image-modal-container .modal-image').forEach(image => window.WanGPImageZoom.destroy(image));
         const closeButton = document.querySelector('#modal_close_trigger_btn');
         if (closeButton) closeButton.click();
     };

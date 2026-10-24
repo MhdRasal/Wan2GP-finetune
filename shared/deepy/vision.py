@@ -8,7 +8,7 @@ from typing import Any
 import torch
 from PIL import Image
 
-from shared.llm_engines.nanovllm.models.qwen3_5 import Qwen3_5ForCausalLM
+from shared.llm_engines.lmgp.models.qwen3_5 import Qwen3_5ForCausalLM
 from shared.prompt_enhancer.qwen35_vl import _prepare_multimodal_vllm_prompt
 from shared.utils.video_decode import decode_video_frame_indices_ffmpeg
 
@@ -26,6 +26,7 @@ VISION_VIDEO_MAX_IMAGE_EDGE = 256
 VISION_VIDEO_MID_RES_MAX_IMAGE_EDGE = 512
 VISION_VIDEO_MID_RES_SAMPLE_DIVISOR = 4
 VISION_VIDEO_MAX_SAMPLES_PER_SECOND = 2
+VISION_VIDEO_SHORT_RANGE_SECONDS, VISION_VIDEO_SHORT_RANGE_SAMPLES_PER_SECOND = 3.0, 8  # joins and cuts need dense frames
 VISION_VIDEO_DECODE_BATCH_SIZE = 8
 VISION_QA_SYSTEM_PROMPT = "Answer the user's question about the labeled visual inputs accurately and concisely. Inputs may be images or ordered frames from one or more videos. If the answer is uncertain, say so."
 _TEXT_MODEL_ID = "prompt_enhancer_llm_model"
@@ -37,6 +38,10 @@ def can_keep_text_resident(runtime, manager) -> bool:
         return False
     if manager.models.get(_TEXT_MODEL_ID) is not runtime.model or _TEXT_MODEL_ID not in manager.active_models_ids:
         return False
+    from mmgp import runtime as mmgp_runtime
+    if mmgp_runtime.dynamic_preload(runtime.model):
+        # its dynamic preload releases only the blocks the vision tower needs beyond the lent cache, and keeps them again afterwards
+        return runtime._get_live_llm() is not None
     prefix = _TEXT_MODEL_ID + "/"
     preloaded = manager.preloaded_blocks_per_model[_TEXT_MODEL_ID]
     if not all(name[len(prefix):] in preloaded for name in manager.blocks_of_modules if name.startswith(prefix)) or not all(parameter.is_cuda for parameter in runtime.model.parameters()):
@@ -88,7 +93,7 @@ def resident_inspection(runtime, caption_model, manager):
         manager.cotenants_map = {**cotenants, _TEXT_MODEL_ID: [*cotenants.get(_TEXT_MODEL_ID, []), _VISION_MODEL_ID], _VISION_MODEL_ID: [*cotenants.get(_VISION_MODEL_ID, []), _TEXT_MODEL_ID]}
         # The enhancer's separate MMGP embedding alias would load a second copy.
         object.__setattr__(adapter, "_input_embedding_model", model.token_embd)
-        runtime._log("Inspection: keeping Qwen weights resident; lending assistant cache memory to vision.")
+        runtime._log("Inspection: keeping Qwen weights resident; lending assistant cache memory to vision (and Qwen blocks if it needs more).")
         yield unload_vision
     finally:
         unload_vision()
@@ -237,6 +242,6 @@ def build_image_question_prompt(caption_model: Any, processor: Any, image: Any, 
 __all__ = [
     "VISION_ANSWER_MAX_NEW_TOKENS", "VISION_MAX_IMAGES", "VISION_MAX_VISUAL_TOKENS_PER_IMAGE", "VISION_QA_SYSTEM_PROMPT",
     "VISION_REMOTE_MAX_IMAGES", "VISION_REMOTE_MAX_IMAGE_EDGE", "VISION_VIDEO_MAX_IMAGE_EDGE", "VISION_VIDEO_MAX_IMAGES",
-    "VISION_VIDEO_MAX_SAMPLES_PER_SECOND", "VISION_VIDEO_MID_RES_MAX_IMAGE_EDGE", "VISION_VIDEO_MID_RES_SAMPLE_DIVISOR", "VISION_VIDEO_REMOTE_MAX_IMAGES", "build_image_question_prompt",
+    "VISION_VIDEO_MAX_SAMPLES_PER_SECOND", "VISION_VIDEO_SHORT_RANGE_SAMPLES_PER_SECOND", "VISION_VIDEO_SHORT_RANGE_SECONDS", "VISION_VIDEO_MID_RES_MAX_IMAGE_EDGE", "VISION_VIDEO_MID_RES_SAMPLE_DIVISOR", "VISION_VIDEO_REMOTE_MAX_IMAGES", "build_image_question_prompt",
     "decode_inspection_video_frames", "normalize_inspection_bbox", "prepare_inspection_image", "resize_inspection_image", "video_inspection_sample_count",
 ]

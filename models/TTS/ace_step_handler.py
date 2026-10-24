@@ -333,9 +333,9 @@ class family_handler:
         if _is_ace_step15(base_model_type):
             extra_model_def = {
                 "group": "music",
-                "infos": "Generate music by combining Lyrics (`prompt`) with Music Caption (`alt_prompt`): the lyrics supply words and song sections; the caption supplies style, instruments, mood and vocal character. Audio Task selects text-only generation, a cover from Source Audio (`audio_guide`, mode `A`), Reference Timbre (`audio_guide2`, mode `B`), or both (`AB`). For a cover, supply the source lyrics and use Source Audio Strength to control adherence. Duration, BPM, key, meter and language are separate controls.",
-                "deepy_infos": "Lyrics `prompt` + sound/style caption `alt_prompt` generate music. `audio_prompt_type`: `A` = cover from `audio_guide` (use source lyrics; Source Audio Strength controls adherence), `B` = timbre from `audio_guide2`, `AB` = both. Duration/BPM/key/meter/language have separate controls.",
-                "deepy_prompt_infos": "Put actual lyrics in `prompt`, with short lines and [Verse], [Chorus], [Bridge] tags separated by blank lines. Keep repeated choruses consistent. Put genre, instruments, mood and vocal character in `alt_prompt`. For instrumental music use `[Instrumental]` as lyrics and describe the sound in the caption.",
+                "infos": "Generate music by combining Lyrics (`prompt`) with Music Caption (`alt_prompt`): the lyrics supply words and song sections; the caption supplies style, instruments, mood and vocal character. Audio Task selects text-only generation, a cover from Source Audio (`audio_guide`, mode `A`), Reference Timbre (`audio_guide2`, mode `B`), or both (`AB`). For a cover, supply the source lyrics and use Source Audio Strength to control adherence. Duration, BPM, key, meter and language are separate controls. The music usually ends with a fade before the target duration (with ACE-Step 1.5 Turbo it lasted 67-97% of it, for example 11-13 s of a 16 s request): when a cue must fill a length, request about a third more and trim it. Songs come out mastered loud (around -10 LUFS, peaks at full scale): lower the music when mixing it under speech.",
+                "deepy_infos": "Lyrics `prompt` + sound/style caption `alt_prompt` generate music. `audio_prompt_type`: `A` = cover from `audio_guide` (use source lyrics; Source Audio Strength controls adherence), `B` = timbre from `audio_guide2`, `AB` = both. Duration/BPM/key/meter/language have separate controls. Music usually ends with a fade before duration_seconds (Turbo: 67-97% of it); to fill an exact length request ~1/3 more and trim (extract_audio, or trim_start_s/trim_duration_s in a remux_media mix). Output is mastered loud (~-10 LUFS, peaks at full scale): give it a negative gain under narration or set normalize_lufs.",
+                "deepy_prompt_infos": "Put actual lyrics in `prompt`, with short lines and [Verse], [Chorus], [Bridge] tags separated by blank lines. Keep repeated choruses consistent. Put genre, instruments, mood and vocal character in `alt_prompt`, naming the lead voice first and plainly (`female vocals, ...` or `male vocals, ...`). For instrumental music use `[Instrumental]` as lyrics and describe the sound in the caption.",
                 "audio_only": True,
                 "image_outputs": False,
                 "sliding_window": False,
@@ -355,7 +355,8 @@ class family_handler:
                 "audio_scale_name": "Source Audio Strength",
                 "audio_prompt_choices": True,
                 "enabled_audio_lora": True,
-                "lm_engines": ["vllm"],
+                "lm_decoder": True,
+                "cuda_graphs": ["transformer"],
                 "prompt_class": "Lyrics",
                 "prompt_infos": "Write the actual lyrics in `prompt`, not an instruction to write a song. Describe the desired sound in `alt_prompt`, for example: warm acoustic folk, fingerpicked guitar, soft female vocals, restrained percussion. For instrumental music, use `[Instrumental]` in `prompt` and describe the instruments in the caption.\n\n" + ACE_STEP_LYRICS_PROMPT_INFOS,
                 "alt_guidance": "LM Guidance (CFG)",
@@ -516,7 +517,7 @@ class family_handler:
         submodel_no_list=None,
         text_encoder_filename=None,
         profile=0,
-        lm_decoder_engine="legacy",
+        lm_features=None,
         **kwargs,
     ):
         transformer_weights = None
@@ -551,7 +552,7 @@ class family_handler:
             silence_latent = _get_model_path(model_def, "ace_step15_silence_latent", _ace_step15_ckpt_file(ACE_STEP15_SILENCE_LATENT_NAME))
             if enable_lm:
                 lm_weight_name = os.path.basename(str(lm_weights)) if lm_weights else ""
-                print(f"[ace_step15] LM engine='{lm_decoder_engine}' | LM weights='{lm_weight_name}'")
+                print(f"[ace_step15] LM weights='{lm_weight_name}'")
 
             pipeline = ACEStep15Pipeline(
                 transformer_weights_path=transformer_weights,
@@ -566,7 +567,7 @@ class family_handler:
                 silence_latent_path=silence_latent,
                 enable_lm=enable_lm,
                 ignore_lm_cache_seed=ignore_lm_cache_seed,
-                lm_decoder_engine=lm_decoder_engine,
+                lm_features=lm_features,
                 device=mps_device(),
                 dtype=dtype or torch.bfloat16,
             )
@@ -579,7 +580,7 @@ class family_handler:
             if text_encoder_filename and pipeline.lm_model is not None:
                 pipe["text_encoder"] = pipeline.lm_model
 
-            pipe = { "pipe": pipe, "coTenantsMap": {}, }
+            pipe = { "pipe": pipe, "coTenantsMap": {}, "cudaGraphs": ["text_encoder"] if "text_encoder" in pipe and lm_features.graphs else False}
 
             if save_quantized and transformer_weights:
                 from wgp import save_quantized_model

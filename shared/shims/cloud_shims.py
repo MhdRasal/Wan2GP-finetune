@@ -60,9 +60,30 @@ class _DummyTensor:
         return self
     def clone(self):
         return self
+    def item(self):
+        if self.data is not None:
+            try:
+                return float(self.data)
+            except Exception:
+                return self.data
+        return 0.0
+    def float(self):
+        return self
+    def int(self):
+        return self
+    def long(self):
+        return self
+    def half(self):
+        return self
+    def bfloat16(self):
+        return self
     def numpy(self):
         import numpy as np
         return np.array(self.data) if self.data is not None else np.array([])
+    def __float__(self):
+        return float(self.item())
+    def __int__(self):
+        return int(self.item())
     def __repr__(self):
         return f"DummyTensor(shape={self.shape}, dtype={self.dtype})"
 
@@ -262,6 +283,8 @@ class UniversalMockFinder(MetaPathFinder):
         if top in KNOWN_SYSTEM_PACKAGES:
             return None
         if top in MOCK_HEAVY_PACKAGES:
+            return ModuleSpec(fullname, MockLoader(), is_package=True)
+        if top == "torch" and fullname != "torch":
             return ModuleSpec(fullname, MockLoader(), is_package=True)
         return None
 
@@ -512,6 +535,12 @@ def _create_mock_torch() -> types.ModuleType:
     overrides_mod.TorchFunctionMode = TorchFunctionMode
     torch_mod.overrides = overrides_mod
 
+    # Memory formats
+    torch_mod.preserve_format = "preserve_format"
+    torch_mod.contiguous_format = "contiguous_format"
+    torch_mod.channels_last = "channels_last"
+    torch_mod.channels_last_3d = "channels_last_3d"
+
     # Basic tensor creation stubs
     torch_mod.from_numpy = lambda arr: _DummyTensor(data=arr)
     torch_mod.zeros = lambda *a, **k: _DummyTensor()
@@ -521,6 +550,12 @@ def _create_mock_torch() -> types.ModuleType:
     torch_mod.save = lambda obj, f, **k: None
     torch_mod.load = lambda f, **k: {}
     torch_mod.manual_seed = lambda s: None
+
+    def _torch_getattr(name: str):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return MockModule(f"torch.{name}")
+    torch_mod.__getattr__ = _torch_getattr
 
     return torch_mod
 

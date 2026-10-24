@@ -12,6 +12,7 @@ from shared.mcp.config import DEFAULT_PORT, server_port
 from shared.gradio.form_sync import GradioForm
 from shared.utils.form_sync import Saved
 from shared.deepy.config import DEEPY_VOICE_LANGUAGE_KEY, deepy_voice_language_choices, normalize_deepy_voice_language
+from shared.deepy.assets import WHISPER_MODEL_CHOICES, WHISPER_MODEL_KEY
 from shared.deepy.voice import VOICE_MODE_KEY, VOICE_MODE_CHOICES, voice_mode
 from shared.deepy.engine import get_or_create_assistant_session
 from shared.gradio import assistant_chat, gradio_queue_focus_patch, ui_studio
@@ -160,13 +161,15 @@ def deepy_filesystem_ui_state(deepy_type):
     return access, everywhere
 
 
-WHOLE_MODEL_PROFILES = (1, 3, 3.5) # memory profiles that load each model whole in VRAM: nothing to preload
+IMPLICIT_DYNAMIC_PROFILES = (1, 3, 3.5) # these profiles always enable dynamic preload
 PRELOAD_MODES = [("Default", "default"), ("Dynamic", "dynamic"), ("Manual", "manual")]
 MEMORY_ADVICE = """**Profile 4 is recommended for most PCs.** It sends the main model to the GPU part by part while the GPU works: models larger than your VRAM still run, most of the VRAM stays free for long videos or large images, and the speed cost is small. *Reserved RAM* is memory set aside to make these transfers fast. Other programs cannot use it, so only part of your RAM is reserved.
 
-**For image models, use Profile 4 or 5 with a *Dynamic* or *Manual* VRAM Preload for faster generations.** Their steps are short, so the transfers set the speed. The *VRAM Preload* next to each memory profile (Profiles 2, 4 and 5) keeps part of each model in VRAM: *Default* keeps the profile's choice; *Dynamic* keeps as much of the model as each generation leaves free and gives part of it back if VRAM runs short (it needs the MMGP Optimized VRAM Allocator); *Manual* keeps the amount set below it (8000 MB or more brings Flux close to Profile 1). Video steps are usually long enough to hide the transfers.
+**For image models, use Profile 4 or 5 with a *Dynamic* or *Manual* VRAM Preload for faster generations.** Their steps are short, so the transfers set the speed. The *VRAM Preload* next to each memory profile (Profiles 0, 2, 4 and 5) keeps part of each model in VRAM: *Default* keeps the profile's choice (*Dynamic* for Profile 0, none for Profiles 2, 4 and 5); *Dynamic* keeps as much of the model as each generation leaves free and gives part of it back if VRAM runs short (it needs the MMGP Optimized VRAM Allocator); *Manual* keeps the amount set below it (8000 MB or more brings Flux close to Profile 1). Video steps are usually long enough to hide the transfers.
 
-**Profile 3+ is recommended for audio models** (their default): they are usually small enough to fit entirely in VRAM, where the language model many of them include runs much faster and can use the faster CUDA Graph or vLLM engines (*Performance* tab).
+**Profile 0 adapts to your PC:** like profile 4, it sends each model to the GPU part by part, but no model keeps Reserved RAM for good: the model running gets it for its parts, which then reach the GPU at full speed, and it passes to the next model when you switch. Fast with much less RAM than the profiles that keep models in Reserved RAM, also for models larger than your VRAM. By default its *VRAM Preload* also keeps as much of each model in VRAM as fits, like profile 3 (*Dynamic*); choose *Manual* for a fixed amount. The language models of Deepy and the prompt enhancer always use it, with *Dynamic* preload.
+
+**Profiles 1 and 3 enable Dynamic Preload automatically:** profile 1 uses profile 2's RAM policy, and profile 3 uses profile 4's. They keep as much of each model in VRAM as fits alongside the generation's working memory, streaming the remaining layers. **Profile 3 is the default for new audio configurations.** Profile 3+ has the same placement policy without reserved RAM. LM engines that require fixed weight addresses use uncaptured steps while layers can move; models with MMGP block graphs can retain those graphs during offloading.
 
 Change the settings below only if needed:
 - **Your PC runs short of RAM:** lower *Reserved RAM for Pinning* and keep *Smart Memory Pinning* On.
@@ -187,6 +190,8 @@ class ConfigTabPlugin(WAN2GPPlugin):
         self.request_global("attention_mode")
         self.request_global("compile")
         self.request_global("compile_choices")
+        self.request_global("transformer_quantization_choices")
+        self.request_global("text_encoder_quantization_choices")
         self.request_global("default_profile_video")
         self.request_global("default_profile_image")
         self.request_global("default_profile_audio")
@@ -229,8 +234,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
 
         self.request_component("model_description")
         self.request_component("header")
-        self.request_component("override_attention")
-        self.request_component("override_compile")
+        self.request_component("overrides")
         self.request_component("model_family")
         self.request_component("model_base_type_choice")
         self.request_component("model_choice")
@@ -348,8 +352,8 @@ class ConfigTabPlugin(WAN2GPPlugin):
                     )
                     self.floating_generate_button_choice = gr.Checkbox(
                         value=self.server_config.get("floating_generate_button", True),
-                        label="Enable Floating Generate Button (requires restart)",
-                        info="Keep generation controls visible on the right until they reach their place below the gallery. Also enables floating Edit Mode controls.",
+                        label="Enable Floating Action Buttons (requires restart)",
+                        info="Keep generation, selected-media and Edit Mode controls visible until they reach their place on the page. Media actions use a separate floating panel.",
                         interactive=not self.args.lock_config
                     )
                     self.queue_color_scheme_choice = gr.Dropdown(
@@ -374,25 +378,15 @@ class ConfigTabPlugin(WAN2GPPlugin):
                         choices=self.attention_modes_choices,
                         value=self.attention_mode, label="Attention Type", interactive=not self.args.lock_config
                     )
-                    self.quantization_choice = gr.Dropdown(choices=[("Scaled Int8 (recommended)", "int8"), ("Scaled Fp8", "fp8"), ("16-bit (no quantization)", "bf16")], value=self.transformer_quantization, label="Transformer Model Quantization (if available otherwise get the closest available)")
+                    self.quantization_choice = gr.Dropdown(choices=self.transformer_quantization_choices, value=self.transformer_quantization, label="Transformer Model Quantization (if available otherwise get the closest available)")
                     self.transformer_dtype_policy_choice = gr.Dropdown(choices=[("Auto (Best for Hardware)", ""), ("FP16", "fp16"), ("BF16", "bf16")], value=self.transformer_dtype_policy, label="Transformer Data Type (if available)")
                     self.mixed_precision_choice = gr.Dropdown(choices=[("16-bit only (less VRAM)", "0"), ("Mixed 16/32-bit (better quality)", "1")], value=self.server_config.get("mixed_precision", "0"), label="Transformer Engine Precision")
-                    self.text_encoder_quantization_choice = gr.Dropdown(choices=[("16-bit (more RAM, better quality)", "bf16"), ("8-bit (less RAM, slightly lower quality)", "int8")], value=self.text_encoder_quantization, label="Text Encoder Quantization")
-                    self.lm_decoder_engine_choice = gr.Dropdown(
-                        choices=[
-                            ("Auto", ""),
-                            ("PyTorch: slow, compatible", "legacy"),
-                            ("Cuda Graph: up to x6 faster, whole LM will be loaded in VRAM", "cg"),
-                            ("vllm: up to x10 faster, whole LM will be loaded in VRAM, requires Triton & Flash Attention 2", "vllm"),
-                        ],
-                        value=self.server_config.get("lm_decoder_engine", ""),
-                        label="Language Models Decoder Engine (when available for a model, used also by Prompt Enhancer and Deepy)",
-                    )
+                    self.text_encoder_quantization_choice = gr.Dropdown(choices=self.text_encoder_quantization_choices, value=self.text_encoder_quantization, label="Text Encoder Quantization")
                     self.compile_choice = gr.Dropdown(choices=self.compile_choices, value=self.compile, label="Transformer Compilation (faster, but the first generation is slower and some GPUs/Models may not support it)", interactive=not self.args.lock_config)
                     self.boost_choice = gr.Dropdown(choices=[("ON", 1), ("OFF", 2)], value=self.boost, label="Boost Layers Offloading when CFG > 1 (~10% speedup for ~1GB VRAM)")
-                    self.int8_kernels_choice = gr.Dropdown(choices=int8_backend.CHOICES, value=self.server_config.get("int8_kernels", "auto"), label="INT8 Math Kernels", info="Auto selects Comfy Kitchen, then Triton, then PyTorch. Disabled uses PyTorch. Changes apply to the next generation without reloading weights.")
+                    self.int8_kernels_choice = gr.Dropdown(choices=int8_backend.CHOICES, value=self.server_config.get("int8_kernels", "auto"), label="INT8 Math Kernels", info="Auto selects WGPKernels, then Comfy Kitchen, then Triton, then PyTorch; an unavailable choice behaves as Auto. Disabled uses PyTorch. Other fused kernels (VAE, attention normalization) also try the selected family first. Changes apply to the next generation without reloading weights.")
                     self.fp8_kernels_choice = gr.Dropdown(choices=fp8_backend.CHOICES, value=self.server_config.get("fp8_kernels", "auto"), label="FP8 Math Kernels", info="For FP8 checkpoints. Auto uses CUDA FP8 when available, then Triton, then PyTorch. Changes apply to the next generation without reloading weights.")
-                    self.kernel_precision_choice = gr.Dropdown(choices=kernel_policy.CHOICES, value=self.server_config.get("kernel_precision", "fast"), label="CUDA Kernels Optimized Ops Precision (When Available)", info="Fast allows additional VAE optimizations with small rounding differences. Allow Faster Approximate Kernels is the default. INT8 math is controlled separately.")
+                    self.kernel_precision_choice = gr.Dropdown(choices=kernel_policy.CHOICES, value=self.server_config.get("kernel_precision", "fast"), label="CUDA Kernels Optimized Ops Precision (When Available)", info="Preserve Precision keeps only kernels at least as precise as standard PyTorch math. Allow Faster Approximate Kernels (default) adds faster kernels with small rounding differences. INT8 math is controlled separately.")
                     self.attention_head_split_choice = gr.Dropdown(choices=attention_kit.HEAD_SPLIT_CHOICES, value=self.server_config.get("attention_head_split", 0), label="Attention Head Split (much lower VRAM for long videos, up to 10% slower)", info="Models that support it compute attention one group of heads at a time for long sequences, which lowers the VRAM peak of denoising. Higher levels use more groups, saving more VRAM at a small speed cost; how many groups each level gives depends on the model. Applies to the next generation without reloading.")
                     self.process_queues_when_browser_unfocused_choice = gr.Checkbox(
                         value=bool(self.server_config.get(gradio_queue_focus_patch.FOCUS_QUEUE_SERVER_CONFIG_KEY, 1)),
@@ -439,7 +433,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
                     preload_info = "This part of each model stays in VRAM: less to transfer at each step, faster for short steps such as images, at the cost of VRAM."
                     profiles, modes, preloads = {}, {}, {}
                     for output_type, title, profile in (("video", "Video", self.default_profile_video), ("image", "Image", self.default_profile_image), ("audio", "Audio", self.default_profile_audio)):
-                        streamed, mode = profile not in WHOLE_MODEL_PROFILES, self.server_config[f"{output_type}_preload_mode"]
+                        streamed, mode = profile not in IMPLICIT_DYNAMIC_PROFILES, self.server_config[f"{output_type}_preload_mode"]
                         with gr.Group():
                             with gr.Row():
                                 profiles[output_type] = gr.Dropdown(choices=self.memory_profile_choices, value=profile, label=f"{title} - Default Memory Profile", scale=6)
@@ -460,12 +454,16 @@ class ConfigTabPlugin(WAN2GPPlugin):
                             label="Reserved RAM for Pinning (% of RAM, 0 = Auto)",
                             info="Auto: 40% on Windows, 60% on Linux. Same as the command line --perc-reserved-mem-max (a fraction, e.g. 0.4), which takes precedence, and as the environment variable perc_reserved_mem_max, which this setting overrides.",
                         )
-                    self.read_ahead_choice = gr.Checkbox(
-                        value=self.server_config.get("read_ahead", False), label="Read Ahead (Windows)",
-                        info="Reads the model files ahead of their use: faster loading when they are not already in RAM, such as the first load after a restart or with Profile 5. Windows may then keep more file data in its cache, shown as used RAM. Applies when models reload.",
+                    self.llm_cpu_compute_choice = gr.Dropdown(
+                        choices=[("Auto: the CPU helps when it is faster on this PC (recommended)", "auto"),
+                                 ("On: the CPU always helps, even when it is slower (to compare)", "on"),
+                                 ("Off: the layers that do not fit in VRAM are transferred to the GPU", "off")],
+                        value=self.server_config.get("llm_cpu_compute", "auto") if self.server_config.get("llm_cpu_compute", "auto") in ("on", "off") else "auto",
+                        label="Language Models CPU Compute (Prompt Enhancer and Deepy)",
+                        info="When the Language Model does not fit in VRAM, writing is much faster if the CPU processes part of the layers left in RAM while the GPU receives the others. Auto measures what is faster on this PC for each model format and leaves the layers to the GPU when the CPU is slower; On uses the CPU anyway, to compare. No effect when the model fits in VRAM. The Reserved RAM these models use while they write follows Memory Profile 0, which they always use.",
                     )
                     def update_preload_visibility(profile, mode):
-                        streamed = profile not in WHOLE_MODEL_PROFILES
+                        streamed = profile not in IMPLICIT_DYNAMIC_PROFILES
                         return gr.update(visible=streamed), gr.update(visible=streamed and mode == "manual")
                     for output_type in profiles:
                         for trigger in (profiles[output_type], modes[output_type]):
@@ -518,6 +516,10 @@ class ConfigTabPlugin(WAN2GPPlugin):
 
                     with gr.Group():
                         self.depth_anything_v2_variant_choice = gr.Dropdown(choices=[("Depth Anything 2 Large (more precise, slower)", "vitl"), ("Depth Anything 2 Big (less precise, faster)", "vitb"), ("Depth Anything 3 Metric Large (better temporal stability ?)", "da3_metric_large")], value=self.server_config.get("depth_anything_v2_variant", "vitl"), label="Depth Anything Preprocessor")
+                    gr.Markdown("**Speech Recognition**")
+                    with gr.Group():
+                        self.whisper_model_choice = gr.Dropdown(choices=WHISPER_MODEL_CHOICES, value=self.server_config.get(WHISPER_MODEL_KEY, "auto"), interactive=not self.args.lock_config,
+                            label="Whisper Model (Deepy Voice Input and Transcriptions, Prompt Enhancer, Reference Transcripts and Speech Alignment of Audio Models)")
 
 
                 with gr.Tab("Prompt Enhancer / Deepy"):
@@ -591,8 +593,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
                             interactive=not self.args.lock_config,
                         )
                     speculative_choices, speculative_method, token_choices, speculative_tokens = speculative_decoding_ui_state(
-                        enhancer_enabled_value, enhancer_quantization_value, self.server_config.get("lm_decoder_engine", ""),
-                        self.server_config.get(PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY, PROMPT_ENHANCER_SPECULATIVE_DECODING_DEFAULT))
+                        enhancer_enabled_value, enhancer_quantization_value, self.server_config.get(PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY, PROMPT_ENHANCER_SPECULATIVE_DECODING_DEFAULT))
                     with gr.Row(visible=not deepy_remote_default and enhancer_enabled_value in QWEN_PROMPT_ENHANCER_IDS) as self.enhancer_speculative_row:
                         self.enhancer_speculative_decoding_choice = gr.Dropdown(
                             choices=speculative_choices, value=speculative_method, label="Speculative Decoding",
@@ -711,8 +712,18 @@ class ConfigTabPlugin(WAN2GPPlugin):
                     if mcp_workspace_mode == 'auto':
                         mcp_workspace_mode = 'per_agent' if self.server_config.get('workspace_storage_mode', 'shared') == 'dedicated' else 'shared'
                     self.mcp_workspace_mode_choice = gr.Dropdown(
-                        choices=[('Use Selected Workspace (agents use the current gallery workspace)', 'shared'), ('Create a Workspace per Agent (each agent automatically gets its own workspace)', 'per_agent')],
+                        choices=[('Use Selected Workspace (agents keep the workspace selected when they first connect)', 'shared'), ('Create a Workspace per Agent (each agent automatically gets its own workspace)', 'per_agent')],
                         value=mcp_workspace_mode, label='MCP Agent Workspace (requires restart)',
+                    )
+                    self.mcp_workspace_visibility_choice = gr.Dropdown(
+                        choices=[('Their Own Workspaces', 'own'), ('Their Own and Your Workspaces', 'own_and_user'), ('All Workspaces, Including Deepy Conversations and Other Agents', 'all')],
+                        value=self.server_config.get('mcp_workspace_visibility', 'own_and_user'), label='Workspaces Agents Can See',
+                        info='Agents can list and work in these workspaces. Your workspaces are the ones you created; Deepy conversation workspaces are named after your requests.',
+                    )
+                    self.mcp_visual_inspection_choice = gr.Dropdown(
+                        choices=[('Agents Look Themselves (they receive the images and video frames they choose)', 'agent'), ("WanGP's Visual Inspector Answers Their Questions (only text is sent back)", 'wangp'), ('Both', 'both')],
+                        value=self.server_config.get('mcp_visual_inspection', 'agent'), label='Visual Inspection by Agents',
+                        info="Agents with their own vision judge images best themselves. WanGP's Visual Inspector keeps images on this machine and saves network traffic: it uses the prompt enhancer's Qwen VL model (a running generation pauses briefly while it answers), or Deepy's remote engine when Deepy runs on one.",
                     )
 
                 with gr.Tab("Outputs"):
@@ -736,7 +747,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
                             ("AAC 256 kbps (High Quality, Recommended)", "aac_256"),
                             ("AAC 320 kbps (Very High Quality)", "aac_320"),
                             ("ALAC Lossless (preview/playback compatibility may be limited)", "alac"),
-                            ("FLAC Lossless (MP4/MKV only, playback compatibility may be limited)", "flac"),
+                            ("FLAC 16-bit (MP4 / MKV)", "flac"),
                         ],
                         value=self.server_config.get("audio_output_codec", "aac_128"),
                         visible=True,
@@ -748,7 +759,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
                     self.audio_stand_alone_output_codec_choice = gr.Dropdown(
                         choices=[
                             ("WAV (Lossless)", "wav"),
-                            ("FLAC (Lossless)", "flac"),
+                            ("FLAC 16-bit (Lossless)", "flac"),
                             ("MP3 128 kbps", "mp3_128"),
                             ("MP3 192 kbps", "mp3_192"),
                             ("MP3 320 kbps", "mp3_320"),
@@ -842,9 +853,9 @@ class ConfigTabPlugin(WAN2GPPlugin):
         self.deepy_context_tokens_choice.input(fn=update_deepy_context_label, inputs=deepy_context_label_inputs, outputs=[self.deepy_context_tokens_choice], show_progress="hidden")
         self.deepy_kv_cache_quantization_choice.input(fn=update_deepy_context_label, inputs=deepy_context_label_inputs, outputs=[self.deepy_context_tokens_choice], show_progress="hidden")
 
-        def update_speculative_decoding_choice(enhancer_enabled_choice, enhancer_quantization_choice, lm_decoder_engine_choice, method, tokens):
+        def update_speculative_decoding_choice(enhancer_enabled_choice, enhancer_quantization_choice, method, tokens):
             _, quantization, _ = prompt_enhancer_quantization_ui_state(enhancer_enabled_choice, enhancer_quantization_choice)
-            choices, method, counts, tokens = speculative_decoding_ui_state(enhancer_enabled_choice, quantization, lm_decoder_engine_choice, method, tokens)
+            choices, method, counts, tokens = speculative_decoding_ui_state(enhancer_enabled_choice, quantization, method, tokens)
             return gr.update(choices=choices, value=method, interactive=not self.args.lock_config), gr.update(choices=counts, value=tokens, interactive=bool(counts) and not self.args.lock_config)
 
         def update_enhancer_quantization_choice(enhancer_enabled_choice, enhancer_quantization_choice):
@@ -852,11 +863,10 @@ class ConfigTabPlugin(WAN2GPPlugin):
             return gr.update(choices=choices, value=value, visible=visible)
 
         self.enhancer_enabled_choice.input(fn=update_enhancer_quantization_choice, inputs=[self.enhancer_enabled_choice, self.enhancer_quantization_choice], outputs=[self.enhancer_quantization_choice], show_progress="hidden")
-        speculative_inputs = [self.enhancer_enabled_choice, self.enhancer_quantization_choice, self.lm_decoder_engine_choice, self.enhancer_speculative_decoding_choice, self.enhancer_speculative_tokens_choice]
+        speculative_inputs = [self.enhancer_enabled_choice, self.enhancer_quantization_choice, self.enhancer_speculative_decoding_choice, self.enhancer_speculative_tokens_choice]
         speculative_outputs = [self.enhancer_speculative_decoding_choice, self.enhancer_speculative_tokens_choice]
         self.enhancer_enabled_choice.change(fn=update_speculative_decoding_choice, inputs=speculative_inputs, outputs=speculative_outputs, show_progress="hidden")
         self.enhancer_quantization_choice.change(fn=update_speculative_decoding_choice, inputs=speculative_inputs, outputs=speculative_outputs, show_progress="hidden")
-        self.lm_decoder_engine_choice.input(fn=update_speculative_decoding_choice, inputs=speculative_inputs, outputs=speculative_outputs, show_progress="hidden")
         self.enhancer_speculative_decoding_choice.input(fn=update_speculative_decoding_choice, inputs=speculative_inputs, outputs=speculative_outputs, show_progress="hidden")
 
         def update_remote_engine_ui(deepy_engine, enhancer_quantization, deepy_type):
@@ -915,25 +925,25 @@ class ConfigTabPlugin(WAN2GPPlugin):
             self.display_stats_choice, self.max_frames_multiplier_choice, self.keep_resolution_on_model_switch_choice, self.enable_4k_resolutions_choice, self.checkpoints_paths_choice, self.loras_root_choice, self.save_queue_if_crash_choice,
             self.UI_theme_choice, self.floating_generate_button_choice, self.queue_color_scheme_choice, self.process_queues_when_browser_unfocused_choice, self.prevent_power_throttling_choice, self.compute_cache_choice, self.compute_cache_path_choice,
             self.quantization_choice, self.transformer_dtype_policy_choice, self.mixed_precision_choice,
-            self.text_encoder_quantization_choice, self.lm_decoder_engine_choice, self.compile_choice,
+            self.text_encoder_quantization_choice, self.compile_choice,
             self.depth_anything_v2_variant_choice,
             self.vae_config_choice, self.boost_choice, self.int8_kernels_choice, self.fp8_kernels_choice, self.kernel_precision_choice, self.attention_head_split_choice,
             self.video_profile_choice, self.image_profile_choice, self.audio_profile_choice, self.video_preload_choice, self.image_preload_choice, self.audio_preload_choice,
             self.video_preload_mode_choice, self.image_preload_mode_choice, self.audio_preload_mode_choice,
-            self.smart_memory_pinning_choice, self.perc_reserved_mem_max_choice, self.read_ahead_choice, self.vram_allocator_choice, self.ram_allocator_choice, self.max_reserved_loras_choice,
-            self.deepy_llm_engine_choice,
+            self.smart_memory_pinning_choice, self.perc_reserved_mem_max_choice, self.vram_allocator_choice, self.ram_allocator_choice, self.max_reserved_loras_choice,
+            self.llm_cpu_compute_choice, self.deepy_llm_engine_choice,
             *self.codex_config_ui.save_components,
             *self.claude_config_ui.save_components,
             *self.opencode_config_ui.save_components,
             self.enhancer_enabled_choice, self.enhancer_quantization_choice, self.enhancer_speculative_decoding_choice, self.enhancer_speculative_tokens_choice, self.enhancer_mode_choice,
             self.prompt_enhancer_temperature_choice, self.prompt_enhancer_top_p_choice, self.prompt_enhancer_randomize_seed_choice,
-            self.matanyone_version_choice,
+            self.matanyone_version_choice, self.whisper_model_choice,
             self.deepy_type_choice, self.deepy_vram_mode_choice, self.deepy_voice_language_choice, self.voice_mode_choice, self.deepy_allow_read_file_system_choice, self.deepy_file_system_paths_choice, self.deepy_read_everywhere_choice,
             self.deepy_context_tokens_choice, self.deepy_kv_cache_quantization_choice, self.deepy_compaction_type_choice, self.deepy_repetition_penalty_choice, self.deepy_zero_custom_system_prompt_choice, self.deepy_prime_custom_system_prompt_choice, self.deepy_prime_mcp_servers_choice, self.deepy_mcp_auto_discover_paths_choice,
             self.video_container_choice, self.video_output_codec_choice, self.rgba_video_output_choice, self.hdr_video_crf_choice, self.image_output_codec_choice, self.audio_output_codec_choice, self.audio_stand_alone_output_codec_choice,
             self.metadata_choice, self.embed_source_images_choice,
             self.video_save_path_choice, self.image_save_path_choice, self.audio_save_path_choice, self.mesh_save_path_choice,
-            self.workspace_storage_choice, self.workspaces_root_choice, self.mcp_workspace_mode_choice, self.mcp_port_choice, self.mcp_webui_choice,
+            self.workspace_storage_choice, self.workspaces_root_choice, self.mcp_workspace_mode_choice, self.mcp_port_choice, self.mcp_webui_choice, self.mcp_workspace_visibility_choice, self.mcp_visual_inspection_choice,
             self.notification_sound_enabled_choice, self.notification_sound_volume_choice, self.notification_apprise_urls_choice, self.notification_secure_storage_choice, self.notification_on_generation_choice, self.notification_on_queue_complete_choice, self.notification_on_queue_interrupted_choice,
             *self.audio_processor_config_components,
             *self.temporal_upsampler_config_components,
@@ -945,8 +955,8 @@ class ConfigTabPlugin(WAN2GPPlugin):
         view_events = [event for index, event in gr.context.get_blocks_context().fns.items() if index >= first_event and event.fn and event.outputs and all(kind in ('input', 'change') for _, kind in event.targets)]
         self.synced_form = GradioForm(self.state.value.service.forms, 'configuration', inputs[1:-1], view_events=view_events)
         self.synced_form.bind_save(
-            self.apply_btn.click, lambda *values: self._save_changes(*values[:-2], override_attention=values[-2], override_compile=values[-1]),
-            inputs=[*inputs, self.override_attention, self.override_compile],
+            self.apply_btn.click, lambda *values: self._save_changes(*values[:-1], overrides=values[-1]),
+            inputs=[*inputs, self.overrides],
             outputs=[
                 self.msg,
                 self.model_description,
@@ -982,7 +992,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
         self.release_RAM_btn.click(fn=release_ram_and_notify, inputs=[self.state])
         return [self.release_RAM_btn]
 
-    def _save_changes(self, state, *args, override_attention="", override_compile=""):
+    def _save_changes(self, state, *args, overrides=""):
         gen_in_progress = self.is_generation_in_progress()
         # return "<div style='color:red; text-align:center;'>Unable to change config when a generation is in progress.</div>", *[gr.update()]*5
 
@@ -1012,25 +1022,25 @@ class ConfigTabPlugin(WAN2GPPlugin):
             display_stats_choice, max_frames_multiplier_choice, keep_resolution_on_model_switch_choice, enable_4k_resolutions_choice, checkpoints_paths_choice, loras_root_choice, save_queue_if_crash_choice,
             UI_theme_choice, floating_generate_button_choice, queue_color_scheme_choice, process_queues_when_browser_unfocused_choice, prevent_power_throttling_choice, compute_cache_choice, compute_cache_path_choice,
             quantization_choice, transformer_dtype_policy_choice, mixed_precision_choice,
-            text_encoder_quantization_choice, lm_decoder_engine_choice, compile_choice,
+            text_encoder_quantization_choice, compile_choice,
             depth_anything_v2_variant_choice,
             vae_config_choice, boost_choice, int8_kernels_choice, fp8_kernels_choice, kernel_precision_choice, attention_head_split_choice,
             video_profile_choice, image_profile_choice, audio_profile_choice, video_preload_choice, image_preload_choice, audio_preload_choice,
             video_preload_mode_choice, image_preload_mode_choice, audio_preload_mode_choice,
-            smart_memory_pinning_choice, perc_reserved_mem_max_choice, read_ahead_choice, vram_allocator_choice, ram_allocator_choice, max_reserved_loras_choice,
-            deepy_llm_engine_choice,
+            smart_memory_pinning_choice, perc_reserved_mem_max_choice, vram_allocator_choice, ram_allocator_choice, max_reserved_loras_choice,
+            llm_cpu_compute_choice, deepy_llm_engine_choice,
             codex_executable_choice, codex_model_choice, codex_reasoning_effort_choice,
             claude_executable_choice, claude_model_choice, claude_reasoning_effort_choice,
             opencode_executable_choice, opencode_base_url_choice, opencode_provider_choice, opencode_model_choice, opencode_reasoning_effort_choice, opencode_config_choice,
             enhancer_enabled_choice, enhancer_quantization_choice, enhancer_speculative_decoding_choice, enhancer_speculative_tokens_choice, enhancer_mode_choice,
             prompt_enhancer_temperature_choice, prompt_enhancer_top_p_choice, prompt_enhancer_randomize_seed_choice,
-            matanyone_version_choice,
+            matanyone_version_choice, whisper_model_choice,
             deepy_type_choice, deepy_vram_mode_choice, deepy_voice_language_choice, voice_mode_choice, deepy_allow_read_file_system_choice, deepy_file_system_paths_choice, deepy_read_everywhere_choice,
             deepy_context_tokens_choice, deepy_kv_cache_quantization_choice, deepy_compaction_type_choice, deepy_repetition_penalty_choice, deepy_zero_custom_system_prompt_choice, deepy_prime_custom_system_prompt_choice, deepy_prime_mcp_servers_choice, deepy_mcp_auto_discover_paths_choice,
             video_container_choice, video_output_codec_choice, rgba_video_output_choice, hdr_video_crf_choice, image_output_codec_choice, audio_output_codec_choice, audio_stand_alone_output_codec_choice,
             metadata_choice, embed_source_images_choice,
             save_path_choice, image_save_path_choice, audio_save_path_choice, mesh_save_path_choice,
-            workspace_storage_choice, workspaces_root_choice, mcp_workspace_mode_choice, mcp_port_choice, mcp_webui_choice,
+            workspace_storage_choice, workspaces_root_choice, mcp_workspace_mode_choice, mcp_port_choice, mcp_webui_choice, mcp_workspace_visibility_choice, mcp_visual_inspection_choice,
             notification_sound_enabled_choice, notification_sound_volume_choice, notification_apprise_urls_choice, notification_secure_storage_choice, notification_on_generation_choice, notification_on_queue_complete_choice, notification_on_queue_interrupted_choice,
             last_resolution_choice
         ) = fixed_args
@@ -1071,7 +1081,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
 
         if qwen_local:
             try:
-                _, method, _, tokens = speculative_decoding_ui_state(enhancer_enabled_choice, enhancer_quantization_choice, lm_decoder_engine_choice, enhancer_speculative_decoding_choice, enhancer_speculative_tokens_choice)
+                _, method, _, tokens = speculative_decoding_ui_state(enhancer_enabled_choice, enhancer_quantization_choice, enhancer_speculative_decoding_choice, enhancer_speculative_tokens_choice)
                 enhancer_speculative_decoding_choice = validate_prompt_enhancer_speculative_decoding(enhancer_enabled_choice, speculative_decoding_config(method, tokens))
             except ValueError as exc:
                 gr.Info(f"Configuration was not saved: {exc}")
@@ -1142,13 +1152,13 @@ class ConfigTabPlugin(WAN2GPPlugin):
             "generation_preview": generation_preview_choice,
             "text_encoder_quantization": text_encoder_quantization_choice, "save_path": save_path_choice,
             "image_save_path": image_save_path_choice, "audio_save_path": audio_save_path_choice, "mesh_save_path": mesh_save_path_choice,
-            'workspace_storage_mode': workspace_storage_choice, 'workspaces_dir': workspaces_root_choice.strip() or 'workspaces', 'mcp_workspace_mode': mcp_workspace_mode_choice, 'mcp_port': mcp_port_choice, 'mcp_webui': mcp_webui_choice,
-            "lm_decoder_engine": lm_decoder_engine_choice,
+            'workspace_storage_mode': workspace_storage_choice, 'workspaces_dir': workspaces_root_choice.strip() or 'workspaces', 'mcp_workspace_mode': mcp_workspace_mode_choice, 'mcp_port': mcp_port_choice, 'mcp_webui': mcp_webui_choice, 'mcp_workspace_visibility': mcp_workspace_visibility_choice, 'mcp_visual_inspection': mcp_visual_inspection_choice,
             "compile": compile_choice, "profile": video_profile_choice,
             "video_profile": video_profile_choice, "image_profile": image_profile_choice, "audio_profile": audio_profile_choice,
             "video_preload_in_VRAM": video_preload_choice, "image_preload_in_VRAM": image_preload_choice, "audio_preload_in_VRAM": audio_preload_choice,
             "video_preload_mode": video_preload_mode_choice, "image_preload_mode": image_preload_mode_choice, "audio_preload_mode": audio_preload_mode_choice,
-            "smart_memory_pinning": smart_memory_pinning_choice, "perc_reserved_mem_max": perc_reserved_mem_max_choice, "read_ahead": read_ahead_choice, "vram_allocator": vram_allocator_choice, RAM_ALLOCATOR_KEY: ram_allocator_choice,
+            "smart_memory_pinning": smart_memory_pinning_choice, "perc_reserved_mem_max": perc_reserved_mem_max_choice, "vram_allocator": vram_allocator_choice, RAM_ALLOCATOR_KEY: ram_allocator_choice,
+            "llm_cpu_compute": llm_cpu_compute_choice,
             "vae_config": vae_config_choice,
             "mixed_precision": mixed_precision_choice, "metadata_type": metadata_choice,
             "transformer_quantization": quantization_choice, "transformer_dtype_policy": transformer_dtype_policy_choice,
@@ -1161,6 +1171,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
             LLM_CONFIG_KEY: llm_config_choice,
             "enhancer_mode": enhancer_mode_choice,
             "matanyone_version": matanyone_version_choice,
+            WHISPER_MODEL_KEY: whisper_model_choice,
             DEEPY_ENABLED_KEY: normalize_deepy_enabled(deepy_enabled_choice),
             DEEPY_TYPE_KEY: normalize_deepy_type(deepy_type_choice),
             DEEPY_VOICE_LANGUAGE_KEY: normalize_deepy_voice_language(deepy_voice_language_choice),
@@ -1266,7 +1277,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
         changes = list(updates)
 
         no_reload_keys = [
-            'workspace_storage_mode', 'workspaces_dir', 'mcp_workspace_mode', 'mcp_port', 'mcp_webui',
+            'workspace_storage_mode', 'workspaces_dir', 'mcp_workspace_mode', 'mcp_port', 'mcp_webui', 'mcp_workspace_visibility', 'mcp_visual_inspection',
             VOICE_MODE_KEY,
             DEEPY_VOICE_LANGUAGE_KEY,
             "attention_mode", "vae_config", "boost", "int8_kernels", "fp8_kernels", "kernel_precision", "attention_head_split", "save_path", "image_save_path", "audio_save_path", "mesh_save_path",
@@ -1291,7 +1302,6 @@ class ConfigTabPlugin(WAN2GPPlugin):
         self.set_global("default_profile_audio", new_server_config["audio_profile"])
         self.set_global("compile", new_server_config["compile"])
         self.set_global("text_encoder_quantization", new_server_config["text_encoder_quantization"])
-        self.set_global("lm_decoder_engine", new_server_config["lm_decoder_engine"])
         self.set_global("vae_config", new_server_config["vae_config"])
         self.set_global("boost", new_server_config["boost"])
         self.set_global("int8_kernels", new_server_config["int8_kernels"])
@@ -1307,12 +1317,12 @@ class ConfigTabPlugin(WAN2GPPlugin):
         set_deepy_runtime_config(self.server_config, self.server_config_filename)
         if needs_reload: self.set_global("reload_needed", True)
 
-        enhancer_runtime_changed = LLM_CONFIG_KEY in changes or "enhancer_enabled" in changes or "prompt_enhancer_quantization" in changes or "lm_decoder_engine" in changes or DEEPY_KV_CACHE_QUANTIZATION_KEY in changes or DEEPY_ENABLED_KEY in changes or DEEPY_VRAM_MODE_KEY in changes
+        enhancer_runtime_changed = LLM_CONFIG_KEY in changes or "enhancer_enabled" in changes or "prompt_enhancer_quantization" in changes or DEEPY_KV_CACHE_QUANTIZATION_KEY in changes or DEEPY_ENABLED_KEY in changes or DEEPY_VRAM_MODE_KEY in changes
         deepy_type_changed = DEEPY_TYPE_KEY in changes
         deepy_prime_mcp_servers_changed = DEEPY_PRIME_MCP_SERVERS_KEY in changes or DEEPY_MCP_AUTO_DISCOVER_PATHS_KEY in changes
         deepy_file_access_changed = any(key in changes for key in (DEEPY_ALLOW_READ_FILE_SYSTEM_KEY, DEEPY_FILE_SYSTEM_PATHS_KEY, DEEPY_READ_EVERYWHERE_KEY, "save_path", "image_save_path", "audio_save_path", "mesh_save_path"))
         speculative_decoding_changed = PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY in changes
-        enhancer_profile_changed = "profile" in changes or "video_profile" in changes
+        enhancer_profile_changed = "profile" in changes or "video_profile" in changes or "llm_cpu_compute" in changes
         chat_event_update = gr.update()
         if enhancer_runtime_changed:
             session = get_or_create_assistant_session(state)
@@ -1348,7 +1358,7 @@ class ConfigTabPlugin(WAN2GPPlugin):
         model_type = state["model_type"]
         
         model_family_update, model_base_type_update, model_choice_update = self.generate_dropdown_model_list(model_type)
-        description_update, header_update = self.generate_header(model_type, compile=new_server_config["compile"], attention_mode=new_server_config["attention_mode"], override_attention=override_attention, override_compile=override_compile)
+        description_update, header_update = self.generate_header(model_type, compile=new_server_config["compile"], attention_mode=new_server_config["attention_mode"], overrides=overrides)
 
         if gen_in_progress:
             msg = "<div style='color:green; text-align:center;'>The new configuration has been succesfully applied. Some of the Settings will be only effective when you will start another Generation</div>"

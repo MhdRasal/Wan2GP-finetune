@@ -22,7 +22,7 @@ from shared.api import WanGPSession
 from shared.deepy import media_registry
 from shared.deepy.config import DEEPY_CONTEXT_TOKENS_DEFAULT, DEEPY_CONTEXT_TOKENS_KEY, DEEPY_MCP_AUTO_DISCOVER_PATHS_DEFAULT, DEEPY_MCP_AUTO_DISCOVER_PATHS_KEY, DEEPY_PRIME_MCP_SERVERS_KEY, get_deepy_config_value, get_deepy_runtime_config, normalize_deepy_context_tokens, normalize_deepy_mcp_auto_discover_paths, normalize_deepy_prime_mcp_servers
 from shared.gradio import assistant_chat
-from shared.mcp.server import build_inprocess_server, resolve_gallery_media_path
+from shared.mcp.server import _compact_job_snapshot, build_inprocess_server, resolve_gallery_media_path
 from shared.mcp.resources import RESOURCE_ALIASES, RESOURCE_DESCRIPTION, query_resources, resource_record, _extract_markdown_sections, _select_markdown_sections, _search_markdown_sections, _resource_read_blocks
 
 
@@ -464,7 +464,7 @@ class DeepyPrimeTools:
             generated_files = list(result.get("generated_files", []) or [])
             if generated_files:
                 snapshot["output_file"] = str(generated_files[-1])
-        return snapshot
+        return _compact_job_snapshot(snapshot, keep_paths=True)  # the chat attaches generated_files / output_file
 
     def _wait_for_generation(self, initial: dict[str, Any], timeout_s: float | None = None, event_limit: int = 0) -> dict[str, Any]:
         job_id = str(initial.get("job_id", "") or "").strip()
@@ -497,7 +497,7 @@ class DeepyPrimeTools:
                         continue
                     if deadline is not None and not self.assistant_session.pause_requested and time.monotonic() >= deadline:
                         self._watch_background_job(job_id, trigger_queue=not queue_triggered)
-                        return {**snapshot, "status": "timeout", "waiting_timed_out": True}
+                        return _compact_job_snapshot({**snapshot, "status": "timeout", "waiting_timed_out": True})
                     time.sleep(self._POLL_INTERVAL_SECONDS)
                     snapshot = self._server._wangp_jobs.get(job_id).snapshot(event_limit=event_limit)
         finally:
@@ -534,17 +534,16 @@ class DeepyPrimeTools:
             "Deepy Settings / General Properties determine whether dimensions, frame count or audio duration, and seed come from templates or from standing defaults.",
             f"Use properties defined in template settings files: {bool(settings['use_template_properties'])}.",
         ]
-        if settings["use_template_properties"]:
-            lines.append("When using a Deepy template, retain its width, height, frame count, audio duration, and seed unless the user asks for an override.")
+        if settings["use_template_properties"]:  # named as settings: "width" and "height" are not setting names
+            lines.append("When using a Deepy template, retain its resolution, video_length, duration_seconds and seed unless the user asks for an override.")
         else:
             lines.extend([
-                f"Default width: {int(settings['width'])}.",
-                f"Default height: {int(settings['height'])}.",
-                f"Default video frame count: {int(settings['num_frames'])}.",
-                f"Default audio duration: {int(settings['audio_duration'])} seconds.",
+                f"Default resolution: \"{int(settings['width'])}x{int(settings['height'])}\".",
+                f"Default video_length: {int(settings['num_frames'])} frames.",
+                f"Default audio duration_seconds: {int(settings['audio_duration'])}.",
                 f"Default seed: {int(settings['seed'])}.",
             ])
-            lines.append("Override compatible template/model defaults with the width, height, frame count, audio duration, and seed above when the user does not specify them.")
+            lines.append("Override compatible template/model defaults with the resolution, video_length, duration_seconds and seed above when the user does not specify them.")
         lines.append("The generate tool fills omitted dimensions, duration, and seed from Deepy's standing defaults before model factory defaults; pass the template values explicitly to preserve them.")
         return "\n".join(lines)
 
@@ -600,11 +599,22 @@ class DeepyPrimeTools:
         metadata = self._api_session.get_model_metadata(model_type) or {}
         return str(metadata.get("name", "") or model_type.replace("_", " ").replace("-", " ").title()).strip(), metadata
 
+    def _template_label_settings(self, template: Any) -> dict[str, Any]:
+        from shared.mcp.server import _deepy_template_settings
+
+        task, _, name = str(template).partition("/")
+        try:
+            return _deepy_template_settings(self._api_session, task, name.strip() or "default")["settings"]
+        except (KeyError, ValueError):  # an unknown task or template: the call itself reports it, the label stays generic
+            return {}
+
     def _generation_label_context(self, source: Any) -> tuple[str, str]:
         tasks = self._generation_settings(source)
         model_names = []
         media_kinds = []
         for settings in tasks:
+            if settings.get("template") and not settings.get("model_type"):  # a template reference: name the model the template runs
+                settings = {**self._template_label_settings(settings["template"]), **settings}
             model_name, metadata = self._model_label_metadata(settings.get("model_type", ""))
             if model_name and model_name not in model_names:
                 model_names.append(model_name)
@@ -684,7 +694,7 @@ class DeepyPrimeTools:
             settings = arguments.get("settings")
             if settings is None and isinstance(arguments.get("arguments"), dict):
                 settings = arguments["arguments"].get("source")
-            if settings is None and arguments.get("model_type"):
+            if settings is None and (arguments.get("model_type") or arguments.get("template")):
                 settings = arguments  # members already streamed from an incomplete settings object
             if settings is None:
                 return self.get_tool_display_name(tool_name)
@@ -770,7 +780,7 @@ class DeepyPrimeTools:
         toolbox = "action" in properties and "arguments" in properties
         unknown = set(arguments) - set(properties)
         if not PRIME_ASYNC_ENABLED and tool_name in {"wangp_generate", "wangp_postprocess"}:
-            unknown -= {"wait", "timeout_s"}
+            unknown -= {"wait", "timeout_s", "event_limit"}
         unknown = sorted(unknown)
         if unknown and (toolbox or parameters.get("additionalProperties") is False):
             hint = ' Put action at the top level and action parameters inside arguments: {"action":"<action>","arguments":{...}}.' if toolbox else " Pass the declared parameters directly, without action or arguments." if {"action", "arguments"} & set(unknown) else " Use only the declared parameters."
@@ -795,7 +805,7 @@ class DeepyPrimeTools:
         if toolbox and tool_name != "wangp_artifact" and arguments.get("arguments") is not None:
             nested = arguments["arguments"]
             if not isinstance(nested, dict):
-                hint = ' For rg, use {"action":"rg","arguments":{"command":"-n pattern -- @workspace/file.txt"}}.' if tool_name == "wangp_io" and arguments.get("action") == "rg" else ""
+                hint = ' For rg, use {"action":"rg","arguments":{"command":"-n pattern -- @documents/file.txt"}}.' if tool_name == "wangp_io" and arguments.get("action") == "rg" else ""
                 return 'arguments must be an object: {"action":"<action>","arguments":{...}}.' + hint
             if not arguments.get("action") and nested:
                 return 'action belongs at the top level, beside arguments: {"action":"<action>","arguments":{...}}. Nothing was executed.'
@@ -845,14 +855,17 @@ class DeepyPrimeTools:
                 arguments["arguments"] = dict(arguments["arguments"])
             for values in (arguments, arguments.get("arguments")):
                 if isinstance(values, dict):
-                    for name in ("wait", "timeout_s"):
+                    for name in ("wait", "timeout_s", "event_limit"):
                         if name in values:
                             values.pop(name)
                             if name not in ignored:
                                 ignored.append(name)
         result = self._call_mcp_tool(tool_name, arguments)
         if tool_name in {"wangp_generate", "wangp_postprocess"} and result.get("job_id") and not result.get("recovered"):
-            action_arguments = arguments if tool_name == "wangp_generate" else arguments["arguments"]
+            from shared.mcp.v2 import JOB_CONTROLS
+
+            # job controls sit at the top level; post-processing calls may still carry them inside arguments
+            action_arguments = arguments if tool_name == "wangp_generate" else {**{key: value for key, value in arguments["arguments"].items() if key in JOB_CONTROLS}, **{key: arguments[key] for key in JOB_CONTROLS if key in arguments}}
             if action_arguments.get("wait", True):
                 result = self._wait_for_generation(result, action_arguments.get("timeout_s"), action_arguments.get("event_limit", 0))
             else:

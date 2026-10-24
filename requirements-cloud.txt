@@ -21,6 +21,7 @@ numpy>=1.24.0
 opencv-python-headless>=4.8.0
 piexif
 imageio>=2.30.0
+imageio-ffmpeg
 soundfile>=0.12.0
 safetensors>=0.4.0
 xxhash>=3.0.0
@@ -43,6 +44,5 @@ runpod>=1.7.0
 # Deepy & Remote LLM Providers (OpenCode, Claude Code, FastMCP)
 mcp==1.30.0
 claude-agent-sdk==0.1.66
-timm
 pydub
 

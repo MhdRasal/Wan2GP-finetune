@@ -1,6 +1,6 @@
 
 <p align="center">
-  <H2>Memory Management 4.0.0 for the GPU Poor by DeepBeepMeep</H2>	
+  <H2>Memory Management 4.2.0 for the GPU Poor by DeepBeepMeep</H2>	
 </p>
 
 
@@ -22,6 +22,22 @@ Requirements: Python 3.10+, PyTorch 2.1+ (2.3+ for the VRAM allocator), an NVIDI
 - **Co-tenancy**: models used alternately can stay in VRAM together.
 - **Progress reporting and cancellation** of loading, quantization and pinning.
 - **PyTorch compilation** of the main model.
+
+### Model execution API
+
+Model code can use `from mmgp import runtime, cuda_graphs` without inspecting MMGP's hook attributes:
+
+- `runtime.execution_device(module)` returns the execution device of a managed root or submodule, including while its weights are on CPU. For an unmanaged module it returns its first parameter/buffer's device (CPU for an empty module).
+- `runtime.ensure_loaded(module)` requests the owning model's base/preloaded weights before a custom entry point reads them. It keeps the normal co-tenancy and block-swapping policy; it does not make all blocks resident. It does nothing for an unmanaged module.
+- `cuda_graphs.run(stage, *args, owner=model, method="forward", enabled=True, **kwargs)` executes an extra graphable stage inside `cuda_graphs.scope()`. A registered stage can omit `owner`. A separate stage can reuse a managed model's weights without changing checkpoint paths or registering those parameters again. Its method follows the same graph contract as a transformer block: weights and explicit inputs only, no CPU synchronization, and tensor outputs/in-place updates only.
+- `cuda_graphs.is_enabled(model)` checks graph availability inside the current scope, including registered gates and weight readiness, when preparation is specific to graph execution. `run()` also enforces these conditions.
+
+Extra stages use their owner's existing graph cache, LoRA inputs, weight-placement keys and cleanup. Outside a graph scope, when disabled, or when the owner has no CUDA-graph manager, `run()` calls the selected method normally. PyTorch compilation alone does not enable MMGP CUDA graphs. Module ownership is registered independently of compilation hooks and removed on release; it does not keep models or managers alive. Separately managed roots own themselves; shared descendants use the last configured owner, so pass an explicit root as `owner` when a graph stage uses shared modules.
+
+```python
+with cuda_graphs.scope():
+    output = cuda_graphs.run(output_stage, hidden, conditioning, owner=transformer)
+```
 
 ### What's new in 4.0
 - MMGP Optimized VRAM Allocator (*mmgp.allocator*).
@@ -78,13 +94,17 @@ It is almost plug and play and just needs to be invoked from the main app just a
 Instead of a pipeline you may pass a dictionary of models, for instance *{ "transformer": model, "text_encoder": t5, "vae": vae }* (see *Special cases* below). Models that will receive LoRAs must be declared with the *loras* parameter (see *LoRAs* below).
 
 You can choose between 5 profiles depending on your hardware:
-- HighRAM_HighVRAM  (1): each model loaded whole in VRAM, all models kept in reserved RAM. The fastest generations and model switches, needs the most RAM and VRAM
+- HighRAM_HighVRAM  (1): profile 2 with automatic VRAM preload. All models kept in reserved RAM; as many blocks as fit beside the workload stay in VRAM, and the rest are streamed.
 - HighRAM_LowVRAM  (2): all models kept in reserved RAM, sent to the GPU part by part. Runs models larger than the VRAM, leaves VRAM for long videos or large images and switches models fast, needs a lot of RAM
-- LowRAM_HighVRAM  (3): each model loaded whole in VRAM, only the main model ('transformer') kept in reserved RAM. Fast generations with less RAM, needs enough VRAM for the whole model
+- LowRAM_HighVRAM  (3): profile 4 with automatic VRAM preload. Only the main model ('transformer') kept in reserved RAM; as many blocks as fit beside the workload stay in VRAM, and the rest are streamed.
 - LowRAM_LowVRAM  (4): only the main model ('transformer') kept in reserved RAM, sent to the GPU part by part. The most versatile: runs models larger than the VRAM and leaves VRAM for long videos or large images
 - VerylowRAM_LowVRAM  (5): no reserved RAM (only a small staging ring with smartPinning), all models sent to the GPU part by part. For PCs short of RAM and VRAM, slower with short steps such as images
 
-Profile 4 is recommended for most configurations, and profile 2 if you have plenty of RAM. Profiles 1 and 3 are faster when the whole model fits in VRAM, which is often the case with image models. Profile 5, the default of *offload.profile*, is the safest: if your application runs out of memory, try it first and move to profile 4 and then to profile 2 as long as it remains responsive.
+Profile 4 is recommended for most configurations, and profile 2 if you have plenty of RAM. Profiles 1 and 3 enable `autoPreload` implicitly: after measuring a workload, they retain as much of the model as fits, including the whole model when possible. With the MMGP VRAM allocator, optional preload can be reclaimed under memory pressure. Without that allocator, the corresponding profile 2/4 budgets apply. Profile 5, the default of *offload.profile*, uses the least reserved RAM.
+
+Models with an `mmgp.experts.ExpertBank` keep their source expert tensors in pageable CPU memory in every profile. Individual experts can have GPU copies, independently within each layer. Ordinary blocks of the model and its declared co-tenants have priority; experts use only the remaining preload budget and are reclaimed first when VRAM runs short. Profiles 2/4/5 leave experts on the CPU unless an explicit budget has room after the ordinary weights, or `autoPreload` is enabled. Profiles 1/3 choose the expert preload dynamically. Splitting a checkpoint does not require loading all its parts into VRAM: register independent stages in the pipe and use `coTenantsMap` for stages that alternate during generation.
+
+An expert compute backend reads `resident_tensors()` inside the bank's `lease()` and executes the other selected experts on the CPU. MMGP owns the GPU copies; the backend must not move source weights. The provided `mmgp.expert_compute.SwiGLUExperts` backend routes, places and schedules SwiGLU experts; their storage format and kernels come from an `ExpertFormat` that a quantization handler registered with `mmgp.quant_router` declares in its `EXPERT_FORMATS`. A bank takes the format of the checkpoint tensors it loads. Its CPU computation runs as a CUDA host function inside the captured graphs, beside optional GPU kernels for the experts with GPU copies. `MMGP_CPU_EXPERT_THREADS` controls the worker count given to the CPU kernels (default: up to eight). Models can wrap generation in `mmgp.runtime.execution_scope(checkpoint)` to make large expert preloads cancellable through their local abort check.
 
 By default the model named 'transformer' is quantized to 8 bits with every profile; set *quantizeTransformer = False* if you do not want it. Profiles 3, 4 and 5 also quantize the text encoders named 'text_encoder' or 'text_encoder_2' when they are T5, Llama or other LLM models.
 
@@ -121,7 +141,7 @@ For example:
 - budgets: either a number in mega bytes (for all models, 0 for an unlimited budget), a string that is a percentage of the total VRAM (for instance "80%"), or a dictionary that maps model ids to mega bytes or percentages: the approximate VRAM allocated to a model. To define the default value in the dictionary, add an entry named "*".\
 The smaller this number, the more VRAM is left for image data / longer videos, but the slower, since the parts of the model are transferred between the RAM and the VRAM at each step. A model too big for its budget is broken down into blocks loaded one after the other; the part of the budget that these transfers do not need keeps blocks permanently in VRAM. The speed of a low budget increases (up to 2 times) with reserved RAM and asyncTransfers.
 - workingVRAM: either a number in mega bytes, a string that is a percentage of the total VRAM, or a dictionary that maps model ids to mega bytes: a minimum amount of VRAM that should be left for the data processed by the model. This number prevails if it is in conflict with a too high budget defined for the same model.
-- vram_safety_coefficient: float between 0 and 1, 0.8 by default: the maximum share of the VRAM that the models may occupy.
+- vram_safety_coefficient: float between 0 and 1, 0.85 by default: the maximum share of the VRAM that the models may occupy.
 - asyncTransfers: True by default. The next blocks of a model are transferred to the GPU while the current block is computed. This may increase speed by 20% (mostly visible on fast modern GPUs).
 - prefetchWindow: None by default: 2 for the models whose budget also preloads blocks in VRAM, 1 for the others. With asyncTransfers, number of blocks transferred ahead of the block being computed, for the models that are pinned or copied through the staging ring. The GPU itself orders these transfers after the computation of the blocks whose memory they reuse, so the next transfers are prepared during the computation; the blocks in transit (window + 1) are taken from the budget of the model, so a window of 2 costs no VRAM beyond it. Windows beyond 1 are only used if their extra blocks fit in 5% of the VRAM. 0 waits for the GPU after every block.
 - autoPreload: False by default. With the MMGP Optimized VRAM Allocator (`mmgp.allocator.install()`), the models processed block by block keep in VRAM as much of their blocks as each workload (a denoising stage, a resolution, a model of the pipe) leaves free, instead of the preload of their budget: the first step of a new workload measures what it needs, the next ones fill the VRAM left, and part of the model leaves the VRAM if it runs short, instead of an out of memory error. *True* keeps what was measured for the process; a dictionary keeps it in it, so that an application can tie it to a model definition. Not applied to compiled models or without asynchronous transfers.
@@ -129,6 +149,7 @@ The smaller this number, the more VRAM is left for image data / longer videos, b
 - coTenantsMap: a dictionary that maps a model id to a list of other models with which it accepts to share the VRAM at the same time. This is useful to avoid inefficient loading / unloading when two models are used alternately. For instance with *coTenantsMap = { "text_encoder_2": ["text_encoder"] }*, when *text_encoder_2* is loaded it won't unload *text_encoder*. Please note that the reverse is not true as these maps are by design not symmetrical, to allow tailored workflows. If you also need *text_encoder* not to unload *text_encoder_2*: *coTenantsMap = { "text_encoder_2": ["text_encoder"], "text_encoder": ["text_encoder_2"] }*. A small auxiliary model mapped to "*" stays in VRAM with any other model and is never unloaded for one.
 - compile: list of model ids to compile, which may accelerate up to x2 depending on the GPU. It makes sense to compile only the model that is used the most, such as the "transformer" model of a video or image generator. Compilation requires Triton, available out of the box on Linux and WSL; on Windows install https://github.com/woct0rdho/triton-windows. *compile_mode* sets the mode of torch.compile ("default"). A submodule with a *_compile_me* attribute set to True or False is compiled or left out whatever its position.
 - loading_callback: an *offload.LoadingCallback* to report progress and accept cancellation (see *Loading progress and cancellation*).
+- preloadExperts: whether an explicit `budgets` allowance can also preload individual experts after ordinary layers. `offload.all` defaults to True; profiles enable it only when the caller supplies a budget. Dynamic preload handles experts independently of this switch. Source expert weights are never pinned.
 - verboseLevel: number between 0 and 2 (1 by default), provides various levels of feedback on the different processes.
 
 If you are short on RAM and plan to work with quantized models, it is recommended to load pre-quantized models directly rather than using on the fly quantization: it is faster and consumes slightly less RAM.

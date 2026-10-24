@@ -100,17 +100,17 @@ def add_session_workspace(policy, session_id: str, workspace_path: str | os.Path
         workspace = Path(workspace_path).expanduser().resolve()
     workspace.mkdir(parents=True, exist_ok=True)
     used = {alias.casefold() for alias in policy.aliases}
-    alias = "workspace"
+    alias = "documents"
     suffix = 2
     while alias.casefold() in used:
-        alias = f"workspace{suffix}"
+        alias = f"documents{suffix}"
         suffix += 1
     return policy.with_root(workspace, alias)
 
 
 def workspace_mount(policy) -> tuple[str, Path] | None:
     for alias, path in policy.mounts:
-        if re.fullmatch(r"workspace\d*", alias, flags=re.IGNORECASE):
+        if re.fullmatch(r"documents\d*", alias, flags=re.IGNORECASE):
             return alias, path
     return None
 
@@ -125,8 +125,7 @@ def long_text_system_instructions(policy) -> str:
         "Use rg(arguments) for bounded, read-only text search. Its syntax is rg options plus one pattern, then `--` and authorized @alias paths; omit paths to search the temporary workspace. "
         "Use append_text(file_path, text) to create a missing UTF-8 file or append exact literal text; include every intended newline and do not prefix lines with patch markers. "
         "Use edit(file_path, old_string, new_string, replace_all=false) for exact replacement. Search for enough local context that old_string occurs once, preserve its whitespace and line endings exactly, then search or read back the changed area. "
-        f"A generation prompt may be the exact reference `@file(\"{workspace}/prompt.txt\")`; WanGP snapshots the UTF-8 file into the queued task and preserves blank-line sliding-window boundaries. "
-        "For long prose or generation prompts, read wangp://skills/long-story-writing or wangp://skills/long-generation-prompts."
+        f"A generation prompt may be the exact reference `@file(\"{workspace}/prompt.txt\")`; WanGP snapshots the UTF-8 file into the queued task and preserves blank-line sliding-window boundaries."
     )
 
 
@@ -361,6 +360,8 @@ def edit_text(policy, file_path: str, old_string: str, new_string: str, replace_
         target = policy.require_read(file_path, file=True)
         policy.require_write(target)
         original, encoding = _decode_text(target.read_bytes(), policy.virtualize_path(target))
+        if "\r\n" in original and "\n" not in original.replace("\r\n", ""):  # read_text shows a CRLF file with plain newlines
+            old_string, new_string = (value.replace("\r\n", "\n").replace("\n", "\r\n") for value in (old_string, new_string))
         occurrences = original.count(old_string)
         if occurrences == 0:
             raise ValueError("old_string was not found exactly in the target file. Use rg and preserve whitespace and line endings.")
@@ -382,6 +383,7 @@ def append_text(policy, file_path: str, text: str, *, include_structure: bool = 
         created = not target.exists()
         if created:
             original, encoding = "", "utf-8"
+            target.parent.mkdir(parents=True, exist_ok=True)  # inside the authorized write area, like the file itself
         else:
             target = policy.require_read(target, file=True)
             original, encoding = _decode_text(target.read_bytes(), policy.virtualize_path(target))

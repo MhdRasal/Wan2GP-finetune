@@ -9,7 +9,8 @@ from .adaln import AdaLayerNormSingle, adaln_embedding_coefficient
 from .attention import AttentionCallable, AttentionFunction
 from .modality import Modality
 from .rope import LTXRopeType
-from .transformer import BasicAVTransformerBlock, TransformerConfig, _apply_scale_shift
+from .transformer import BasicAVTransformerBlock, TransformerConfig
+from shared.kernels import ops as kernels
 from .transformer_args import (
     MultiModalTransformerArgsPreprocessor,
     TransformerArgs,
@@ -458,8 +459,8 @@ class LTXModel(torch.nn.Module):
         )
         shift, scale = scale_shift_values[:, :, 0], scale_shift_values[:, :, 1]
 
-        x = norm_out(x)
-        x = _apply_scale_shift(x, scale, shift)
+        x_list, x = [x], None
+        x = kernels.layer_norm_modulate(x_list, shift, scale, norm_out.eps, frames=True)
         x = proj_out(x)
         return x
 
@@ -474,6 +475,10 @@ class LTXModel(torch.nn.Module):
         Returns:
             Processed output tensors
         """
+        with cuda_graphs.scope():  # with CUDA graphs, the preparation and the head run in the graph pool's idle memory (cuda_graphs.pooled)
+            return self._forward(video, audio, perturbations)
+
+    def _forward(self, video, audio, perturbations):
         if not self.model_type.is_video_enabled() and video is not None:
             raise ValueError("Video is not enabled for this model")
         if not self.model_type.is_audio_enabled() and audio is not None:
@@ -511,15 +516,17 @@ class LTXModel(torch.nn.Module):
                 return [None] * len(video_out_list), [None] * len(audio_out_list)
 
             vx_list = [
-                self._process_output(
-                    self.scale_shift_table, self.norm_out, self.proj_out, v_out.x, v_out.embedded_timestep
+                cuda_graphs.pooled(
+                    self, self._process_output, self.scale_shift_table, self.norm_out, self.proj_out, v_out.x, v_out.embedded_timestep
                 )
                 if v_out is not None
                 else None
                 for v_out in video_out_list
             ]
             ax_list = [
-                self._process_output(
+                cuda_graphs.pooled(
+                    self,
+                    self._process_output,
                     self.audio_scale_shift_table,
                     self.audio_norm_out,
                     self.audio_proj_out,
@@ -548,14 +555,16 @@ class LTXModel(torch.nn.Module):
             return None, None
 
         vx = (
-            self._process_output(
-                self.scale_shift_table, self.norm_out, self.proj_out, video_out.x, video_out.embedded_timestep
+            cuda_graphs.pooled(
+                self, self._process_output, self.scale_shift_table, self.norm_out, self.proj_out, video_out.x, video_out.embedded_timestep
             )
             if video_out is not None
             else None
         )
         ax = (
-            self._process_output(
+            cuda_graphs.pooled(
+                self,
+                self._process_output,
                 self.audio_scale_shift_table,
                 self.audio_norm_out,
                 self.audio_proj_out,

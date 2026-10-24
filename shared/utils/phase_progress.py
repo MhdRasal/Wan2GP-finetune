@@ -77,6 +77,30 @@ def set_phase_status(title):
             state.set_status(title)
 
 
+@contextmanager
+def progress_context(prefix):
+    """Prefix all phase events/statuses in a scope; yield its direct callback."""
+    state = _generation.get()
+    if state is None:
+        yield None
+        return
+    callback, set_status = state.callback, state.set_status
+    if callback is not None:
+        @wraps(callback)
+        def contextual_callback(*args, **kwargs):
+            title = kwargs.get("progress_title")
+            if title is not None:
+                kwargs["progress_title"] = f"{prefix} | {title}"
+            return callback(*args, **kwargs)
+        state.callback = contextual_callback
+    if set_status is not None:
+        state.set_status = lambda title: set_status(f"{prefix} | {title}")
+    try:
+        yield state.callback
+    finally:
+        state.callback, state.set_status = callback, set_status
+
+
 class PhaseProgress:
     def __init__(self, total, title="VAE Decoding", unit="tiles", next_status=None,
                  completion_hold=0.0):
@@ -121,8 +145,9 @@ class PhaseProgress:
                 # Fast final blocks can finish before the next throttled update.
                 # Report completion before replacing this phase's status.
                 remaining = self.state.next_update - monotonic()
-                if remaining > 0:
+                while remaining > 0:
                     sleep(remaining + 0.001)
+                    remaining = self.state.next_update - monotonic()
             self._report()
             # A final-layer/tile abort must not start the next (possibly expensive) phase.
             if self.state is not None and self.state.pipeline._interrupt:
