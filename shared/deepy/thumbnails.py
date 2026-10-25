@@ -25,9 +25,12 @@ async def render_thumbnail(path):
 
 
 def thumbnail(path):
-    path = os.path.normcase(os.path.abspath(path))
-    stat = Path(path).stat()
-    return _thumbnail(path, stat.st_mtime_ns, stat.st_size)
+    try:
+        path = os.path.normcase(os.path.abspath(path))
+        stat = Path(path).stat()
+        return _thumbnail(path, stat.st_mtime_ns, stat.st_size)
+    except Exception:
+        return None
 
 
 @lru_cache(maxsize=256)

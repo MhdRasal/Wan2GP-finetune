@@ -513,7 +513,11 @@ class DeepyPrimeTools:
     def get_remote_execution_instructions(self) -> str:
         if PRIME_ASYNC_ENABLED:
             return ""
-        return "WanGP waits for generation and post-processing internally and returns their results; do not poll jobs."
+        return (
+            "WanGP waits for generation and post-processing internally and returns their results; do not poll jobs. "
+            "For dependent generation workflows (such as creating a 3D asset from a generated reference image, or generating video from an image), "
+            "execute the preliminary step first, wait for its output media file/ID to return, and only then dispatch the dependent generation."
+        )
 
     def get_runtime_context(self) -> str:
         from shared.deepy.ui_settings import normalize_assistant_tool_ui_settings

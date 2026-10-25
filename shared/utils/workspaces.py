@@ -440,6 +440,28 @@ def load_gallery(record, read_settings):
             raise ValueError('Invalid workspace media selection.')
         selected_path = paths[selected] if 0 <= selected < len(paths) else None
         existing = [path for path in paths if media_available(path)]
+        # Auto-discover local outputs that might not be recorded yet (e.g. cloud downloads or CLI runs)
+        out_dir = Path("outputs").resolve()
+        if out_dir.is_dir():
+            if prefix == '':
+                for ext in (".mp4", ".mkv", ".webm", ".png", ".jpg", ".jpeg", ".webp"):
+                    for p in sorted(out_dir.glob(f"*{ext}"), key=lambda x: x.stat().st_mtime):
+                        p_str = str(p.resolve())
+                        if p_str not in existing:
+                            existing.append(p_str)
+            elif prefix == 'audio_':
+                for ext in (".wav", ".mp3", ".flac", ".ogg", ".aac"):
+                    for p in sorted(out_dir.glob(f"*{ext}"), key=lambda x: x.stat().st_mtime):
+                        p_str = str(p.resolve())
+                        if p_str not in existing:
+                            existing.append(p_str)
+            elif prefix == 'mesh_':
+                for ext in (".glb", ".ply"):
+                    for p in sorted(out_dir.glob(f"*{ext}"), key=lambda x: x.stat().st_mtime):
+                        p_str = str(p.resolve())
+                        if p_str not in existing:
+                            existing.append(p_str)
+
         result[prefix + 'file_list'] = existing
         result[prefix + 'file_settings_list'] = MediaSettings(existing, read_settings)
         result[prefix + 'selected'] = existing.index(selected_path) if selected_path in existing else len(existing) - 1

@@ -43,6 +43,9 @@ from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse
 APP_NAME = os.environ.get("MODAL_APP_NAME", "wan2gp-prod3")
 EXPECTED_API_KEY = os.environ.get("MODAL_API_KEY", "")
 
+# Maximum concurrent GPU containers (0 = unlimited, Modal account quota applies)
+MAX_CONCURRENT_CLOUD_JOBS = int(os.environ.get("MAX_CONCURRENT_CLOUD_JOBS", "0"))
+
 OUTPUTS_VOL_NAME = os.environ.get("MODAL_VOLUME_NAME", "wan2gp-outputs")
 MODELS_VOL_NAME = os.environ.get("MODAL_MODELS_VOLUME_NAME", "wan2gp-models")
 CACHE_VOL_NAME = "wan2gp-cache"
@@ -706,22 +709,6 @@ def ensure_volume_venv(log_file: Optional[Path] = None, allow_install: bool = Fa
     elif req_file.exists():
         log("[VENV] Using volume venv (fast startup, verified dependencies).")
 
-    # Verify flash_attn link integrity on persistent volume venv
-    if venv_py.exists():
-        test_fa = subprocess.run([str(venv_py), "-c", "import torch; import flash_attn_2_cuda"], capture_output=True)
-        if test_fa.returncode != 0:
-            chk_installed = subprocess.run([str(venv_py), "-m", "pip", "show", "flash-attn"], capture_output=True)
-            if chk_installed.returncode == 0:
-                log("[VENV] Incompatible flash-attn detected in volume venv; uninstalling to prevent symbol mismatch...")
-                subprocess.run([str(venv_py), "-m", "pip", "uninstall", "-y", "flash-attn"], capture_output=True)
-                fa_wheel = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.5cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
-                subprocess.run([str(venv_py), "-m", "pip", "install", "--no-deps", fa_wheel], capture_output=True)
-
-    try:
-        models_volume.commit()
-    except Exception:
-        pass
-
     return venv_py if venv_py.exists() else Path(sys.executable)
 
 # ---------------------------------------------------------------------------
@@ -767,24 +754,28 @@ def resolve_gpu_tuning(requested_gpu: str) -> Tuple[int, str, str]:
         matched_key = "T4"
 
     tuning = GPU_PROFILE_MAP.get(matched_key, GPU_PROFILE_MAP["L40S"])
-    attention = tuning["attention"]
+    target_attention = tuning.get("attention", "auto")
 
-    if attention in ("sage", "sage2"):
+    # Verify if target attention mode can actually be imported; fallback to 'auto' or 'sdpa'
+    attention = "auto"
+    if target_attention in ("sage", "sage2"):
         try:
-            import sageattention
+            import sageattention  # noqa: F401
+            attention = target_attention
         except Exception:
             try:
-                import torch
-                import flash_attn_2_cuda
+                import flash_attn  # noqa: F401
                 attention = "flash"
             except Exception:
                 attention = "sdpa"
-    elif attention == "flash":
+    elif target_attention == "flash":
         try:
-            import torch
-            import flash_attn_2_cuda
+            import flash_attn  # noqa: F401
+            attention = "flash"
         except Exception:
             attention = "sdpa"
+    elif target_attention == "sdpa":
+        attention = "sdpa"
 
     return tuning["profile"], attention, detected_device
 
@@ -821,7 +812,7 @@ def setup_wan2gp_environment(wgp_dir: Path, profile_num: int, attention_mode: st
                     log_line(f"[WARN] Failed to symlink {item.name}: {e}")
 
     config_data = {
-        "attention_mode": attention_mode,
+        "attention_mode": "auto",
         "compile": "",
         "video_profile": profile_num,
         "image_profile": profile_num,
@@ -832,7 +823,7 @@ def setup_wan2gp_environment(wgp_dir: Path, profile_num: int, attention_mode: st
         json.dump(config_data, f, indent=2)
 
     log_line(f"[SETUP] Linked {linked_count} model assets from {MODELS_MOUNT}")
-    log_line(f"[SETUP] Configured wgp_config.json: profile={profile_num}, attention={attention_mode}")
+    log_line(f"[SETUP] Configured wgp_config.json: profile={profile_num}, attention=auto")
 
     # Commit any patch modifications if wgp_dir resides on the persistent volume
     if str(wgp_dir).startswith(MODELS_MOUNT):
@@ -917,11 +908,12 @@ def execute_wan2gp_job(job_id: str, batch_uuid: Optional[str] = None, requested_
         setup_wan2gp_environment(wan2gp_dir, profile_num, attention_mode, log_file)
 
         # 4. Invoke Wan2GP CLI
+        # Note: Do not force --attention here so wgp.py uses its native automatic selection
+        # (or the user-configured setting in queue/config) without aborting when a specific kernel is missing.
         cmd = [
             str(python_exec),
             str(wan2gp_dir / "wgp.py"),
             "--profile", str(profile_num),
-            "--attention", str(attention_mode),
             "--process", str(zip_path),
             "--output-dir", str(job_dir)
         ]
@@ -949,6 +941,7 @@ def execute_wan2gp_job(job_id: str, batch_uuid: Optional[str] = None, requested_
 
         stopped_by_user = False
         last_commit_time = time.time()
+        last_reported_files = set()
         with open(log_file, "a") as log:
             while True:
                 line = proc.stdout.readline()
@@ -972,6 +965,28 @@ def execute_wan2gp_job(job_id: str, batch_uuid: Optional[str] = None, requested_
                             except subprocess.TimeoutExpired:
                                 proc.kill()
                             break
+
+                        # Progressive intermediate file reporting for sequential batches
+                        current_files = sorted([
+                            f.name for f in job_dir.glob("*")
+                            if f.is_file()
+                            and f.name not in ("input.zip", "status.json", "run.log", "STOP", "results.json")
+                            and not f.name.endswith(".tmp")
+                            and "_tmp." not in f.name
+                        ])
+                        if set(current_files) != last_reported_files:
+                            last_reported_files = set(current_files)
+                            st = {
+                                "status": "running",
+                                "job_id": job_id,
+                                "batch_uuid": batch_uuid,
+                                "requested_gpu": requested_gpu,
+                                "error": None,
+                                "files": current_files
+                            }
+                            with open(status_file, "w") as f:
+                                json.dump(st, f, indent=2)
+
                         outputs_volume.commit()
                     except Exception:
                         pass
@@ -1056,7 +1071,8 @@ def execute_wan2gp_job(job_id: str, batch_uuid: Optional[str] = None, requested_
     timeout=3600,
     single_use_containers=True,
     scaledown_window=2,
-    retries=0
+    retries=0,
+    **(dict(concurrency_limit=MAX_CONCURRENT_CLOUD_JOBS) if MAX_CONCURRENT_CLOUD_JOBS > 0 else {})
 )
 def run_worker_h100(job_id: str, batch_uuid: Optional[str] = None):
     execute_wan2gp_job(job_id, batch_uuid, requested_gpu="H100")
@@ -1068,7 +1084,8 @@ def run_worker_h100(job_id: str, batch_uuid: Optional[str] = None):
     timeout=3600,
     single_use_containers=True,
     scaledown_window=2,
-    retries=0
+    retries=0,
+    **(dict(concurrency_limit=MAX_CONCURRENT_CLOUD_JOBS) if MAX_CONCURRENT_CLOUD_JOBS > 0 else {})
 )
 def run_worker_a100_80gb(job_id: str, batch_uuid: Optional[str] = None):
     execute_wan2gp_job(job_id, batch_uuid, requested_gpu="A100-80GB")
@@ -1080,7 +1097,8 @@ def run_worker_a100_80gb(job_id: str, batch_uuid: Optional[str] = None):
     timeout=3600,
     single_use_containers=True,
     scaledown_window=2,
-    retries=0
+    retries=0,
+    **(dict(concurrency_limit=MAX_CONCURRENT_CLOUD_JOBS) if MAX_CONCURRENT_CLOUD_JOBS > 0 else {})
 )
 def run_worker_a100_40gb(job_id: str, batch_uuid: Optional[str] = None):
     execute_wan2gp_job(job_id, batch_uuid, requested_gpu="A100-40GB")
@@ -1090,9 +1108,9 @@ def run_worker_a100_40gb(job_id: str, batch_uuid: Optional[str] = None):
     gpu="L40S",
     volumes={OUTPUTS_MOUNT: outputs_volume, MODELS_MOUNT: models_volume, CACHE_MOUNT: cache_volume},
     timeout=3600,
-    single_use_containers=True,
-    scaledown_window=2,
-    retries=0
+    scaledown_window=120,
+    retries=0,
+    **(dict(concurrency_limit=MAX_CONCURRENT_CLOUD_JOBS) if MAX_CONCURRENT_CLOUD_JOBS > 0 else {})
 )
 def run_worker_l40s(job_id: str, batch_uuid: Optional[str] = None):
     execute_wan2gp_job(job_id, batch_uuid, requested_gpu="L40S")
@@ -1102,9 +1120,9 @@ def run_worker_l40s(job_id: str, batch_uuid: Optional[str] = None):
     gpu="L4",
     volumes={OUTPUTS_MOUNT: outputs_volume, MODELS_MOUNT: models_volume, CACHE_MOUNT: cache_volume},
     timeout=3600,
-    single_use_containers=True,
-    scaledown_window=2,
-    retries=0
+    scaledown_window=120,
+    retries=0,
+    **(dict(concurrency_limit=MAX_CONCURRENT_CLOUD_JOBS) if MAX_CONCURRENT_CLOUD_JOBS > 0 else {})
 )
 def run_worker_l4(job_id: str, batch_uuid: Optional[str] = None):
     execute_wan2gp_job(job_id, batch_uuid, requested_gpu="L4")
@@ -1116,7 +1134,8 @@ def run_worker_l4(job_id: str, batch_uuid: Optional[str] = None):
     timeout=3600,
     single_use_containers=True,
     scaledown_window=2,
-    retries=0
+    retries=0,
+    **(dict(concurrency_limit=MAX_CONCURRENT_CLOUD_JOBS) if MAX_CONCURRENT_CLOUD_JOBS > 0 else {})
 )
 def run_worker_t4(job_id: str, batch_uuid: Optional[str] = None):
     execute_wan2gp_job(job_id, batch_uuid, requested_gpu="T4")
@@ -1366,6 +1385,157 @@ async def generate_endpoint(
         await run_worker_l40s.spawn.aio(job_id, batch_uuid)
 
     return {"job_id": job_id, "status": "queued", "gpu_selected": gpu_type}
+
+# ---------------------------------------------------------------------------
+# Batch Job Submission (Fire N independent jobs in parallel)
+# ---------------------------------------------------------------------------
+@web_app.post("/v1/jobs/batch")
+async def batch_generate_endpoint(
+    request: Request,
+    gpu_type: str = Query("L40S"),
+    x_api_key: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None)
+):
+    """Submit multiple independent jobs that run in parallel on separate GPU containers.
+
+    Expects JSON body:
+    {
+        "jobs": [
+            {"prompt": "dragon walking", "model_type": "t2v", ...},
+            {"prompt": "cat dancing", "model_type": "t2v", ...}
+        ],
+        "gpu_type": "L40S",          // optional, per-batch default
+        "max_parallel": 3            // optional, cap concurrent containers
+    }
+
+    Each job in "jobs" gets its own container and job_id.
+    Returns list of job_ids for polling.
+    """
+    verify_auth(x_api_key, authorization)
+
+    try:
+        data = await request.body()
+        batch_request = json.loads(data.decode("utf-8"))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON payload: {e}")
+
+    jobs_list = batch_request.get("jobs") or batch_request.get("tasks", [])
+    if not isinstance(jobs_list, list) or len(jobs_list) == 0:
+        raise HTTPException(status_code=400, detail="'jobs' must be a non-empty list of generation tasks")
+
+    batch_gpu = batch_request.get("gpu_type") or gpu_type
+    max_parallel = int(batch_request.get("max_parallel", 0))
+    if MAX_CONCURRENT_CLOUD_JOBS > 0:
+        max_parallel = min(max_parallel, MAX_CONCURRENT_CLOUD_JOBS) if max_parallel > 0 else MAX_CONCURRENT_CLOUD_JOBS
+
+    batch_uuid = str(uuid.uuid4())
+    spawned_jobs = []
+
+    for idx, job_spec in enumerate(jobs_list):
+        if max_parallel > 0 and idx >= max_parallel:
+            # Remaining jobs will be queued on the Modal side (container auto-scaling)
+            pass
+
+        job_id = str(uuid.uuid4())
+        job_dir = Path(OUTPUTS_MOUNT) / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+
+        # Determine per-job GPU override
+        job_gpu = str(job_spec.pop("gpu_type", "")).strip() or batch_gpu
+
+        # Build single-task queue.json
+        task_params = dict(job_spec)
+        for disallowed in ("gpu_type", "width", "height", "task_id", "execution_mode", "engine", "version", "provider", "inputs", "plugin_data", "metadata"):
+            task_params.pop(disallowed, None)
+        task = {"id": idx + 1, "meta_id": str(uuid.uuid4()), "params": task_params}
+
+        import io
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("queue.json", json.dumps([task], indent=2))
+        with open(job_dir / "input.zip", "wb") as f:
+            f.write(zip_buf.getvalue())
+
+        initial_status = {
+            "status": "queued",
+            "job_id": job_id,
+            "batch_uuid": batch_uuid,
+            "batch_index": idx,
+            "gpu_type": job_gpu,
+            "files": []
+        }
+        with open(job_dir / "status.json", "w") as f:
+            json.dump(initial_status, f, indent=2)
+
+        spawned_jobs.append({"job_id": job_id, "batch_index": idx, "gpu_type": job_gpu, "status": "queued"})
+
+    await outputs_volume.commit.aio()
+
+    # Spawn all containers (Modal handles queuing if concurrency_limit is hit)
+    for job_info in spawned_jobs:
+        jid = job_info["job_id"]
+        norm_gpu = job_info["gpu_type"].upper().replace("-", "_").replace(" ", "_")
+        if "H100" in norm_gpu:
+            await run_worker_h100.spawn.aio(jid, batch_uuid)
+        elif "80GB" in norm_gpu or ("A100" in norm_gpu and "80" in norm_gpu):
+            await run_worker_a100_80gb.spawn.aio(jid, batch_uuid)
+        elif "A100" in norm_gpu:
+            await run_worker_a100_40gb.spawn.aio(jid, batch_uuid)
+        elif norm_gpu == "L4" or norm_gpu.startswith("L4_"):
+            await run_worker_l4.spawn.aio(jid, batch_uuid)
+        elif "T4" in norm_gpu:
+            await run_worker_t4.spawn.aio(jid, batch_uuid)
+        else:
+            await run_worker_l40s.spawn.aio(jid, batch_uuid)
+
+    return {
+        "batch_uuid": batch_uuid,
+        "total_jobs": len(spawned_jobs),
+        "max_concurrent": max_parallel or "unlimited",
+        "jobs": spawned_jobs
+    }
+
+# ---------------------------------------------------------------------------
+# Active Jobs Listing
+# ---------------------------------------------------------------------------
+@web_app.get("/v1/jobs/active")
+def active_jobs_endpoint(
+    batch_uuid: Optional[str] = Query(None),
+    x_api_key: Optional[str] = Header(None),
+    authorization: Optional[str] = Header(None)
+):
+    """List all active (queued/running) jobs, optionally filtered by batch_uuid."""
+    verify_auth(x_api_key, authorization)
+    outputs_volume.reload()
+
+    outputs_root = Path(OUTPUTS_MOUNT)
+    active_jobs = []
+    for job_dir in outputs_root.iterdir():
+        if not job_dir.is_dir():
+            continue
+        status_file = job_dir / "status.json"
+        if not status_file.exists():
+            continue
+        try:
+            with open(status_file, "r") as f:
+                st = json.load(f)
+            if st.get("status") in ("queued", "running"):
+                if batch_uuid and st.get("batch_uuid") != batch_uuid:
+                    continue
+                active_jobs.append({
+                    "job_id": st.get("job_id", job_dir.name),
+                    "batch_uuid": st.get("batch_uuid"),
+                    "status": st.get("status"),
+                    "gpu_type": st.get("gpu_type") or st.get("requested_gpu"),
+                })
+        except Exception:
+            continue
+
+    return {
+        "active_count": len(active_jobs),
+        "max_concurrent": MAX_CONCURRENT_CLOUD_JOBS or "unlimited",
+        "jobs": active_jobs
+    }
 
 @web_app.get("/status/{job_id}")
 @web_app.get("/v1/jobs/{job_id}")

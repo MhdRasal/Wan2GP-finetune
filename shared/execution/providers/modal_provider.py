@@ -116,21 +116,65 @@ class ModalCloudProvider(BaseCloudProvider):
         # 2. Fallback to Modal SDK
         return self._execute_sdk(request, fn_send_cmd, start_time)
 
+    def execute_batch(
+        self,
+        batch_zip_bytes: bytes,
+        send_cmd: Optional[Callable[[str, Any], None]] = None,
+        gpu_type: Optional[str] = None,
+        save_path: Optional[str] = None,
+    ) -> ExecutionResult:
+        """
+        Execute a bundled multi-task batch on 1 warm GPU container sequentially.
+        Progressive downloads stream each completed video immediately to disk.
+        """
+        fn_send_cmd = send_cmd if send_cmd is not None else (lambda cmd, data=None: None)
+        start_time = time.time()
+        resolved_gpu = gpu_type or os.environ.get("MODAL_DEFAULT_GPU", "L40S")
+        resolved_save = save_path or os.environ.get("WAN2GP_OUTPUT_DIR") or "outputs"
+        return self._execute_http_payload(
+            zip_payload=batch_zip_bytes,
+            fn_send_cmd=fn_send_cmd,
+            start_time=start_time,
+            gpu_type=resolved_gpu,
+            save_path=resolved_save,
+            task_id="batch",
+        )
+
     def _execute_http(
         self,
         request: GenerationRequest,
         fn_send_cmd: Callable[[str, Any], None],
         start_time: float,
     ) -> ExecutionResult:
+        gpu_type = os.environ.get("MODAL_DEFAULT_GPU", "L40S")
+        if isinstance(request.settings, dict):
+            gpu_type = request.settings.get("gpu_type") or gpu_type
+
+        # Package request and any media inputs into a self-contained ZIP bundle
+        fn_send_cmd("status", "Modal: Packaging generation bundle and media attachments...")
+        zip_payload = package_generation_request_to_zip(request)
+        save_dir_setting = os.environ.get("WAN2GP_OUTPUT_DIR") or (request.settings.get("save_path") if hasattr(request, "settings") and isinstance(request.settings, dict) else None) or "outputs"
+
+        return self._execute_http_payload(
+            zip_payload=zip_payload,
+            fn_send_cmd=fn_send_cmd,
+            start_time=start_time,
+            gpu_type=gpu_type,
+            save_path=save_dir_setting,
+            task_id=request.task_id,
+        )
+
+    def _execute_http_payload(
+        self,
+        zip_payload: bytes,
+        fn_send_cmd: Callable[[str, Any], None],
+        start_time: float,
+        gpu_type: str,
+        save_path: str,
+        task_id: Any = None,
+    ) -> ExecutionResult:
         job_id = None
         try:
-            gpu_type = os.environ.get("MODAL_DEFAULT_GPU", "L40S")
-            if isinstance(request.settings, dict):
-                gpu_type = request.settings.get("gpu_type") or gpu_type
-
-            # Package request and any media inputs (images, control videos, audio) into a self-contained ZIP bundle
-            fn_send_cmd("status", "Modal: Packaging generation bundle and media attachments...")
-            zip_payload = package_generation_request_to_zip(request)
             payload_size_mb = len(zip_payload) / (1024 * 1024)
 
             fn_send_cmd("status", f"Modal: Submitting bundle ({payload_size_mb:.2f} MB) to {self.endpoint_url} (GPU: {gpu_type})...")
@@ -156,7 +200,7 @@ class ModalCloudProvider(BaseCloudProvider):
                 return ExecutionResult(
                     success=True,
                     status="completed",
-                    task_id=request.task_id or job_id,
+                    task_id=task_id or job_id,
                     output_files=list(outputs),
                     metadata={"provider": "modal", "endpoint": self.endpoint_url},
                     generation_info=resp_data.get("generation_info", {}),
@@ -170,6 +214,11 @@ class ModalCloudProvider(BaseCloudProvider):
                 deadline = time.time() + self.timeout
                 last_log_len = 0
 
+                out_dir = Path(save_path)
+                out_dir.mkdir(parents=True, exist_ok=True)
+                downloaded_paths = []
+                downloaded_fnames = set()
+
                 while time.time() < deadline:
                     time.sleep(poll_interval)
                     status_url = f"{self.endpoint_url}/status/{job_id}"
@@ -181,6 +230,26 @@ class ModalCloudProvider(BaseCloudProvider):
                         continue
 
                     state = str(s_data.get("status", "running")).lower()
+
+                    # Progressive downloads: download completed videos as soon as they finish
+                    current_remote_files = s_data.get("files", [])
+                    for fname in current_remote_files:
+                        if fname in ("input.zip", "status.json", "run.log", "STOP", "results.json") or fname.endswith(".tmp") or "_tmp." in fname or fname in downloaded_fnames:
+                            continue
+                        dest_file = out_dir / fname
+                        dl_url = f"{self.endpoint_url}/download/{job_id}/{urllib.parse.quote(fname)}"
+                        dl_req = urllib.request.Request(dl_url, headers=headers, method="GET")
+                        try:
+                            with urllib.request.urlopen(dl_req, timeout=120.0) as dl_resp:
+                                with open(dest_file, "wb") as f_out:
+                                    f_out.write(dl_resp.read())
+                            resolved_str = str(dest_file.resolve())
+                            downloaded_paths.append(resolved_str)
+                            downloaded_fnames.add(fname)
+                            fn_send_cmd("status", f"Modal: Progressive download ready -> {fname}")
+                            fn_send_cmd("output", resolved_str)
+                        except Exception as dl_err:
+                            fn_send_cmd("status", f"Modal: Warning downloading {fname}: {dl_err}")
 
                     # Fetch real-time log lines for progress feedback
                     try:
@@ -197,8 +266,6 @@ class ModalCloudProvider(BaseCloudProvider):
                                         clean_l = line.strip()
                                         if clean_l:
                                             print(f"[Modal] {clean_l}", flush=True)
-                                            # Match Wan2GP phase progress like "[3/8] Denoising First Phase | 29.7s"
-                                            # or "[12/27] VAE Decoding | 1m 37s"
                                             m_prog = re.search(r"\[(\d+)/(\d+)\]\s+([^|\n]+)", clean_l)
                                             if m_prog:
                                                 curr_step = int(m_prog.group(1))
@@ -207,7 +274,6 @@ class ModalCloudProvider(BaseCloudProvider):
                                                 if total_steps > 0:
                                                     fn_send_cmd("progress", [(curr_step, total_steps), f"Cloud GPU: {phase_name}", total_steps])
                                             else:
-                                                # Match percentage progress like "38%|███▊      | 3/8"
                                                 m_pct = re.search(r"(\d+)%\|.*\|\s*(\d+)/(\d+)", clean_l)
                                                 if m_pct:
                                                     curr_step = int(m_pct.group(2))
@@ -233,13 +299,8 @@ class ModalCloudProvider(BaseCloudProvider):
                             except Exception:
                                 pass
 
-                        save_dir_setting = os.environ.get("WAN2GP_OUTPUT_DIR") or (request.settings.get("save_path") if hasattr(request, "settings") and isinstance(request.settings, dict) else None) or "outputs"
-                        out_dir = Path(save_dir_setting)
-                        out_dir.mkdir(parents=True, exist_ok=True)
-                        downloaded_paths = []
-
                         for fname in output_files:
-                            if fname in ("input.zip", "status.json"):
+                            if fname in ("input.zip", "status.json", "run.log", "STOP", "results.json") or fname.endswith(".tmp") or "_tmp." in fname or fname in downloaded_fnames:
                                 continue
                             dest_file = out_dir / fname
                             dl_url = f"{self.endpoint_url}/download/{job_id}/{urllib.parse.quote(fname)}"
@@ -249,12 +310,13 @@ class ModalCloudProvider(BaseCloudProvider):
                                     with open(dest_file, "wb") as f_out:
                                         f_out.write(dl_resp.read())
                                 downloaded_paths.append(str(dest_file.resolve()))
+                                downloaded_fnames.add(fname)
+                                fn_send_cmd("output", str(dest_file.resolve()))
                             except Exception as dl_err:
                                 fn_send_cmd("status", f"Modal: Warning downloading {fname}: {dl_err}")
 
                         total_exec_time = time.time() - start_time
                         gpu_chosen = str(resp_data.get("gpu_selected", "L40S")).upper()
-                        # Modal pricing per hour (USD)
                         modal_rates = {
                             "T4": 0.59,
                             "L4": 0.80,
@@ -278,7 +340,7 @@ class ModalCloudProvider(BaseCloudProvider):
                         return ExecutionResult(
                             success=True,
                             status="completed",
-                            task_id=request.task_id or job_id,
+                            task_id=task_id or job_id,
                             output_files=downloaded_paths,
                             metadata={
                                 "provider": "modal",
@@ -292,14 +354,13 @@ class ModalCloudProvider(BaseCloudProvider):
                         )
 
                     if state in ("failed", "error", "stopped"):
-                        # Ensure remote worker is confirmed stopped immediately (true serverless)
                         self._stop_job_http(job_id)
                         err_msg = s_data.get("error") or f"Job {job_id} {state} on Modal"
                         fn_send_cmd("error", f"Modal generation error: {err_msg}")
                         return ExecutionResult(
                             success=False,
                             status="failed",
-                            task_id=request.task_id or job_id,
+                            task_id=task_id or job_id,
                             error=str(err_msg),
                             execution_time=time.time() - start_time,
                         )
@@ -312,7 +373,7 @@ class ModalCloudProvider(BaseCloudProvider):
                 return ExecutionResult(
                     success=False,
                     status="failed",
-                    task_id=request.task_id or job_id,
+                    task_id=task_id or job_id,
                     error=timeout_msg,
                     execution_time=time.time() - start_time,
                 )
@@ -324,22 +385,44 @@ class ModalCloudProvider(BaseCloudProvider):
             return ExecutionResult(
                 success=False,
                 status="failed",
-                task_id=request.task_id,
+                task_id=task_id or job_id,
                 error=str(err),
                 execution_time=time.time() - start_time,
             )
 
         except urllib.error.URLError as exc:
             if job_id:
-                self._stop_job_http(job_id)
+                try:
+                    self._stop_job_http(job_id)
+                except Exception:
+                    pass
             err_msg = f"Modal connection error: {exc.reason}"
             fn_send_cmd("error", err_msg)
-            return ExecutionResult(success=False, status="failed", task_id=request.task_id, error=err_msg, execution_time=time.time() - start_time)
+            return ExecutionResult(success=False, status="failed", task_id=task_id or job_id, error=err_msg, execution_time=time.time() - start_time)
         except (KeyboardInterrupt, GeneratorExit):
             if job_id:
-                self._stop_job_http(job_id)
+                try:
+                    self._stop_job_http(job_id)
+                except Exception:
+                    pass
             err_msg = "Generation cancelled / disconnected."
             fn_send_cmd("error", err_msg)
+            return ExecutionResult(success=False, status="failed", task_id=task_id or job_id, error=err_msg, execution_time=time.time() - start_time)
+        except Exception as e:
+            if job_id:
+                try:
+                    self._stop_job_http(job_id)
+                except Exception:
+                    pass
+            err_msg = f"Modal execution failed: {e}"
+            fn_send_cmd("error", err_msg)
+            return ExecutionResult(
+                success=False,
+                status="failed",
+                task_id=task_id or job_id,
+                error=err_msg,
+                execution_time=time.time() - start_time,
+            )
             return ExecutionResult(success=False, status="failed", task_id=request.task_id, error=err_msg, execution_time=time.time() - start_time)
         except Exception as exc:
             if job_id:

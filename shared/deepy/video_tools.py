@@ -134,7 +134,7 @@ def get_video_thumbnail_data_url(video_path: str) -> str:
         capture_output=True,
     )
     if result.returncode != 0 or len(result.stdout) == 0:
-        raise RuntimeError((result.stderr.decode("utf-8", errors="ignore").strip() or "ffmpeg thumbnail extraction failed").strip())
+        return ""
     data_url = f"data:image/jpeg;base64,{base64.b64encode(result.stdout).decode('ascii')}"
     _THUMB_DATA_URL_CACHE[cache_key] = data_url
     while len(_THUMB_DATA_URL_CACHE) > _THUMB_CACHE_MAX:

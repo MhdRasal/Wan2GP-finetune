@@ -267,6 +267,11 @@ MOCK_HEAVY_PACKAGES = {
     "av",
     "segment_anything",
     "timm",
+    "iopath",
+    "decord",
+    "insightface",
+    "facexlib",
+    "pycocotools",
 }
 
 KNOWN_SYSTEM_PACKAGES = {
@@ -497,33 +502,36 @@ def _create_mock_torch() -> types.ModuleType:
     torch_mod.library = lib_mod
 
     # utils submodule (torch.utils._pytree, checkpoint, _python_dispatch)
-    utils_mod = types.ModuleType("torch.utils")
+    utils_mod = MockModule("torch.utils")
     utils_mod.__path__ = []
-    disp_mod = types.ModuleType("torch.utils._python_dispatch")
+    disp_mod = MockModule("torch.utils._python_dispatch")
     disp_mod.TorchDispatchMode = object
     utils_mod._python_dispatch = disp_mod
 
-    pytree_mod = types.ModuleType("torch.utils._pytree")
+    pytree_mod = MockModule("torch.utils._pytree")
     pytree_mod.tree_flatten = lambda x: ([x], None)
     pytree_mod.tree_unflatten = lambda v, s: v[0]
+    pytree_mod.tree_map = lambda f, tree: f(tree)
+    pytree_mod.tree_map_only = lambda ty, f, tree: f(tree) if isinstance(tree, ty) else tree
+    pytree_mod.register_pytree_node = lambda *a, **k: None
     utils_mod._pytree = pytree_mod
 
-    checkpoint_mod = types.ModuleType("torch.utils.checkpoint")
+    checkpoint_mod = MockModule("torch.utils.checkpoint")
     checkpoint_mod.checkpoint = lambda f, *a, **k: f(*a, **k)
     utils_mod.checkpoint = checkpoint_mod
 
-    model_zoo_mod = types.ModuleType("torch.utils.model_zoo")
+    model_zoo_mod = MockModule("torch.utils.model_zoo")
     model_zoo_mod.load_url = lambda *a, **k: {}
     utils_mod.model_zoo = model_zoo_mod
 
-    device_mod = types.ModuleType("torch.utils._device")
+    device_mod = MockModule("torch.utils._device")
     device_mod._device_constructors = lambda: []
     utils_mod._device = device_mod
 
     torch_mod.utils = utils_mod
 
     # distributed submodule
-    dist_mod = types.ModuleType("torch.distributed")
+    dist_mod = MockModule("torch.distributed")
     dist_mod.is_initialized = lambda: False
     dist_mod.get_rank = lambda: 0
     dist_mod.get_world_size = lambda: 1
@@ -531,11 +539,13 @@ def _create_mock_torch() -> types.ModuleType:
     torch_mod.distributed = dist_mod
 
     # overrides submodule
-    overrides_mod = types.ModuleType("torch.overrides")
+    overrides_mod = MockModule("torch.overrides")
     class TorchFunctionMode:
         def __enter__(self): return self
         def __exit__(self, *a): return False
     overrides_mod.TorchFunctionMode = TorchFunctionMode
+    overrides_mod.has_torch_function = lambda *a, **k: False
+    overrides_mod.handle_torch_function = lambda func, relevant_args, *args, **kwargs: func(*args, **kwargs)
     torch_mod.overrides = overrides_mod
 
     # Memory formats
