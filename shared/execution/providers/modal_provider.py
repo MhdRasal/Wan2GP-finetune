@@ -423,13 +423,6 @@ class ModalCloudProvider(BaseCloudProvider):
                 error=err_msg,
                 execution_time=time.time() - start_time,
             )
-            return ExecutionResult(success=False, status="failed", task_id=request.task_id, error=err_msg, execution_time=time.time() - start_time)
-        except Exception as exc:
-            if job_id:
-                self._stop_job_http(job_id)
-            err_msg = f"Modal error: {exc}"
-            fn_send_cmd("error", err_msg)
-            return ExecutionResult(success=False, status="failed", task_id=request.task_id, error=err_msg, execution_time=time.time() - start_time)
         finally:
             self._active_job_id = None
 
@@ -477,3 +470,7 @@ class ModalCloudProvider(BaseCloudProvider):
             err_msg = f"Modal SDK execution failed: {exc}"
             fn_send_cmd("error", err_msg)
             return ExecutionResult(success=False, status="failed", task_id=request.task_id, error=err_msg, execution_time=time.time() - start_time)
+
+
+# Backwards-compatible alias — callers may import either ModalProvider or ModalCloudProvider.
+ModalProvider = ModalCloudProvider

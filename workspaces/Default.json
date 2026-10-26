@@ -2,7 +2,7 @@
     "id": "a4b5a6387ba04176bf91da59543f3778",
     "name": "Default",
     "gallery": {
-        "current_gallery_source": "mesh",
+        "current_gallery_source": "audio",
         "selected_video_time": null,
         "file_list": [
             "/run/media/rasal/FAFF-6A46/dirve Rasal/work/wan2gp fine tuned/Wan2GP-finetune/outputs/2026-10-24-18h19m44s_seed902022049_a nude woman.mp4",
@@ -23,12 +23,18 @@
             "/run/media/rasal/FAFF-6A46/dirve Rasal/work/wan2gp fine tuned/Wan2GP-finetune/outputs/2026-10-25-12h04m03s_seed316081542_A cute baby dragon begins standing on the ground. It spreads both wings wide, flaps its wings powerf.png",
             "/run/media/rasal/FAFF-6A46/dirve Rasal/work/wan2gp fine tuned/Wan2GP-finetune/outputs/2026-10-25-12h07m31s_seed913039581_A cute baby dragon begins standing on the ground. It spreads both wings wide, flaps its wings powerf.png",
             "/run/media/rasal/FAFF-6A46/dirve Rasal/work/wan2gp fine tuned/Wan2GP-finetune/outputs/2026-10-25-12h10m53s_seed954577192_A cute baby dragon flies forward through the open sky. It flaps both wings rhythmically and continuo.png",
-            "/run/media/rasal/FAFF-6A46/dirve Rasal/work/wan2gp fine tuned/Wan2GP-finetune/outputs/2026-10-25-12h13m58s_seed597312283_A cute baby dragon flies forward through the open sky. It flaps both wings rhythmically and continuo.png"
+            "/run/media/rasal/FAFF-6A46/dirve Rasal/work/wan2gp fine tuned/Wan2GP-finetune/outputs/2026-10-25-12h13m58s_seed597312283_A cute baby dragon flies forward through the open sky. It flaps both wings rhythmically and continuo.png",
+            "/run/media/rasal/FAFF-6A46/dirve Rasal/work/wan2gp fine tuned/Wan2GP-finetune/outputs/2026-10-26-13h11m27s_seed390782989_Hand-drawn whiteboard marker doodle explainer style sheet on warm off-white paper background small.jpg",
+            "/run/media/rasal/FAFF-6A46/dirve Rasal/work/wan2gp fine tuned/Wan2GP-finetune/outputs/2026-10-26-13h11m27s_seed390782989_Hand-drawn whiteboard marker doodle explainer style sheet on warm off-white paper background small.jpg"
         ],
-        "selected": 18,
+        "selected": 20,
         "last_selected": true,
-        "audio_file_list": [],
-        "audio_selected": -1,
+        "audio_file_list": [
+            "/run/media/rasal/FAFF-6A46/dirve Rasal/work/wan2gp fine tuned/Wan2GP-finetune/outputs/2026-10-26-13h10m14s_seed349893765_Right now, somewhere in this galaxy, the trigger for the end of the world may have already been pull.wav",
+            "/run/media/rasal/FAFF-6A46/dirve Rasal/work/wan2gp fine tuned/Wan2GP-finetune/outputs/2026-10-26-13h10m32s_seed988746707_Number one a gamma-ray burst. When a giant star collapses, it can fire twin beams of pure radiation.wav",
+            "/run/media/rasal/FAFF-6A46/dirve Rasal/work/wan2gp fine tuned/Wan2GP-finetune/outputs/2026-10-26-13h13m09s_seed601437183_Number two a solar superflare. People forget that the most dangerous object to humanity is the star.wav"
+        ],
+        "audio_selected": 2,
         "audio_last_selected": true,
         "mesh_file_list": [
             "/run/media/rasal/FAFF-6A46/dirve Rasal/work/wan2gp fine tuned/Wan2GP-finetune/outputs/2026-10-25-05h46m02s_seed1234.glb",
@@ -51,6 +57,6 @@
         "mesh_selected": 10,
         "mesh_last_selected": false
     },
-    "last_activity": 1792930533.7560413,
+    "last_activity": 1793020399.0102746,
     "archive_protected": false
 }
