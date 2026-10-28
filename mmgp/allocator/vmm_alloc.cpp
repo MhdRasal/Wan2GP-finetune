@@ -243,6 +243,7 @@ using Event = std::shared_ptr<CUevent_st>;  // recorded when memory was freed, s
 using MempoolId = std::pair<unsigned long long, unsigned long long>;  // c10::cuda::MempoolId_t
 using CaptureFilter = std::function<bool(CUstream)>;                  // true for the streams that allocate to a capture's pool
 thread_local bool warmup_paused = false;
+thread_local char thread_tag;  // its address identifies the calling thread: a warmup routes the allocations of its own thread only
 
 struct Range {
     CUdeviceptr va = 0;
@@ -304,9 +305,11 @@ struct Pool {  // graph-private heaps share physical chunks; all virtual mapping
     std::vector<std::pair<CUdeviceptr, Event>> pending;  // escaped warmup outputs still read on another stream
     std::unordered_set<CUmemGenericAllocationHandle> host_chunks;  // spill mode: chunks of pinned system RAM taken when VRAM was short
 };
-struct Capture {  // between PyTorch's begin and end of allocation to a pool
+struct Capture {  // between PyTorch's begin and end of allocation to a pool, or a warmup's
     MempoolId id;
     CaptureFilter filter;
+    const void* thread;      // thread_tag of the thread that began it
+    unsigned long long warmup;  // a warmup's token, 0 for a PyTorch capture
 };
 // Debug mode (mmgp/allocator/debug.py): the allocations of debug_threshold bytes and more are recorded with an origin that a Python
 // callback returns (module, tag, stack), the records are copied at the peak of each phase and when an allocation fails, and the
@@ -1478,8 +1481,7 @@ int64_t copy_entries(const std::vector<DebugEntry>& source, DebugEntry* out, int
     return static_cast<int64_t>(source.size());
 }
 
-void end_capture(Device& d, std::vector<Capture>::iterator capture) {
-    d.captures.erase(capture);
+void captures_ended(Device& d) {
     if (d.captures.empty()) {  // the frees postponed during the captures
         std::vector<CUdeviceptr> pending;
         pending.swap(d.deferred);
@@ -1502,6 +1504,11 @@ void end_capture(Device& d, std::vector<Capture>::iterator capture) {
                 }
         }
     }
+}
+
+void end_capture(Device& d, std::vector<Capture>::iterator capture) {
+    d.captures.erase(capture);
+    captures_ended(d);
 }
 
 // Called only after the owner stream has completed, or after a device sync.
@@ -2020,28 +2027,43 @@ EXPORT void vmm_begin_allocate_to_pool(int device, MempoolId id, CaptureFilter f
     std::lock_guard<std::mutex> guard(lock);
     Device& d = device_state(device);
     ++d.pools[id].use_count;
-    d.captures.push_back({id, std::move(filter)});
+    d.captures.push_back({id, std::move(filter), &thread_tag, 0});
 }
 
 EXPORT void vmm_end_allocate_to_pool(int device, MempoolId id) {
     std::lock_guard<std::mutex> guard(lock);
     Device& d = device_state(device);
     for (auto capture = d.captures.rbegin(); capture != d.captures.rend(); ++capture) {
-        if (capture->id == id) {
+        if (capture->id == id && !capture->warmup) {  // PyTorch's end: its capture, never a warmup of the same pool
             end_capture(d, std::next(capture).base());
             return;
         }
     }
 }
 
-EXPORT void vmm_begin_warmup(int device, unsigned long long first, unsigned long long second, CUstream stream) {
-    vmm_begin_allocate_to_pool(device, {first, second}, [stream](CUstream current) { return !warmup_paused && current == stream; });
+EXPORT unsigned long long vmm_begin_warmup(int device, unsigned long long first, unsigned long long second, CUstream stream) {
+    static unsigned long long warmups = 0;
+    std::lock_guard<std::mutex> guard(lock);
+    Device& d = device_state(device);
+    ++d.pools[{first, second}].use_count;
+    // the allocations of this thread on this stream: the default stream has the same handle in every thread
+    const void* thread = &thread_tag;
+    d.captures.push_back({{first, second}, [stream, thread](CUstream current) { return !warmup_paused && current == stream && &thread_tag == thread; },
+                          thread, ++warmups});
+    return warmups;
 }
 
-EXPORT void vmm_end_warmup(int device, unsigned long long first, unsigned long long second) {
-    vmm_end_allocate_to_pool(device, {first, second});
+EXPORT void vmm_end_warmup(int device, unsigned long long first, unsigned long long second, unsigned long long token) {
     std::lock_guard<std::mutex> guard(lock);
-    Device& d = devices.at(device);
+    Device& d = device_state(device);
+    // With the warmup go the entries its thread began after it: the captures run inside it have ended, and an entry left is that of a capture
+    // whose end failed (PyTorch's capture_end raises before ending its allocation to the pool when the capture was invalidated). Left in
+    // place, it would keep the device in capture mode: no memory pressure callback, recovery nor pool release until the process exits.
+    auto warmup = std::find_if(d.captures.begin(), d.captures.end(), [token](const Capture& capture) { return capture.warmup == token; });
+    const void* thread = warmup->thread;
+    for (size_t i = d.captures.size(), start = warmup - d.captures.begin(); i-- > start;)
+        if (i == start || d.captures[i].thread == thread) d.captures.erase(d.captures.begin() + static_cast<std::ptrdiff_t>(i));
+    captures_ended(d);
     auto pool = d.pools.find({first, second});
     if (--pool->second.use_count <= 0 && pool->second.live == 0) {
         RelaxedCapture relaxed(any_capture());

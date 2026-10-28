@@ -21,6 +21,10 @@ try:
     from .audio_triton import snake_beta_aa as _snake, snake_ as _snake_plain
 except (ImportError, OSError, RuntimeError):
     _snake = _snake_plain = None
+try:
+    from . import group_norm_silu as _norm_silu
+except (ImportError, OSError, RuntimeError):
+    _norm_silu = None
 
 _AUDIO_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 
@@ -126,6 +130,47 @@ def scaled_residual(x_list, scale, residual):
     if choose(owned_triton=_video is not None and cuda_inference(x, dtypes=_DTYPES)):
         return _video.residual_(x, scale, residual)
     return x.mul_(scale).add_(residual)
+
+
+def silu_(x, chunk_bytes=256 << 20):
+    """x * sigmoid(x) written into x by chunks: the same values, without two full-size temporaries."""
+    flat, rows = x.view(-1), max(1, chunk_bytes // x.element_size())
+    for start in range(0, flat.numel(), rows):
+        part = flat[start:start + rows]
+        part.mul_(torch.sigmoid(part))
+    return x
+
+
+def group_norm_silu(x, norm, dtype, chunk_bytes=256 << 20):
+    """silu(norm(x)) of a 2-D GroupNorm (N, C, H, W) as computed under autocast: normalization and SiLU in FP32, rounded once to dtype;
+    x is borrowed. The WanGP kernel allocates only the output (shared.kernels.group_norm_silu). PyTorch: by chunks of groups (the FP32
+    copies autocast would make), each rounded right away, so that neither the FP32 copy of x nor the FP32 result is allocated in full."""
+    valid = _norm_silu is not None and norm.affine and _norm_silu.eligible(x, norm.num_groups, dtype)
+    if choose("GroupNorm + SiLU", owned_triton=valid) is not None:
+        return _norm_silu.group_norm_silu(x, norm.num_groups, norm.weight, norm.bias, norm.eps, dtype)
+    out = torch.empty_like(x, dtype=dtype)
+    step = x.shape[1] // norm.num_groups
+    groups = max(1, chunk_bytes // (x[:, :step].numel() * 4))
+    for start in range(0, norm.num_groups, groups):
+        c0, c1 = start * step, min(norm.num_groups, start + groups) * step
+        out[:, c0:c1] = silu_(F.group_norm(x[:, c0:c1].float(), (c1 - c0) // step, norm.weight[c0:c1].float(), norm.bias[c0:c1].float(), norm.eps), chunk_bytes)
+    return out
+
+
+def attention(q, k, v, chunk_bytes=64 << 20):
+    """F.scaled_dot_product_attention(q, k, v) of (batch, heads, tokens, dim) tensors: one call where SDPA has a flash, memory-efficient or
+    cuDNN kernel for them. Elsewhere (BF16 on Turing...) its math path materializes every score in FP32, 2.4 GiB for the single-head
+    mid-block attention of a VAE's 1024 px tile: there, by chunks of queries whose scores take at most chunk_bytes, each attending all the
+    keys (values differ by rounding only)."""
+    sdpa = torch.backends.cuda
+    params = sdpa.SDPAParams(q, k, v, None, 0.0, False, False)
+    rows = max(1, chunk_bytes // (q.shape[0] * q.shape[1] * k.shape[-2] * 4))
+    if rows >= q.shape[-2] or q.device.type != "cuda" or sdpa.can_use_flash_attention(params) or sdpa.can_use_efficient_attention(params) or sdpa.can_use_cudnn_attention(params):
+        return F.scaled_dot_product_attention(q, k, v)
+    out = q.new_empty(q.shape[:-1] + v.shape[-1:])
+    for start in range(0, q.shape[-2], rows):
+        out[..., start:start + rows, :] = F.scaled_dot_product_attention(q[..., start:start + rows, :], k, v)
+    return out
 
 
 def pixel_norm_silu(x_list, norm, act, *, channel_norm):

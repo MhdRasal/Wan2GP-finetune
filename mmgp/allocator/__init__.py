@@ -102,7 +102,8 @@ def install(mode="vmm", large_mb=256, chunk_mb=32, spill=False):
     lib.vmm_set_oom_thrower.argtypes = (ctypes.c_void_p,)
     lib.vmm_set_ram_release.argtypes = (ctypes.c_void_p,)
     lib.vmm_begin_warmup.argtypes = (ctypes.c_int, ctypes.c_ulonglong, ctypes.c_ulonglong, ctypes.c_void_p)
-    lib.vmm_end_warmup.argtypes = (ctypes.c_int, ctypes.c_ulonglong, ctypes.c_ulonglong)
+    lib.vmm_begin_warmup.restype = ctypes.c_ulonglong
+    lib.vmm_end_warmup.argtypes = (ctypes.c_int, ctypes.c_ulonglong, ctypes.c_ulonglong, ctypes.c_ulonglong)
     lib.vmm_pause_warmup.argtypes = (ctypes.c_int,)
     lib.vmm_pause_warmup.restype = ctypes.c_int
     lib.vmm_prepare_reuse.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int)
@@ -173,13 +174,13 @@ def graph_warmup(pool):
         return
     device = torch.cuda.current_device()
     stream = torch.cuda.current_stream(device)
-    _lib.vmm_begin_warmup(device, *pool, stream.cuda_stream)
+    token = _lib.vmm_begin_warmup(device, *pool, stream.cuda_stream)
     _warmup.depth = getattr(_warmup, "depth", 0) + 1
     try:
         yield
     finally:
         _warmup.depth -= 1
-        _lib.vmm_end_warmup(device, *pool)
+        _lib.vmm_end_warmup(device, *pool, token)
 
 
 def pool_live(pool, device=None):

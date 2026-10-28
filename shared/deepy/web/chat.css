@@ -1343,6 +1343,15 @@
     font: inherit;
 }
 
+.chat__stream-gap {
+    display: block;
+    height: 0.85em;  /* a paragraph margin, as in the final rendering */
+}
+
+.chat__body pre .chat__stream-tail {
+    white-space: inherit;  /* in code the line being written lays out like the finished ones (no wrapping): a wrapped tail made the block shrink back at every newline */
+}
+
 .chat__stream-text > span {
     background: transparent !important;
 }
@@ -1562,6 +1571,55 @@
     font-size: calc(0.55rem * var(--dock-font-scale));
     font-weight: 800;
     letter-spacing: 0.02em;
+}
+
+.chat__disclosure--tool > summary {
+    position: relative;
+}
+
+.chat__tool-progress {
+    position: absolute;
+    left: 12px;
+    right: 12px;
+    bottom: 3px;
+    height: 3px;
+    border-radius: 999px;
+    overflow: hidden;
+    background: rgba(229, 160, 38, 0.18);
+    pointer-events: none;
+}
+
+.chat__tool-progress > span {
+    display: block;
+    height: 100%;
+    border-radius: inherit;
+    background: #e5a026;
+    transition: width 0.3s ease;
+}
+
+.chat__tool-live-meta {
+    overflow-wrap: anywhere;
+}
+
+.chat__tool-section-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.chat__tool-stdout {
+    white-space: pre-wrap;  /* grows with the output: no inner scrollbar */
+}
+
+.chat__tool-stack {  /* a Python run's Status, Output and Result, one under the other beside its arguments */
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    min-width: 0;
+}
+
+.chat__tool-json:has(> .chat__tool-stdout:empty) {  /* a running script that has not printed yet */
+    display: none;
 }
 
 #assistant_chat_html .chat__tool-status--running {
@@ -1845,6 +1903,75 @@
 .chat__status.is-visible {
     opacity: 1;
     transform: translateY(0);
+}
+
+.chat__status-main {
+    flex: 1;
+    min-width: 0;
+    display: grid;
+    grid-template-columns: minmax(0, max-content) minmax(40%, 1fr);  /* a running script's progress shares the first line with its title */
+    align-items: baseline;
+    column-gap: 10px;
+    row-gap: 4px;
+    pointer-events: none;
+}
+
+.chat__status-main:has(> .chat__status-detail[hidden]) {
+    grid-template-columns: minmax(0, 1fr);
+}
+
+.chat__status-main > .chat__status-progress,
+.chat__status-main > .chat__status-sub {
+    grid-column: 1 / -1;
+}
+
+.chat__status-main:has(> .chat__status-detail:not([hidden])) > .chat__status-text {
+    display: block;
+    max-height: none;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+
+.chat__status-detail {
+    font-size: calc(0.76rem * var(--dock-font-scale));
+    line-height: 1.35;
+    opacity: 0.82;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    color: var(--status-text);
+}
+
+.chat__status-progress {
+    height: 4px;
+    border-radius: 999px;
+    overflow: hidden;
+    background: rgba(255, 255, 255, 0.18);
+}
+
+.chat__status-progress > span {
+    display: block;
+    width: 0;
+    height: 100%;
+    border-radius: inherit;
+    background: var(--status-text);
+    transition: width 0.3s ease;
+}
+
+.chat__status-sub {  /* the tool a running script calls, as the status bar shows a direct call, on one line */
+    font-size: calc(0.86rem * var(--dock-font-scale));
+    line-height: 1.4;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    color: var(--status-text);
+}
+
+.chat__status-detail[hidden],
+.chat__status-sub[hidden],
+.chat__status-progress[hidden] {
+    display: none;
 }
 
 .chat__status-text {
@@ -2792,3 +2919,8 @@
 .media-card > .media-play { top: calc(var(--media-thumbnail-height) / 2); }
 .media-play:hover { filter: brightness(1.2); }
 .media-play:focus-visible { outline: 3px solid #339ec6; outline-offset: 3px; }
+
+/* A tab hiding the gallery is displayed while its full-screen viewer shows chat media. */
+.tabitem.wangp-gallery-viewer-host { display: flex !important; }
+/* The 3D viewer of a chat asset is only shown full screen. */
+.wangp-chat-mesh-viewer:not(:fullscreen) { display: none; }

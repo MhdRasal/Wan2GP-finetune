@@ -92,7 +92,8 @@ def norm_modulate(x_list, norm, shift, scale, segments, *, dtype=None):
         return _layer_norm_modulate(x_list, shift[:spans].to(x_list[0].dtype).unsqueeze(1), scale[:spans].to(x_list[0].dtype).unsqueeze(1), norm.eps).view(spans * rows, -1)
     layout = x.is_contiguous() and (weight is None or weight.device == x.device and weight.dtype == x.dtype) and x.shape[-1] <= 8192
     fused = _triton is not None and cuda_inference(x, approximate=packed_fma(x.device.index)) and layout
-    bits = not fused and dtype is None and layout and _bf16_bits_eligible(x)  # bit-identical to the eager path
+    bits = (not fused and dtype is None and layout and _bf16_bits_eligible(x)  # bit-identical to the eager path
+            and scale.dtype in (torch.float32, torch.bfloat16) and shift.dtype == scale.dtype)
     if choose("Segmented Norm Modulation", owned_triton=fused or bits):
         return _bits_triton.norm_modulate(x, norm, shift, scale, segments) if bits else _triton.norm_modulate(x, norm, shift, scale, segments, dtype)
     x = norm(x)
@@ -203,6 +204,19 @@ def gated_mlp(x_list, gate_proj, up_proj, down_proj, activation):
     return linear(down_proj, gate_list)
 
 
+def situ(x_list, *, packed=True):
+    """Bounded SiLU gate and saturated value, preserving native rounding.
+
+    Packed input is value|gate; separate projections pass [gate, value].
+    """
+    if packed:
+        value, gate = take(x_list).chunk(2, -1)
+    else:
+        gate, value = x_list
+        x_list.clear()
+    return (4.0 * torch.tanh(gate / 4.0) * torch.sigmoid(gate)) * (25.0 * torch.tanh(value / 25.0))
+
+
 def swiglu_linear(layer, x_list, residual=None, residual_scale=None):
     if can_linear(layer, x_list[0]):
         return linear(layer, x_list, input_act="swiglu", residual=residual,
@@ -298,7 +312,8 @@ def gate_segments(gate, batch, tokens):
 def mlp(x_list, fc1, fc2, act, *, up=None, prefix=None, residual=None, gate=None, segments=None):
     """fc2(act(fc1(x))) by chunks of tokens (mlp_chunk_rows): each chunk's output replaces its input rows, or is added to residual
     scaled by gate and written into residual. x, handed off in x_list, and residual have shape (..., dim) and are contiguous.
-    act: 'gelu' (tanh approximation), 'gelu_erf', or 'swiglu' (fc1 rows gate | value; with up: silu(fc1(x)) * up(x)). prefix: rows
+    act: 'gelu' (tanh approximation), 'gelu_erf', 'silu', 'situ' (fc1 rows value | gate), or 'swiglu' (fc1 rows gate | value).
+    With up, fc1 is the gate and up is the value projection for situ/swiglu. prefix: rows
     (..., p) borrowed and concatenated before the activated fc1 output as fc2's input (fc2 reads p + the activation's width: the
     single-stream blocks of Flux, whose second linear takes the attention output and the MLP together). gate is one vector per channel
     for all tokens, or segments [(start, stop, vector)] over the flattened tokens (frames, spans, batch rows: gate_segments). Where
@@ -311,7 +326,7 @@ def mlp(x_list, fc1, fc2, act, *, up=None, prefix=None, residual=None, gate=None
     # working set per row: the fc1 (and up) output, plus the concatenated fc2 input that coexists with it for a prefix MLP
     width = fc1.out_features + (0 if up is None else up.out_features) + (0 if prefix is None else prefix.shape[-1] + fc1.out_features)
     rows = mlp_chunk_rows(x.shape[0], width * x.element_size(), x.device, double=up is not None or prefix is not None)
-    fusable = act if up is None and prefix is None and act != "gelu_erf" else None
+    fusable = act if up is None and prefix is None and act in ("gelu", "swiglu") else None
     for start, stop, scale in [(0, x.shape[0], gate)] if segments is None else segments:
         scale = None if scale is None else scale.reshape(-1).to(out.dtype)
         for first in range(start, stop, rows):
@@ -319,8 +334,9 @@ def mlp(x_list, fc1, fc2, act, *, up=None, prefix=None, residual=None, gate=None
             h = fc1(x[first:last])
             fused = fusable if fusable and can_linear(fc2, h, act=fusable) else None
             if fused is None:
-                h = (swiglu([h, up(x[first:last])], packed=False) if up is not None else swiglu([h]) if act == "swiglu"
-                     else torch.ops.aten.gelu_(h, approximate="tanh" if act == "gelu" else "none"))
+                h = (situ([h, up(x[first:last])], packed=False) if act == "situ" and up is not None else situ([h]) if act == "situ"
+                     else swiglu([h, up(x[first:last])], packed=False) if up is not None else swiglu([h]) if act == "swiglu"
+                     else torch.ops.aten.silu_(h) if act == "silu" else torch.ops.aten.gelu_(h, approximate="tanh" if act == "gelu" else "none"))
             if prefix is not None:
                 h = torch.cat((prefix[first:last], h), dim=-1)
             target = out[first:last]
@@ -459,7 +475,8 @@ def split_half_norm_rope_quant_(q, k, rope, q_norm, k_norm, core, settings, *, i
     quantized = [None, None]
     if k is not None:
         layout, block, sm_scale, scale_eps = layouts["k"]
-        mean = _qk_quant.norm_rope_mean(k, k_weight, rope, k_eps, interleaved=interleaved, weight_rows=k_rows)
+        mean = settings.get("k_mean")  # a cached prefix's mean (staged_quantize_k), else k's own
+        mean = _qk_quant.norm_rope_mean(k, k_weight, rope, k_eps, interleaved=interleaved, weight_rows=k_rows) if mean is None else mean.expand(k.shape[0], -1, -1)
         quantized[1] = _qk_quant.norm_rope_quantize(k, k_weight, rope, k_eps, layout, block, mean=mean, sm_scale=sm_scale, scale_eps=scale_eps,
                                                     interleaved=interleaved, weight_rows=k_rows)
         del mean

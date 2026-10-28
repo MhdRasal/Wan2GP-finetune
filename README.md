@@ -64,6 +64,45 @@ WanGP is a one-stop super app for the best open source generative models across 
 
 ## 🔥 Latest Updates : 
 
+## 27th of October 2026: WanGP v18.84 - The One World Generator
+
+###  New World Generators
+Create a world, then walk through it with the keyboard in the new **Worlds gallery**. Save your exploration to continue later, record the journey as a video, or capture a view for another generation. You don't need a 24 GB card to join in: **8 GB is enough to get started** and almost at **NO SPEED COST** thanks to **MMGPv4**. Don't expect miracles, though: near-real-time exploration depends on the model and a fast, recent GPU.
+
+- **Hy-Nomas 8B** starts from a text description and remembers earlier views to help keep places and characters consistent. Walk around, turn the camera, or type an event such as "the fox sits down". Choose how much history it remembers and trade generation quality for quicker moves.
+
+- **EVOKE Turbo 14B** starts from an image and keeps a memory of the scene's depth, helping places retain their layout when you return to them. It is a good fit for exploring streets, landscapes and interiors at **640×384**, though moves take longer to generate.
+
+### Business as usual
+- **H3 PTD RefAsymOPD**  another **high-quality PDD 8 steps**, the trick is here to apply a different LoRA at each step (as a consequence you will need 11GB extra RAM) 
+
+- **H3 LoRAs Accelerators**: new **FL2V v1.3 / v1.1** and **Ref2V v1.0 / v1.1** accelerators.
+
+- **Two MOSS Image Editors**: **Edit SFT** changes clothing, backgrounds, lighting or style and combines up to **four ordered references**. **Edit HQ v4** focuses on localized changes to a single image while preserving surrounding details; combining multiple images is more limited.
+
+- **Fast Quantized KV Cache**: **MOSS Image Edit**, **Qwen Image 2.1** and **Wan Animate 2** now support quantized KV caches that make generation from image or video references much faster, even with **memory profiles 4 and 5**.
+
+- **More Speed Boost and VRAM Savers**: update **WGPKernels to 1.4.2** and **GGUF kernels to 1.0.29** using the [installation guide](docs/INSTALLATION.md).
+
+### Deepy Prime — Twice the Context, More Ways to Create
+
+Thanks to the new **Q4 KV cache**, Deepy Prime can fit **roughly twice the context within the same VRAM budget**, or use less VRAM at your current context size.
+
+Deepy Prime, your built-in personal assistant, can now:
+
+- **Search the web** for facts and visual references, read pages and download assets. Web access is optional and off by default; no search API key is needed.
+
+- **Find and install compatible LoRAs** from Civitai and Hugging Face for your chosen style or effect. Civitai downloads need your API key.
+
+- **Create with Python**: add exact lettering, draw charts, assemble contact sheets, write timed subtitles, animate titles and build procedural 3D props in a restricted sandbox.
+
+- **Automate batches** of image inspection, transcription and generation without filling the conversation with intermediate steps.
+
+- **Generate 3D assets and worlds**, or continue a saved world from movement instructions before exploring it yourself.
+
+- **Run Media Flow from chat**: restore, outpaint, upscale or smooth long videos and whole folders, with resumable batches and original audio preserved.
+
+
 ## 21st of October 2026: WanGP v18.21 - No GPU Left Behind
 
 - **Profile 0 — More Speed with Less RAM (Experimental)**: a new, fully automated mode. WanGP gives fast Reserved RAM and spare VRAM to the model currently running, then makes those resources available to the next task. This makes switching between large models much friendlier to low-RAM PCs. Higher-end PCs may still get better results by choosing a profile manually.

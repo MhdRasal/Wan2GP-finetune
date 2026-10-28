@@ -27,6 +27,7 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers.utils import logging
 from diffusers.utils.accelerate_utils import apply_forward_hook
 
+from shared import attention_kit
 from shared.attention import pay_attention
 
 from ..interrupt import GenerationInterrupted
@@ -329,24 +330,45 @@ def _take(x_list: list[torch.Tensor]) -> torch.Tensor:
     return hidden_states
 
 
-def _split_interleaved_qkv(src, dim, split_sizes, context):
-    info = context["info"]
-    heads, head_dim = info["num_attention_heads"], info["attention_head_dim"]
-    grouped = src.reshape(heads, 3, head_dim, *src.shape[1:])
-    return [grouped[:, index].reshape(split_sizes[index], *src.shape[1:]).contiguous() for index in range(3)]
+def group_qkv_rows(state_dict, num_attention_heads: int = 32, attention_head_dim: int = 64):
+    """The rows of the fused to_qkv projections (weights, the per-row scales of INT8 checkpoints, biases), interleaved head by head
+    (heads, q/k/v, head_dim) in the released checkpoints, grouped (q/k/v, heads, head_dim): MMGP then splits them into to_q / to_k / to_v
+    as row ranges, quantized or not."""
+    rows = 3 * num_attention_heads * attention_head_dim
+    for key in [key for key in state_dict if key.endswith((".attn.to_qkv.weight", ".attn.to_qkv.weight_scale", ".attn.to_qkv.bias"))]:
+        tensor = state_dict[key]
+        if tensor.shape[0] == rows:  # a per-tensor scale stays as it is
+            state_dict[key] = tensor.reshape(num_attention_heads, 3, attention_head_dim, *tensor.shape[1:]).transpose(0, 1).reshape(tensor.shape).contiguous()
+    return state_dict
 
 
-def get_linear_split_map(inner_dim: int = 2048, num_attention_heads: int = 32,
-                         attention_head_dim: int = 64):
-    return {
-        "to_qkv": {
-            "mapped_modules": ["to_q", "to_k", "to_v"],
-            "split_sizes": [inner_dim, inner_dim, inner_dim],
-            "num_attention_heads": num_attention_heads,
-            "attention_head_dim": attention_head_dim,
-            "split_handlers": {"weight": _split_interleaved_qkv, "bias": _split_interleaved_qkv},
-        }
-    }
+def get_linear_split_map(inner_dim: int = 2048):
+    return {"to_qkv": {"mapped_modules": ["to_q", "to_k", "to_v"], "split_sizes": [inner_dim, inner_dim, inner_dim]}}
+
+
+def _rotate_(x, rotary, first, last):
+    """The split-half RoPE of the first rotary channels of FP32 rows x (batch, tokens first..last, heads, head_dim), in place."""
+    cos, sin = (table[:, first:last] for table in rotary)
+    half = cos.shape[-1] // 2
+    a, b = x[..., :half], x[..., half:2 * half]
+    rotated = a * cos[..., :half] - b * sin[..., :half]
+    b.mul_(cos[..., half:]).add_(a * sin[..., half:])
+    a.copy_(rotated)
+    return x
+
+
+def _norm_rope_(query, key, attn, rotary_emb, plan):
+    """In place on query and / or key (batch, tokens, heads, head_dim; the other None): the per-head RMSNorm without weight then the
+    split-half RoPE of the first rotary channels. Both together go through the fused kernel of rope_plan when there is one; alone (the
+    staged quantization projects k before q), FP32 rows rounded once."""
+    if query is not None and key is not None and plan[0] is not None:
+        for x, done in zip((query, key), vae_ops.finish_rope_(query, key, rotary_emb, attn.norm_q.eps, plan)):
+            if done is not x:
+                x.copy_(done)
+        return
+    for x, norm in ((query, attn.norm_q), (key, attn.norm_k)):
+        if x is not None:
+            attention_kit.rows_(x, lambda part, first, last: (norm(part.float()) if rotary_emb is None else _rotate_(norm(part.float()), rotary_emb, first, last)).to(x.dtype))
 
 
 class MiniMaxH3VideoAttnProcessor:
@@ -361,6 +383,8 @@ class MiniMaxH3VideoAttnProcessor:
         pre_norm=None, residual_scale=None,
     ) -> torch.Tensor:
         hidden_states = _take(hidden_states)
+        if hasattr(attn, "to_q") and hidden_states.dtype in _FUSED_DTYPES:
+            return self._kit_attention(attn, hidden_states, rotary_emb, pre_norm, residual_scale)
         batch_size, seq_len, _ = hidden_states.shape
         plan = vae_ops.rope_plan(hidden_states, attn.dim_head, rotary_emb)
 
@@ -398,6 +422,27 @@ class MiniMaxH3VideoAttnProcessor:
             projected_list, projected = [projected], None
             return kernels.linear(attn.to_out, projected_list, residual=residual, residual_scale=residual_scale)
         return attn.to_out(projected)
+
+    @staticmethod
+    def _kit_attention(attn, hidden_states, rotary_emb, pre_norm, residual_scale):
+        """q, k and v projected one after the other from one prepared input (attention_kit): with SageAttention 2 staged, each is
+        quantized as soon as it is projected, the per-head norm and the RoPE of q and k fused with their quantization. The fused
+        projection's whole output (three times the input) never exists."""
+        residual = hidden_states if pre_norm is not None else None
+        x = pre_norm(hidden_states) if pre_norm is not None else hidden_states
+        del hidden_states
+        plan = vae_ops.rope_plan(x, attn.dim_head, rotary_emb)
+        # the fused kernels take the rotation as (batch, tokens, 1, pairs, cos / sin) and a weight for the norm: 1 (this one has none)
+        table = None if rotary_emb is None else torch.stack((rotary_emb[0][..., :rotary_emb[0].shape[-1] // 2], rotary_emb[1][..., :rotary_emb[1].shape[-1] // 2]), dim=-1)
+        unit = (torch.ones(attn.dim_head, dtype=x.dtype, device=x.device), attn.norm_q.eps)
+        x_list, x = [x], None
+        attention = attention_kit.qkv_attention(x_list, attn.to_q, attn.to_k, attn.to_v, attn.heads, attn.dim_head,
+                                                lambda query, key, group: _norm_rope_(query, key, attn, rotary_emb, plan),
+                                                fused_quant=lambda query, key, group, core, settings: kernels.split_half_norm_rope_quant_(query, key, table, unit, unit, core, settings))
+        projected_list, attention = [attention.flatten(2, 3)], None
+        if residual is not None:
+            return kernels.linear(attn.to_out, projected_list, residual=residual, residual_scale=residual_scale)
+        return attn.to_out(_take(projected_list))
 
 
 class MiniMaxH3VideoAttention(nn.Module):
@@ -479,9 +524,10 @@ class MiniMaxH3VideoTransformerBlock(nn.Module):
         self, hidden_states: list[torch.Tensor], rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None
     ) -> torch.Tensor:
         hidden_states = _take(hidden_states)
-        if (hasattr(self.attn, 'to_qkv')
-                and all(kernels.can_linear(layer, hidden_states, dtypes=_FUSED_DTYPES)
-                        for layer in (self.attn.to_qkv, self.attn.to_out, self.ff.w1, self.ff.w2))
+        # split q / k / v projections (attention kit) take the normalized input; a fused one gets the norm fused into its kernel
+        fused_qkv = (self.attn.to_qkv,) if hasattr(self.attn, 'to_qkv') else ()
+        if (all(kernels.can_linear(layer, hidden_states, dtypes=_FUSED_DTYPES)
+                for layer in (*fused_qkv, self.attn.to_out, self.ff.w1, self.ff.w2))
                 and all(p.device == hidden_states.device and p.dtype == hidden_states.dtype
                         for p in (self.norm1.weight, self.norm2.weight, self.scale1, self.scale2))):
             hidden_states = self.attn([hidden_states], rotary_emb, pre_norm=self.norm1, residual_scale=self.scale1)

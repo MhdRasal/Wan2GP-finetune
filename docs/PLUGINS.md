@@ -13,6 +13,10 @@ For configuration forms shared across browser windows, use the [shared form sync
     *   [The `WAN2GPPlugin` Class](#the-wan2gpplugin-class)
     *   [Core Methods](#core-methods)
     *   [Deepy Tool Registration](#deepy-tool-registration)
+    *   [Plugin toolboxes for agents](#plugin-toolboxes-for-agents)
+    *   [Plugin skills](#plugin-skills)
+    *   [Running Deepy Jobs](#running-deepy-jobs)
+    *   [Plugin Web Apps](#plugin-web-apps)
 5.  [Examples](#examples)
     *   [Example 1: Creating a New Tab](#example-1-creating-a-new-tab)
     *   [Example 2: Injecting UI Elements](#example-2-injecting-ui-elements)
@@ -260,6 +264,152 @@ Unknown parameter names are rejected during plugin setup. A Zero tool name canno
 The same bound method may be registered once for Prime and once for Zero, even with the same name; the two namespaces are independent. At invocation time WanGP passes tool arguments as keyword arguments. Prime's MCP layer validates its generated schema. Zero checks required values, while other schema constraints guide the model; a Zero callable must still validate semantic limits and untrusted input. Return a JSON-serializable value such as a dictionary, list, string, number, Boolean, or `None`. Unhandled exceptions are reported to Deepy as tool failures.
 
 Registration happens before requested WanGP globals and Gradio components are injected, but the bound method runs later and may use attributes requested with `request_global`. Tool functions run in Deepy's backend worker rather than a Gradio event callback, so they should not mutate Gradio components directly.
+
+#### Plugin toolboxes for agents
+
+A plugin with several related functions can publish them as one toolbox instead of separate tools. Every agent reaches it through the `wangp_plugins` tool: MCP clients, Deepy Prime and Deepy Python scripts (`wangp.plugins()`, `wangp.plugin(plugin, action, ...)`). Agents discover it step by step, so an enabled toolbox costs only one line in their context until it is used:
+
+1.  The `wangp_plugins` description lists one summary line per toolbox.
+2.  `wangp_plugins(plugin="<id>")` returns the toolbox guide and its actions with their call signatures.
+3.  `wangp_plugins(plugin, action, arguments=null)` returns the action's contract: description, argument schema, example and routing.
+4.  `wangp_plugins(plugin, action, arguments={...})` runs it.
+
+```python
+def setup_ui(self):
+    self.register_deepy_toolbox("One line: what the plugin does and for which media.", guide="How to choose and combine the actions.")
+    self.register_deepy_action(self.list_presets, uses_gpu=False, summary="List the presets.")
+    self.register_deepy_action(self.process, summary="Process a file or a folder.", paths={"source": "read", "output": "write"},
+                               routing="Processing a whole folder of clips", instead_of="wangp_postprocess")
+
+def process(self, ctx, source: str | list[str], output: str | None = None, strength: float = 1.0) -> dict:
+    """Process the media at source and return the result."""
+    ...
+```
+
+`register_deepy_toolbox(summary, *, guide="", toolbox_id=None, display_name=None)` declares the toolbox once. Its identifier defaults to the plugin folder name and its display name to the plugin name.
+
+`register_deepy_action(function, *, name=None, summary=None, description=None, parameters=None, example=None, uses_gpu=True, paths=None, routing="", instead_of="", scripts=True)` adds an action:
+
+*   `function(ctx, **arguments)` is synchronous and takes the call context as its first parameter. The argument schema comes from the type hints, the description from the docstring.
+*   `parameters`: optional per-argument JSON-schema entries (`description`, `enum`, `minimum`, ...) merged into the derived schema. An entry with its own `type`, `anyOf` or `enum` replaces the derived one.
+*   `uses_gpu`: Deepy releases the GPU before every call of the action, so that the generations the action submits can run. Without that release, a generation submitted by the plugin would wait for Deepy, which is waiting for the plugin. Leave it `True` unless the action never runs GPU work. Discovery and contract reads never release Deepy.
+*   `paths`: argument roles, `"read"` or `"write"`. Before the call, WanGP turns Gallery media ids and `@alias` paths into absolute paths and checks them against the caller's file access. Folders and wildcard patterns (`@documents/clips/*.mp4`) are accepted; the folder part is authorized and the pattern is kept for the plugin to expand.
+*   `routing`: when to choose this action. WanGP adds it to the agents' instructions, so a request is routed to the plugin without hand-written prompt changes. `instead_of` names a WanGP tool the action competes with, such as `wangp_postprocess`, whose discovery then mentions the action.
+*   `scripts=False` keeps an action out of Deepy Python scripts (for example one that stops a job).
+
+The context `ctx` gives:
+
+*   `ctx.state` and `ctx.session`: the caller's WanGP state and API session. Tasks submitted with `ctx.session.submit_task(...)` join the caller's queue; WanGP starts Deepy's browser queue for them.
+*   `ctx.progress(done=None, total=None, text="")`: progress on the caller's tool card (Deepy) or job (MCP), at most three updates per second.
+*   `ctx.cancelled()`: true once the caller stops: the Deepy chat Stop button, or `cancel_job` on a background job.
+*   `ctx.call(tool, arguments)`: another WanGP tool, run on the action's thread. Its arguments and result name files as the caller does (`@outputs/...`): `ctx.resolve(path)` gives a file's real path. A GPU tool releases Deepy first. In Deepy, a generation run this way shows its steps on the status bar and moves the action's progress bar within its current item (report `done`/`total` items with `ctx.progress` before each one).
+*   `ctx.can_write(path)`, `ctx.outputs_dir`, `ctx.virtualize(path)` and `ctx.resolve(path)`: the caller's write access, WanGP's outputs folder, the caller's name for a path and the real path of a name.
+
+An action returns a dictionary. Its `status` defaults to `done`; use `stopped` or `error` for other outcomes. A `gr.Error` raised by shared validation code reaches the agent as a tool error. MCP clients may pass `wait=false` to run an action as a background job followed with `wangp_session` `get_job`, `wait_jobs` and `cancel_job`. The bundled Media Flow plugin is a complete example: it exposes its templates by task and runs them on single files, folders or wildcard batches.
+
+#### Plugin skills
+
+A skill is a Markdown method that Deepy Prime and MCP agents read when a task calls for it, like WanGP's own `wangp://skills/...` (Deepy Zero does not read skills). A plugin ships its skills in its own folder, one folder per skill, and WanGP serves them while the plugin is enabled; no registration call is needed:
+
+```
+plugins/my_plugin/
+    plugin.py
+    skills/
+        comic-pages/SKILL.md   # general skill: wangp://skills/comic-pages
+        inking/SKILL.md        # toolbox skill: wangp://skills/my_plugin/inking
+```
+
+Each `SKILL.md` starts with front matter giving the `name` (the folder's name, lowercase and hyphenated) and a `description` of what the skill covers, followed by the Markdown body. Whether it has a `routing` line decides who reads it:
+
+```markdown
+---
+name: comic-pages
+description: Lay out comic pages and strips from generated panels.
+routing: Drawing a comic page or strip
+---
+```
+
+*   **General skill (with `routing`):** it extends Deepy for every conversation. It is served as `wangp://skills/<name>` and listed with WanGP's skills. Its routing line joins the agents' instructions ("Drawing a comic page or strip: read wangp://skills/comic-pages"), at the cost of that one line in every session. A name already used by WanGP or another enabled plugin is refused.
+*   **Toolbox skill (without `routing`):** it is the method for the plugin's own toolbox and jobs, for example how to plan, which templates to choose and how to review results. It is served as `wangp://skills/<plugin folder>/<name>`, outside the skills listing. The toolbox discovery (`wangp_plugins(plugin="<id>")`) names it next to the guide, and a job's `instructions` can name it too, so agents read it only when they use the plugin.
+
+Prefer toolbox skills. Write a general skill only when the method helps outside the plugin's own toolbox.
+
+### Running Deepy Jobs
+
+A plugin can also send its own request to Deepy, with media, and follow its progress. `self.deepy` gives the plugin's Deepy client in the WanGP web UI (it raises an error before the UI has started or in command-line runs).
+
+```python
+clips = self.deepy.gallery(kind="video")
+with self.deepy.run("Cut a 10 s trailer from these clips", media=[clips[0]["id"], "D:/shots/intro.mp4"], session_dir="D:/my_plugin/sessions/trailer-12", title="Trailer 12") as job:
+    for event in job.events():
+        if event.kind == "progress":
+            print(event.data.status, event.data.progress)
+    result = job.result()
+print(result.status, result.text, [output["path"] for output in result.outputs])
+
+# Later, even after a restart: the conversation continues where it stopped.
+with self.deepy.run("Make it 6 s", session_dir="D:/my_plugin/sessions/trailer-12") as job:
+    result = job.result()
+```
+
+**How a job runs.** Deepy has one conversation at a time, so a job waits until Deepy and the generation queue are idle (and until earlier plugin jobs have finished). It then sets the user's conversation and workspace aside, shows its own conversation and workspace in Deepy and in the gallery while it runs, and brings the user's back when it ends. The user's conversation is restored whether or not saved sessions are enabled; Deepy reloads its context then, as when resuming a session. Meanwhile the user sees the request (badged with the plugin's name) and Deepy's work, and can stop it, but cannot switch conversation or workspace. Do not wait for a job inside a Deepy tool: the job would wait for that tool's request to finish.
+
+**Listing media.** `self.deepy.gallery(workspace=None, kind=None)` lists the media of a workspace, the one shown by default: dictionaries with `id`, `path`, `kind` (`image`, `video`, `audio` or `3d`), `name`, `selected` and `workspace`. `self.deepy.selected()` is the media selected in the shown gallery (or `None`) and `self.deepy.workspaces()` lists the workspaces with their `id`, `name`, `storage_mode` and whether the UI `shown` them. The `id` is a Gallery media id, the form Deepy tools and MCP agents use (for example `visual:3f2a91c04b7e`). `run()` accepts these ids from any workspace, and also the ids Deepy reports for media of the shown gallery.
+
+**`run(prompt, media=(), *, media_mode="copy", session_dir=None, workspace=None, title=None, instructions=None)`** returns a running `DeepyJob` at once. It raises an error when Deepy cannot run requests: check `self.deepy.unavailable_reason` (an empty string when Deepy is ready) beforehand to tell the user why, for example with `gr.Info`.
+
+*   `prompt`: the request, sent as one message.
+*   `media`: Gallery media ids (from any workspace), items returned by `gallery()`, or paths to image, video, audio or 3D files. They are attached to this request only, never to a message the user is writing. A path does not need to be readable by Deepy's own file access: the plugin imports the file into the job's gallery, as a browser upload does, and Deepy then uses it by its media id.
+*   `media_mode`: `"copy"` copies each file into the job's workspace, so the job keeps working if the plugin deletes its file; media already in the job's gallery (for example the user's selection with `workspace="current"`) are used as they are. `"link"` uses the file where it is, without a copy; the plugin must keep the file available. Linking needs a workspace with shared storage: it is refused for a workspace that keeps its media in its own folder (temporary workspaces, workspaces of a `session_dir`, and dedicated storage).
+*   `workspace`: where Deepy's work goes.
+    *   The id of an existing workspace, for example one from `self.deepy.ensure_workspace(...)`: the job works there, and the workspace stays after the job.
+    *   `"isolated"` (the default with `session_dir`): a new workspace for this session. It stays in the workspace list, so the user can browse the results later, and the session uses it again when resumed. With `session_dir` its media are stored in `session_dir/gallery`; otherwise it follows the "Default Storage for New Workspaces" setting.
+    *   `"temporary"` (the default without `session_dir`): a workspace in a private folder, removed with its files when the job is closed. Outputs stay readable until then: copy the ones to keep.
+    *   `"current"`: the workspace the user has open; Deepy's outputs join the user's gallery.
+*   `session_dir`: a folder holding the conversation (`session.json`, `context.json`, the chat journal) and, with an isolated workspace, its media. An empty or missing folder starts a new session; a folder holding a session resumes it, right after the previous job or days later. The folder must be outside Deepy's sessions folder, and the session belongs to the Deepy version (Zero or Prime) that created it. Plugin sessions are not listed in the Deepy session picker. Without `session_dir`, the job's conversation is discarded when the job is closed.
+*   `title`: the session (and isolated workspace) name; by default it is derived from the first request.
+*   `instructions`: standing rules for this job, added to Deepy Prime's system prompt while the job runs and removed when it ends; they never reach the user's conversation. Deepy Zero ignores them. Keep them short and the same from one job to the next (a changed text makes Deepy process the session's context again) and put what is specific to the request in `prompt`; a longer method belongs in a plugin skill they name.
+
+**Following a job.** `job.events(timeout=None)` yields `SessionEvent(kind, data)` objects until the job ends:
+
+| Kind | Data |
+| --- | --- |
+| `queued` | `None`: the job waits for Deepy to be idle. |
+| `started` | `{"session_dir", "workspace_id"}`: Deepy now shows the job. |
+| `status` | `{"kind", "text"}`: Deepy's status line (starting, thinking, paused...). |
+| `text` | `{"text", "delta"}`: Deepy's reply so far, and what was added. |
+| `tool` | `{"id", "name", "label", "status", "status_text"}` when a Deepy action starts or changes state (`running`, `done`, `error`, `interrupted`). |
+| `progress` | A `ProgressUpdate` (`phase`, `status`, `progress` in percent, `current_step`, `total_steps`, `unit`) for generations run by the job. |
+| `output` | `{"id", "path", "kind", "name", "label"}` for each media file Deepy writes. |
+| `done`, `cancelled`, `error` | The `DeepyResult`; always the last event. |
+
+`job.result(timeout=None)` waits for the `DeepyResult`: `status` (`"done"`, `"cancelled"` or `"error"`), `text` (Deepy's reply), `outputs` (as in `output` events), `session_dir` and `error`. The job ends once the user's conversation has been brought back. `job.cancel()` stops a job that is waiting, or interrupts Deepy's work on it; a stop from the Deepy chat ends the job as `cancelled` too. `job.close()` (or leaving a `with` block) cancels a job still running and deletes its private files, temporary workspace included.
+
+**Steering a running job.** `job.steer(text)` sends Deepy a message while it works on the job; Deepy applies it at its next step, as a message typed in the Deepy chat while it works. The reply and media that follow belong to the job's result. It raises an error once the job has ended: send the message with a new `run()` on the same `session_dir`.
+
+**Workspaces of your own.** `self.deepy.ensure_workspace(name, folder)` returns the id of the workspace that keeps its media in `folder`, created with `name` the first time and never archived for inactivity: a plugin can keep a project's media in its own folder and pass the id as `workspace` to `run()`. `self.deepy.deepy_type` is the Deepy version jobs run with (`"zero"` or `"prime"`).
+
+**Generating without Deepy.** `self.deepy.web_session(workspace=None)` returns a `WanGPSession` whose `submit_task(settings, callbacks=None)` adds tasks to the web UI's queue from any thread, for example from a plugin web app. With a workspace id, its generations record in that workspace without changing the gallery the user is viewing.
+
+### Plugin Web Apps
+
+A plugin can serve its own page, for an interface that does not fit Gradio components (a full-screen editor, a dashboard). In `setup_ui`:
+
+```python
+self.register_web_app("/my_plugin", self.create_web_app)
+
+def create_web_app(self):
+    from fastapi import FastAPI
+    app = FastAPI()
+
+    @app.get("/")
+    def index():
+        return {"hello": "world"}
+
+    return app
+```
+
+`register_web_app(path, factory)` serves `factory()`, an ASGI application such as a FastAPI app, at `path` (one lowercase segment, not a WanGP route) from the WanGP server, behind its authentication. The factory runs once when the server starts, after WanGP's globals have been injected. The page is also reachable on its own, full screen, at `http://<server>/<path>/`, and a tab can embed it with an `<iframe src="/my_plugin/">` in a `gr.HTML` component. Use relative URLs in the page so that it works wherever it is mounted. The bundled Showrunner plugin is a complete example: its page, JSON API and event stream are such an app.
 
 ## Examples
 

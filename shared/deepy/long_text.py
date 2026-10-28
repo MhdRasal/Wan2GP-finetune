@@ -30,7 +30,6 @@ _MAX_TEXT_EDIT_CHARS = 1024 * 1024
 _MAX_PROMPT_FILE_BYTES = 4 * 1024 * 1024
 _PROMPT_FILE_RE = re.compile(r'^\s*@file\(\s*"([^"\r\n]+)"\s*\)\s*$')
 _PROMPT_FIELDS = {"prompt", "negative_prompt", "alt_prompt", "audio_prompt", "lyrics", "music_caption", "voice_description"}
-_LEGACY_SKILLS = {"large-artifact-workflows", "long-form-story"}
 _RUNTIME_LOCK = threading.RLock()
 _WORKSPACES_PURGED = False
 
@@ -61,7 +60,7 @@ _RG_FLAG_OPTIONS = {
     "--trim", "-P", "--pcre2", "--crlf", "--stats", "--no-messages",
 }
 _RG_VALUE_OPTIONS = {
-    "-g", "--glob", "-t", "--type", "-T", "--type-not", "-A", "--after-context", "-B", "--before-context",
+    "-g", "--glob", "--iglob", "-t", "--type", "-T", "--type-not", "-A", "--after-context", "-B", "--before-context",
     "-C", "--context", "-m", "--max-count", "--max-depth", "--max-filesize", "-j", "--threads", "-e", "--regexp",
     "-r", "--replace", "--engine", "--sort", "--sortr", "--encoding",
 }
@@ -127,22 +126,6 @@ def long_text_system_instructions(policy) -> str:
         "Use edit(file_path, old_string, new_string, replace_all=false) for exact replacement. Search for enough local context that old_string occurs once, preserve its whitespace and line endings exactly, then search or read back the changed area. "
         f"A generation prompt may be the exact reference `@file(\"{workspace}/prompt.txt\")`; WanGP snapshots the UTF-8 file into the queued task and preserves blank-line sliding-window boundaries."
     )
-
-
-def hide_legacy_artifact_guidance(text: str) -> str:
-    lines = []
-    for line in str(text or "").strip().splitlines():
-        normalized = line.casefold()
-        if "wangp_artifact" in normalized or "managed artifact" in normalized or any(f"wangp://skills/{name}" in normalized for name in _LEGACY_SKILLS):
-            continue
-        line = line.replace("literal text writing, artifact text export (including explicit partial-progress snapshots),", "literal text writing,")
-        line = re.sub(r" Use `write_artifact_text`, not literal `write_text`, when file content comes from an artifact\.", "", line)
-        lines.append(line)
-    return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
-
-
-def legacy_skill_hidden(skill_name: str, policy) -> bool:
-    return long_text_tools_active(policy) and str(skill_name or "").strip().casefold() in _LEGACY_SKILLS
 
 
 def _platform_key() -> tuple[str, str]:
@@ -425,6 +408,6 @@ def resolve_prompt_references(value: Any, policy, key: str = "", *, read_only: b
 
 
 __all__ = [
-    "add_session_workspace", "append_text", "edit_text", "ensure_ripgrep", "hide_legacy_artifact_guidance", "legacy_skill_hidden",
+    "add_session_workspace", "append_text", "edit_text", "ensure_ripgrep",
     "long_text_system_instructions", "long_text_tools_active", "resolve_prompt_file", "resolve_prompt_references", "run_rg", "workspace_mount",
 ]

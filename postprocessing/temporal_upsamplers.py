@@ -12,6 +12,9 @@ Discovery tests the existing optional ``enabled()`` method first. When it is
 absent, handlers may expose a ``status`` property containing ``"enabled"`` or
 ``"disabled"``. Discovery reports ``"unknown"`` only when neither contract
 provides a valid status. Disabled handlers may expose ``reason_disabled``.
+Handlers may implement ``method_available(method)`` and ``method_visible(method)``.
+Both default to True: hidden methods remain usable and are added to menus only
+when restoring their selection; unavailable methods are excluded even then.
 
 Plugin authors can register processors from ``plugin_info.json`` with:
 
@@ -25,13 +28,15 @@ Plugin authors can register processors from ``plugin_info.json`` with:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 import hashlib
 import importlib
 from typing import Any
 
 from shared.attention import attention_shared_state
 from shared.utils import offload_registry
-from .processor_status import PROCESSOR_STATUS_DISABLED, PROCESSOR_STATUS_ENABLED, PROCESSOR_STATUS_UNKNOWN, handler_reason_disabled, handler_status
+from . import memory as processor_memory
+from .processor_status import PROCESSOR_STATUS_DISABLED, PROCESSOR_STATUS_ENABLED, PROCESSOR_STATUS_UNKNOWN, handler_reason_disabled, handler_status, handler_method_available, handler_method_in_choices
 from .model_context import compatible_loaded_model
 
 
@@ -43,6 +48,7 @@ temporal_upsampler_handlers = [
     "postprocessing.dlss5.temporal_upsampler.DLSSGTemporalUpsampler",
 ]
 _temporal_upsampler_handlers: list[Any] = []
+_temporal_upsampler_server_config: dict[str, Any] | None = None
 _registered_temporal_upsampler_handler_paths: set[str] = set()
 
 
@@ -131,6 +137,8 @@ def default_config_sections(handler_modules: list[str] | None = None) -> dict[st
 
 
 def register_temporal_upsamplers(server_config, files_locator, handler_modules: list[str] | None = None) -> None:
+    global _temporal_upsampler_server_config
+    _temporal_upsampler_server_config = server_config
     modules = temporal_upsampler_handlers if handler_modules is None else handler_modules
     for path in modules:
         path = str(path or "").strip()
@@ -285,11 +293,11 @@ def normalize_temporal_upsampling_value_for_method(method, current_value) -> tup
     return normalize_temporal_upsampling_state(method, 2.0 if split is None else split[1])
 
 
-def query_method_choices(enabled_only: bool = False) -> list[tuple[str, str]]:
+def query_method_choices(enabled_only: bool = False, *, selected_method: str = "", include_hidden: bool = False) -> list[tuple[str, str]]:
     choices = []
     for handler in registered_temporal_upsamplers(enabled_only):
         handler_def = handler.query_temporal_upsampler_def()
-        choices += [(_method_pos(handler_def, method), str(label or "").casefold(), str(method or ""), label, method) for label, method in _method_choices(handler_def)]
+        choices += [(_method_pos(handler_def, method), str(label or "").casefold(), str(method or ""), label, method) for label, method in _method_choices(handler_def) if handler_method_in_choices(handler, method, selected_method=selected_method, include_hidden=include_hidden)]
     return [(label, method) for _, _, _, label, method in sorted(choices)]
 
 
@@ -327,7 +335,7 @@ def temporal_help_id(method_choices) -> str:
 
 def dropdown_state(temporal_upsampling, *, late_postprocessing: bool = False) -> dict[str, Any]:
     method, scale = split_temporal_upsampling_value(temporal_upsampling) or ("", 2.0)
-    method_choices = [("None", "")] + query_method_choices(enabled_only=not late_postprocessing)
+    method_choices = [("None", "")] + query_method_choices(enabled_only=not late_postprocessing, selected_method=method)
     if method not in {value for _, value in method_choices}:
         method = ""
     multiplier_choices, scale, value = normalize_temporal_upsampling_state(method, scale)
@@ -345,8 +353,9 @@ def create_generation_temporal_ui(gr, temporal_upsampling, *, visible: bool = Tr
     value = gr.Textbox(value=state["value"], visible=False, elem_classes=elem_classes)
 
     def refresh_method(method, value):
-        multiplier_choices, scale, value = normalize_temporal_upsampling_value_for_method(method, value)
-        return gr.update(choices=multiplier_choices, value=scale, visible=bool(method)), value
+        _, _, value = normalize_temporal_upsampling_value_for_method(method, value)
+        state = dropdown_state(value, late_postprocessing=late_postprocessing)
+        return gr.update(choices=state["method_choices"], value=state["method"]), gr.update(choices=state["multiplier_choices"], value=state["scale"], visible=bool(state["method"])), state["value"]
 
     def refresh_multiplier(method, scale):
         _, scale, value = normalize_temporal_upsampling_state(method, scale)
@@ -354,7 +363,7 @@ def create_generation_temporal_ui(gr, temporal_upsampling, *, visible: bool = Tr
 
     if not update_form:
         outputs = [multiplier, value]
-        gr.on(triggers=[method.input], fn=refresh_method, inputs=[method, value], outputs=outputs, show_progress="hidden")
+        gr.on(triggers=[method.input], fn=refresh_method, inputs=[method, value], outputs=[method, *outputs], show_progress="hidden")
         gr.on(triggers=[multiplier.input], fn=refresh_multiplier, inputs=[method, multiplier], outputs=outputs, show_progress="hidden")
     return {"value": value, "method": method, "multiplier": multiplier}
 
@@ -366,6 +375,9 @@ def validate_temporal_upsampling(temporal_upsampling, *, source_is_image: bool =
     handler = find_temporal_upsampler(temporal_upsampling)
     if handler is None:
         return f"No temporal upsampler registered for '{temporal_upsampling}'"
+    method, _ = handler.split_value(temporal_upsampling)
+    if not handler_method_available(handler, method):
+        return f"Temporal upsampler '{method}' is not available"
     if hasattr(handler, "validate_upsampling"):
         return handler.validate_upsampling(temporal_upsampling, source_is_image=source_is_image)
     return "Temporal Upsampling can not be used with an Image" if source_is_image else ""
@@ -377,6 +389,9 @@ def temporal_upsample(temporal_upsampling, sample, previous_last_frame, fps, *, 
         if str(temporal_upsampling or "").strip():
             raise ValueError(f"No temporal upsampler registered for '{temporal_upsampling}'")
         return sample, previous_last_frame, fps
+    kwargs["profile"] = 0
+    if kwargs.get("init_pipe") is None:
+        kwargs["init_pipe"] = partial(processor_memory.init_pipe, server_config=_temporal_upsampler_server_config)
     name = handler.query_temporal_upsampler_def()["name"]
     persistent = handler.persistent_models() if hasattr(handler, "persistent_models") else False
     borrowed_context = compatible_loaded_model(handler, temporal_upsampling, loaded_model_context)
@@ -467,13 +482,17 @@ def migrate_temporal_upsampler_config(server_config: dict[str, Any]) -> bool:
 
 def create_config_ui(gr, server_config: dict[str, Any], *, lock_config: bool = False) -> list[TemporalUpsamplerConfigBinding]:
     bindings = []
-    for handler in _temporal_upsampler_handlers:
-        if not hasattr(handler, "create_config_ui"):
-            continue
-        config = write_config_section(server_config, handler, read_config_section(server_config, handler))
-        controls = handler.create_config_ui(gr, config, lock_config=lock_config)
-        if controls:
-            bindings.append(TemporalUpsamplerConfigBinding(handler, config_key_for_handler(handler), list(controls)))
+    handlers = [handler for handler in _temporal_upsampler_handlers if hasattr(handler, "create_config_ui")]
+    if not handlers:
+        return bindings
+    with gr.Tabs():
+        for handler in handlers:
+            config = write_config_section(server_config, handler, read_config_section(server_config, handler))
+            with gr.Tab(handler.query_temporal_upsampler_def()["name"]) as tab:
+                controls = handler.create_config_ui(gr, config, lock_config=lock_config)
+            tab.visible = bool(controls)
+            if controls:
+                bindings.append(TemporalUpsamplerConfigBinding(handler, config_key_for_handler(handler), list(controls)))
     return bindings
 
 
@@ -517,6 +536,7 @@ def apply_config_update(server_config: dict[str, Any], bindings: list[TemporalUp
 
 def release_changed_config_temporal_upsamplers(old_config: dict[str, Any], new_config: dict[str, Any], changed_keys) -> None:
     changed_keys = set(changed_keys)
+    memory_changed = processor_memory.config_values(old_config) != processor_memory.config_values(new_config)
     for handler in _temporal_upsampler_handlers:
         if not hasattr(handler, "release_vram"):
             continue
@@ -526,7 +546,7 @@ def release_changed_config_temporal_upsamplers(old_config: dict[str, Any], new_c
             should_release = handler.config_requires_release(old_section, new_section, changed_keys)
         else:
             should_release = old_section != new_section
-        if should_release:
+        if should_release or memory_changed:
             handler.release_vram()
 
 

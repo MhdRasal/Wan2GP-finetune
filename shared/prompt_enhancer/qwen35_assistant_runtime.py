@@ -15,6 +15,7 @@ import torch
 
 from shared.llm_engines.lmgp import SamplingParams
 from shared.llm_engines.lmgp.engine.block_manager import BlockManager
+from shared.llm_engines.lmgp.layers.kv_formats import overlay_slots as _kv_overlay_slots
 from shared.llm_engines.lmgp.engine.sequence import Sequence, SequenceStatus
 from shared.prompt_enhancer import qwen35_text
 from shared.prompt_enhancer.streaming import ThrottledStreamEmitter
@@ -996,7 +997,7 @@ class Qwen35AssistantRuntime:
         llm.reset()
         llm.model_runner.ensure_runtime_ready()
         if llm.config.num_kvcache_blocks > 0 and len(llm.scheduler.block_manager.blocks) != llm.config.num_kvcache_blocks:
-            llm.scheduler.block_manager = BlockManager(llm.config.num_kvcache_blocks, llm.config.kvcache_block_size)
+            llm.scheduler.block_manager = BlockManager(llm.config.num_kvcache_blocks, llm.config.kvcache_block_size, _kv_overlay_slots(llm.config))
         llm.model_runner.reset_generation_state()
         llm.model_runner.call("set_sampling_seed", None if seed is None else int(seed))
         llm.scheduler.waiting.clear()
@@ -1702,6 +1703,8 @@ class Qwen35AssistantRuntime:
                 "repetition_penalty": None if seq.repetition_penalty is None else float(seq.repetition_penalty),
                 "predictive_penalty": bool(seq.predictive_penalty),
                 "repetition_penalty_start": int(seq.repetition_penalty_start),
+                "overlay_slot": int(seq.overlay_slot),
+                "ring_high": int(seq.ring_high),
             },
             "block_manager": {
                 "block_size": int(llm.scheduler.block_manager.block_size),
@@ -1716,9 +1719,11 @@ class Qwen35AssistantRuntime:
                 "hash_to_block_id": {int(hash_key): int(block_id) for hash_key, block_id in llm.scheduler.block_manager.hash_to_block_id.items()},
                 "free_block_ids": [int(block_id) for block_id in llm.scheduler.block_manager.free_block_ids],
                 "used_block_ids": [int(block_id) for block_id in llm.scheduler.block_manager.used_block_ids],
+                "free_overlay_slots": [int(slot) for slot in llm.scheduler.block_manager.free_overlay_slots],
             },
-            "kv_cache": snapshot_cache(runner.kv_cache, ranges, axis=2, previous=None if previous is None else previous["kv_cache"], reuse=reuse_blocks),
-            "kv_cache_scales": None if not hasattr(runner, "kv_cache_scales") else snapshot_cache(runner.kv_cache_scales, ranges, axis=2, previous=None if previous is None else previous["kv_cache_scales"], reuse=reuse_blocks),
+            "kv_tensors": {name: snapshot_cache(tensor, ranges, axis=axis, previous=None if previous is None else previous["kv_tensors"][name], reuse=reuse_blocks)
+                           for name, (tensor, axis) in runner.kv_snapshot_items().items()},
+            "kv_overlay": runner.snapshot_overlay(seq),
             "linear_states": self._snapshot_linear_states(),
             "speculative_state": runner.snapshot_speculative_state(seq.seq_id, previous=None if previous is None else previous["speculative_state"], reuse_tokens=reuse_tokens) if bool(getattr(self.model, "_prompt_enhancer_speculative_decoding", False)) else None,
             "generation_state": {
@@ -1835,21 +1840,18 @@ class Qwen35AssistantRuntime:
         runner = llm.model_runner
         if not hasattr(runner, "kv_cache"):
             raise RuntimeError("Assistant runtime has no KV cache to restore into.")
-        kv_cache = snapshot.get("kv_cache")
-        if kv_cache is None or kv_cache["shape"] != tuple(runner.kv_cache.shape):
-            saved_shape = None if kv_cache is None else kv_cache["shape"]
-            live_shape = tuple(int(x) for x in runner.kv_cache.shape)
-            self._log(f"Assistant KV cache snapshot mismatch saved_shape={saved_shape} live_shape={live_shape}")
+        saved_tensors = snapshot.get("kv_tensors") or {}
+        live_tensors = runner.kv_snapshot_items()
+        if set(saved_tensors) != set(live_tensors) or any(tuple(saved_tensors[name]["shape"]) != tuple(tensor.shape) for name, (tensor, _axis) in live_tensors.items()):
+            saved_shapes = {name: saved["shape"] for name, saved in saved_tensors.items()}
+            live_shapes = {name: tuple(int(x) for x in tensor.shape) for name, (tensor, _axis) in live_tensors.items()}
+            self._log(f"Assistant KV cache snapshot mismatch saved_shape={saved_shapes} live_shape={live_shapes}")
             raise RuntimeError("Assistant KV cache snapshot shape does not match current runtime.")
         with torch.inference_mode():
             from shared.llm_engines.snapshot_cache import restore_cache
 
-            restore_cache(runner.kv_cache, kv_cache)
-            if hasattr(runner, "kv_cache_scales"):
-                kv_cache_scales = snapshot.get("kv_cache_scales")
-                if kv_cache_scales is None or kv_cache_scales["shape"] != tuple(runner.kv_cache_scales.shape):
-                    raise RuntimeError("Assistant KV cache scale snapshot does not match current runtime.")
-                restore_cache(runner.kv_cache_scales, kv_cache_scales)
+            for name, (tensor, _axis) in live_tensors.items():
+                restore_cache(tensor, saved_tensors[name])
         linear_modules = self._get_linear_state_modules()
         linear_states = snapshot.get("linear_states", [])
         if len(linear_modules) != len(linear_states):
@@ -1863,7 +1865,7 @@ class Qwen35AssistantRuntime:
                 module.conv_state_buffer.copy_(saved_conv)
                 module.recurrent_state_buffer.copy_(saved_recurrent)
         saved_block_manager = snapshot["block_manager"]
-        llm.scheduler.block_manager = BlockManager(len(saved_block_manager["blocks"]), int(saved_block_manager["block_size"]))
+        llm.scheduler.block_manager = BlockManager(len(saved_block_manager["blocks"]), int(saved_block_manager["block_size"]), _kv_overlay_slots(llm.config))
         for block, saved_block in zip(llm.scheduler.block_manager.blocks, saved_block_manager["blocks"]):
             block.ref_count = int(saved_block["ref_count"])
             block.hash = int(saved_block["hash"])
@@ -1871,6 +1873,7 @@ class Qwen35AssistantRuntime:
         llm.scheduler.block_manager.hash_to_block_id = {int(hash_key): int(block_id) for hash_key, block_id in saved_block_manager["hash_to_block_id"].items()}
         llm.scheduler.block_manager.free_block_ids = deque(int(block_id) for block_id in saved_block_manager["free_block_ids"])
         llm.scheduler.block_manager.used_block_ids = set(int(block_id) for block_id in saved_block_manager["used_block_ids"])
+        llm.scheduler.block_manager.free_overlay_slots = deque(int(slot) for slot in saved_block_manager.get("free_overlay_slots", []))
         saved_seq = snapshot["sequence"]
         restored_seq = Sequence([int(token_id) for token_id in saved_seq["token_ids"]], SamplingParams(max_tokens=int(saved_seq["max_tokens"]), ignore_eos=bool(saved_seq["ignore_eos"])))
         restored_seq._assistant_context_id = snapshot["context_id"]
@@ -1887,6 +1890,10 @@ class Qwen35AssistantRuntime:
         restored_seq.repetition_penalty = None if saved_seq["repetition_penalty"] is None else float(saved_seq["repetition_penalty"])
         restored_seq.predictive_penalty = bool(saved_seq["predictive_penalty"])
         restored_seq.repetition_penalty_start = int(saved_seq["repetition_penalty_start"])
+        restored_seq.overlay_slot = int(saved_seq.get("overlay_slot", -1))
+        restored_seq.ring_high = int(saved_seq.get("ring_high", 0))
+        with torch.inference_mode():
+            runner.restore_overlay(restored_seq, snapshot.get("kv_overlay"))
         restored_seq.logits_processor = None
         restored_seq.logits_processor_update_state = None
         llm.scheduler.waiting.clear()

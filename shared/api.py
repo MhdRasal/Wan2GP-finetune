@@ -769,6 +769,14 @@ class WanGPSession:
     def get_exported_default_settings(self, model_type: str) -> dict[str, Any]:
         return self.prepare_settings_for_export(self.get_default_settings(model_type))
 
+    def get_lora_dir(self, model_type: str) -> str:
+        """The LoRA folder of a model (raises for unknown models and models without LoRA support)."""
+        runtime = self._ensure_runtime()
+        with _pushd(runtime.root):
+            if runtime.module.get_model_def(model_type) is None:
+                raise ValueError(f"Unknown model_type: {model_type}")
+            return str(runtime.module.get_lora_dir(model_type))
+
     def list_loras(self, model_type: str, name: str | Sequence[str] | None = None) -> dict[str, Any]:
         runtime = self._ensure_runtime()
         with _pushd(runtime.root):

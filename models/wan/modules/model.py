@@ -24,7 +24,7 @@ from ..scail2 import build_scail2_pose_tokens
 from ..steadydancer.small_archs import FactorConv3d, PoseRefNetNoBNV3
 from ..steadydancer.mobilenetv2_dcd import DYModule
 from ..shotplan import inject_shotplan_tokens
-from ..animate2 import animate2_attention_block, animate2_cached_attention_block
+from ..animate2 import animate2_attention_block, animate2_cached_attention_block, load_cached as animate2_load_cached, store_kv as animate2_store_kv
 
 __all__ = ['WanModel']
 
@@ -1592,7 +1592,7 @@ class WanModel(ModelMixin, ConfigMixin):
         animate2_ref_clip_fea = None,
         animate2_ref_freqs = None,
         animate2_log_scale = 0.0,
-        animate2_kv_cache = "Disabled",
+        animate2_kv_cache = "Disabled",  # GPU (exact), INT8 (K/V on the GPU), RAM (INT8 K/V in RAM) (animate2.py)
         camera_adapter_features = None,
         uni3c_condition = None,
     ):
@@ -1637,7 +1637,7 @@ class WanModel(ModelMixin, ConfigMixin):
             scail2_ref_latents_list = [scail2_ref_latents] * len(x_list)
         bernini_enabled = bernini_sources is not None
         animate2_enabled = animate2_ref_x is not None
-        animate2_cache = get_cache("animate2_kv") if animate2_enabled and animate2_kv_cache in ("GPU", "RAM") else None
+        animate2_cache = get_cache("animate2_kv") if animate2_enabled and animate2_kv_cache != "Disabled" else None
         animate2_cached = animate2_cache is not None and len(animate2_cache.get("blocks", [])) == len(self.blocks)
         bernini_freqs_list = []
         bernini_output_slices = []
@@ -2079,11 +2079,14 @@ class WanModel(ModelMixin, ConfigMixin):
                         "log_scale": animate2_log_scale,
                     }
                     if animate2_cached:
-                        animate2_ref_handoff = [animate2_cache["blocks"][block_idx].to(device=x_list[0].device, dtype=modulation_dtype)]
+                        animate2_ref_handoff = [animate2_load_cached(animate2_cache["blocks"][block_idx], x_list[0].device, modulation_dtype)]
                         x_list = block(animate2_ref_handoff, e=animate2_ref_e0, context=None, grid_sizes=animate2_ref_grid_sizes, freqs=animate2_ref_freqs, animate2_generation=animate2_generation, animate2_cached=True)
                     else:
-                        if animate2_cache is not None:
-                            animate2_cache["blocks"].append(animate2_ref_hidden.detach().to(animate2_ref_hidden.device if animate2_kv_cache == "GPU" else "cpu", copy=True))
+                        if animate2_cache is not None and animate2_kv_cache in ("INT8", "RAM"):  # the block stores its reference K/V
+                            cache_device = "cpu" if animate2_kv_cache == "RAM" else animate2_ref_hidden.device
+                            animate2_generation["store_kv"] = lambda ref_kv_list: animate2_cache["blocks"].append(animate2_store_kv(ref_kv_list, cache_device))
+                        elif animate2_cache is not None:
+                            animate2_cache["blocks"].append(animate2_ref_hidden.detach().to(animate2_ref_hidden.device, copy=True))
                         animate2_ref_handoff = [animate2_ref_hidden]
                         animate2_ref_hidden = None
                         animate2_ref_hidden, x_list = block(animate2_ref_handoff, e=animate2_ref_e0, context=animate2_ref_context_emb, grid_sizes=animate2_ref_grid_sizes, freqs=animate2_ref_freqs, animate2_generation=animate2_generation)

@@ -10,7 +10,7 @@ import torch.cuda.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from shared.kernels import kernel_policy
+from shared.kernels import kernel_policy, vae_ops
 from shared.cuda_memory import mmgp_vram_allocator
 
 try:
@@ -651,12 +651,8 @@ class AttentionBlock(nn.Module):
                                                      2).contiguous().chunk(
                                                          3, dim=-1)
 
-        # apply attention
-        x = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-        )
+        # apply attention (by chunks of queries where SDPA has no memory-efficient kernel for the VAE's dtype)
+        x = vae_ops.attention(q, k, v)
         x = x.squeeze(1).permute(0, 2, 1).reshape(b * t, c, h, w)
 
         # output

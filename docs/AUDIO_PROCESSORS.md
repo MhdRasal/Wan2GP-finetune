@@ -180,15 +180,19 @@ Only enabled/loaded plugins are considered. The plugin manager reuses cached
 Audio processor settings are stored under
 `wgp_config["audio_processors"][config_key]`.
 
-Model persistence is shared by all processors at
-`wgp_config["audio_processors"]["persistence"]`; handlers must not add their own
-persistence control. The registry retains at most one audio processor handler and
-fully releases it before dispatching a different handler. Model-backed handlers
-should obtain the policy through `audio_processors.persistent_models(...)` when
-deciding whether their runtime may keep weights in RAM after use. *Auto* (the
-default of new installations) keeps them loaded with memory profile 0 and the
-VRAM Preload of the current model: their Reserved RAM is only borrowed while
-they run. Handlers obtain this through the `init_pipe` WanGP passes them.
+**Postprocessor VRAM Usage**, at the top of Configuration > Extensions, is shared
+with temporal and spatial processors. **Minimum** (default) uses each processor's
+minimum; **Manual Choice** uses the greater of that minimum and the selected MB
+amount; **Dynamic** adapts profile 0 preload to available VRAM. This controls
+preloaded weights rather than imposing a limit on total VRAM use.
+
+The most recently used audio processor stays loaded in RAM for reuse and is
+released when a different processor runs or the shared VRAM policy changes.
+Processors without MMGP-managed weights retain their own memory requirements.
+
+An extension can hide alternative methods from normal menus while keeping them
+available. Extracting settings restores the exact saved method, including a
+hidden one. Selecting another method hides the restored alternative again.
 
 Handlers with configuration should implement `default_config()` and
 `normalize_config_section(...)`. If they expose Configuration-tab controls, return

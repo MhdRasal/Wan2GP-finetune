@@ -202,6 +202,16 @@ This lets WanGP track every extension offload object and release all extension
 resources centrally: the toolbar "Unload Models" tool and Configuration plugin
 release button call `offload_registry.release_all()`.
 
+Alternative methods can be available without appearing in the normal dropdown.
+Extracting settings restores the saved method even when the extension currently
+hides it. Selecting another method hides that alternative again. Disabled or
+unavailable methods still follow the usual availability rules.
+
+MMGP-managed temporal models use the shared **Postprocessor VRAM Usage** control
+in Configuration > Extensions: **Minimum** (default), **Manual Choice** (at least
+the processor's minimum), or **Dynamic** preload. Native processors keep their
+own memory requirements.
+
 ---
 
 > Applies to: Developing temporal upsampler plugins: handlers, registration and shared configuration. Installed frame-interpolation options are available through WanGP's post-processing controls and API.

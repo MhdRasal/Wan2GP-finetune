@@ -3,6 +3,7 @@ import math
 from dataclasses import dataclass, field
 
 import torch
+from shared.kernels import vae_ops
 from shared.utils.conv_bands import band_convs, conv_bands
 from .autoencoder import norm_swish
 from einops import rearrange
@@ -42,7 +43,7 @@ class AttnBlock(nn.Module):
         q = rearrange(q, "b c h w -> b 1 (h w) c").contiguous()
         k = rearrange(k, "b c h w -> b 1 (h w) c").contiguous()
         v = rearrange(v, "b c h w -> b 1 (h w) c").contiguous()
-        h_ = nn.functional.scaled_dot_product_attention(q, k, v)
+        h_ = vae_ops.attention(q, k, v)  # by chunks of queries where SDPA has no memory-efficient kernel (BF16 on Turing)
 
         return rearrange(h_, "b 1 (h w) c -> b c h w", h=h, w=w, c=c, b=b)
 

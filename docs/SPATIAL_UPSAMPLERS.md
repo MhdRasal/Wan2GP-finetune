@@ -34,6 +34,16 @@ Decoded-media handlers also declare `postprocessing_category`:
   may omit `multipliers`; WanGP then hides the Scale control and serializes the
   bare method id.
 
+## FlashVSR Versions
+
+FlashVSR v1.1 and FlashVSR+ Turbo have separate selections, including their
+two-pass variants. **Configuration > Extensions > FlashVSR > Model** controls
+which version is normally shown. **Extract Settings** restores the saved
+version and scale even if the current configuration hides that version;
+running those restored settings uses that version without changing the
+configuration preference. Existing `flashvsr` and `flashvsr2pass` settings mean
+FlashVSR v1.1; `flashvsrplus` and `flashvsrplus2pass` mean FlashVSR+ Turbo.
+
 ## Handler contract
 
 ```python
@@ -82,6 +92,8 @@ class MyUpsampler:
     def release_private_runtime(self): ...                    # optional before borrowing core model
     def release_vram(self): ...
     def enabled(self): ...                                 # optional UI gating
+    def method_available(self, method): ...                # optional per-method availability
+    def method_visible(self, method): ...                  # optional default dropdown visibility
     @property
     def status(self): ...                                  # optional: "enabled" or "disabled"
     @property
@@ -131,6 +143,14 @@ can define a default `pos` and override individual methods with `method_pos`.
 Position is independent of multiplier; expanded choices such as `myup*2` and
 `myup*4` share the `myup` method position.
 
+`method_visible(method)` can hide an available method from normal dropdown
+choices. The registry includes a hidden method when restoring it as the current
+selection, then hides it again when another method is selected. Visibility does
+not affect method lookup, metadata labels, API discovery or execution. Media
+compatibility, model exclusions and `method_available(method)` still apply;
+restoring a hidden choice never makes an unavailable method usable. Handlers
+without this hook show all their available methods.
+
 ### Borrowing the loaded generation model
 
 A postprocessor that can run through an already loaded generation pipeline may
@@ -144,8 +164,8 @@ does not retain a duplicate private model. If compatibility returns false, the
 normal private-runtime path is used; this is also the fallback when no core
 model is loaded.
 
-Borrowed runtimes are always released from RAM after the call, even when shared
-spatial-upscaler persistence is enabled. This detaches borrowed model references
+Borrowed runtimes always detach their borrowed references after the call,
+even when private processor runtimes are retained for reuse. This detaches references
 before the core MMGP owner can be released or replaced.
 
 Borrowing is an explicit capability contract, not an architecture guess. A
@@ -290,16 +310,19 @@ swaps LoRAs. Outputs are limited to a 4320p short side; a larger request fails
 before denoising with the largest multiplier that fits. Its progress counts
 tiles, text-encoder layers and VAE tiles with their units.
 
-Model persistence is a registry-wide setting stored at
-`wgp_config["spatial_upsamplers"]["persistence"]`; handlers must not expose a
-separate persistence control in their own config section. *Auto* (the default
-of new installations) keeps models loaded with memory profile 0 and the VRAM
-Preload of the current model, applied through the `init_pipe` WanGP passes to
-handlers. The registry retains
-at most one spatial upsampler handler. When dispatch changes handlers, it fully
-releases the previous handler before loading the new one. A handler remains
-responsible for releasing incompatible variants that share that handler, such as
-PiD version, backbone, profile, dtype, or checkpoint-set changes.
+**Postprocessor VRAM Usage**, at the top of Configuration > Extensions, applies
+to audio, temporal and spatial processors. **Minimum** is the default and uses
+each processor's own minimum. **Manual Choice** shows a preload amount in MB;
+the effective amount is the greater of that value and the processor's minimum.
+**Dynamic** lets memory profile 0 adapt preload to available VRAM. Whole-model
+requirements remain intact. These controls affect model preload, not a hard
+limit on total VRAM consumed by processing.
+
+The most recently used spatial processor stays loaded in RAM for reuse. Switching
+to another processor releases it, as does changing the shared VRAM policy.
+Processors that reuse the generation model retain that model's existing memory
+configuration. Native processors without MMGP-managed weights keep their own
+memory requirements.
 
 Models declare external VAE upsampler support with method ids under
 `model_def["vae_upsamplers"]`, for example:

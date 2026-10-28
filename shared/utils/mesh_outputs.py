@@ -100,6 +100,8 @@ def save_mesh_metadata(path, settings):
 
 
 def read_mesh_metadata(path):
+    if Path(path).suffix.lower() not in (".glb", ".gltf", ".ply"):
+        return None  # OBJ and STL carry no settings
     if is_splat_file(path):
         from shared.mesh3d.splats import ply_comments
         prefix = SETTINGS_KEY + " "

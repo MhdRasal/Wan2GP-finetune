@@ -92,6 +92,8 @@ def normalize_choice_def(choice_def):
 
 
 def infer_main_outputs(model_def):
+    if model_def.get("world_outputs", False):  # interactive worlds, rendered as videos
+        return ["world", "video"]
     if model_def.get("audio_only", False):
         return ["audio"]
     if model_def.get("mesh_outputs", False):
@@ -134,12 +136,12 @@ def infer_inputs(model_def):
 
 
 def custom_guide_kinds(model_def):
-    """Media kinds of the custom_guide file input ("3d", "audio", ...; "file" for other formats such as MIDI or scores)."""
-    from shared.utils.gallery_sources import MESH_IMPORT_EXTENSIONS
+    """Media kinds of the custom_guide file input ("3d", "world", ...; "file" for other formats such as MIDI or scores)."""
+    from shared.utils.gallery_sources import MESH_IMPORT_EXTENSIONS, WORLD_EXTENSIONS
     custom_guide = model_def.get("custom_guide")
     if custom_guide is None:
         return []
-    kinds = ["3d" if file_type.lower() in MESH_IMPORT_EXTENSIONS else "file" for file_type in custom_guide.get("file_types", [])]
+    kinds = ["3d" if file_type.lower() in MESH_IMPORT_EXTENSIONS else "world" if file_type.lower() in WORLD_EXTENSIONS else "file" for file_type in custom_guide.get("file_types", [])]
     return list(dict.fromkeys(kinds or ["file"]))
 
 
@@ -213,6 +215,7 @@ def infer_capabilities(model_def, main_outputs, outputs, inputs, media_inputs):
         "lora": not bool(model_def.get("no_lora", False)),
         # 3D capabilities are only listed for 3D models, which keeps the other models' metadata unchanged.
         **({"image_to_3d": image_inputs["reference"], "text_to_3d": "text" in inputs and not model_def.get("one_image_ref_needed", False), "video_to_3d": video_inputs["reference"], "3d_to_3d": "3d" in inputs} if "3d" in main_outputs else {}),
+        **({"text_to_world": "text" in inputs, "image_to_world": image_inputs["start"]} if "world" in main_outputs else {}),
         # Specialized workflows can narrow capabilities inferred from shared controls.
         **model_def.get("capability_overrides", {}),
     }

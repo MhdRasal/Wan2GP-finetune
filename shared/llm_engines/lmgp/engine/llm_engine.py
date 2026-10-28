@@ -15,6 +15,7 @@ from ..sampling_params import SamplingParams
 from .sequence import Sequence
 from .scheduler import Scheduler
 from .block_manager import BlockManager
+from ..layers.kv_formats import overlay_slots
 from .model_runner import ModelRunner
 
 
@@ -112,6 +113,7 @@ class LLMEngine:
         self.scheduler.block_manager = BlockManager(
             self.config.num_kvcache_blocks,
             self.config.kvcache_block_size,
+            overlay_slots(self.config),  # the exact overlays of a mixed KV layout, as the scheduler's own
         )
 
     def clear_graph_cache(self):
@@ -250,6 +252,7 @@ class LLMEngine:
             self.scheduler.block_manager = BlockManager(
                 self.config.num_kvcache_blocks,
                 self.config.kvcache_block_size,
+                overlay_slots(self.config),
             )
         # Clean up any residual state from previous interrupted generations
         # This prevents 'deque index out of range' errors from accumulated block leaks
@@ -349,6 +352,7 @@ class LLMEngine:
             self.scheduler.block_manager = BlockManager(
                 self.config.num_kvcache_blocks,
                 self.config.kvcache_block_size,
+                overlay_slots(self.config),
             )
         if not self.is_finished():
             self.reset()

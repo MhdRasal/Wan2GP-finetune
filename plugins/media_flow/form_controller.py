@@ -101,6 +101,13 @@ class InitialFormPatch:
 RESTORED_FORM_OUTPUT_COUNT = 12
 
 
+def create_form_controller(library, get_model_def, server_config: dict) -> "ProcessFormController":
+    """The form rules of the tab, also used for the defaults of agent runs."""
+    all_resolutions = ui_constants.HIGH_OUTPUT_RESOLUTION_CHOICES + ui_constants.STANDARD_OUTPUT_RESOLUTION_CHOICES
+    return ProcessFormController(library=library, get_model_def=get_model_def, output_resolution_values={value for _, value in all_resolutions}, output_resolution_choices=ui_constants.output_resolution_choices(server_config),
+                                 source_audio_track_values={value for _, value in ui_constants.SOURCE_AUDIO_TRACK_CHOICES}, ratio_values={value for _, value in ui_constants.RATIO_CHOICES})
+
+
 def skipped_restored_form_outputs() -> tuple:
     return tuple(gr.skip() for _ in range(RESTORED_FORM_OUTPUT_COUNT))
 

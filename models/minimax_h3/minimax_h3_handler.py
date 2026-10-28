@@ -7,6 +7,7 @@ import gradio as gr
 import torch
 
 from shared.utils.download import process_files_def_if_needed
+from shared.utils import files_locator as fl
 from shared.utils.hf import build_hf_url
 from shared.utils.frame_scheduler import normalize_overlap
 from shared.utils.generation_overrides import get_override, set_override
@@ -19,6 +20,7 @@ from .dialogue import H3_DIALOGUE_GENERATION, H3_DIALOGUE_MAX_TOTAL_SECONDS, H3_
 from .minimax_h3_main import (AUDIO_VAE_FILE, LATENT_UPSCALER_FILE, LATENT_UPSCALER_FOLDER, TEXT_ENCODER_FOLDER,
                               VIDEO_VAE_FILE, VIDEO_VAE_FP8MIX_FILE, VIDEO_VAE_INT8_FILE, VIDEO_VAE_LIGHT_FILE, VIDEO_VAE_LIGHT_INT8_FILE)
 from .pdd import PDD_BLOCK_SIZE, PDD_NUM_STEPS
+from .ptd import PTD_FOLDER, PTD_HEAD_FILE, PTD_INFOS, PTD_DEEPY_INFOS
 from .vae_upsampler import X2_VAE_DESCRIPTION, X2_VAE_FILE, X2_VAE_INT8_FILE, X2_VAE_METHOD, X2_VAE_VALUE, query_x2_vae_files
 from .viggle import VIGGLE_ARCHITECTURE, VIGGLE_ASSET_FOLDER, VIGGLE_INFOS, VIGGLE_PROMPT_FILE, VIGGLE_REPO_ID
 from .prompt_enhancer import (FL2VA_DEEPY_PROMPT_INFOS, FL2VA_IMAGE_SYSTEM_PROMPT, FL2VA_PROMPT_INFOS, FL2VA_TEXT_SYSTEM_PROMPT,
@@ -290,8 +292,34 @@ The extra phase uses the text prompt and the locked final video only. Reference 
 
 H3_COMMON_RUNTIME_INFOS = """
 - **Sol-Attn:** in **Advanced Mode > Configs > Override Attention Mode**, select **sol**. The **Start Tau** slider then appears below the attention selector and shows that End Tau is fixed at `0.8`. H3 defaults to `1.3`; this value is used on the first denoising step and decreases linearly to `0.8` on the final step. Use `1.0` for the Sol-Attn paper starting value, increase it to route more attention blocks through the approximate path for greater speed, or lower it for denser attention and higher fidelity. It uses sparse attention only on large visual sequences and requires BF16, Triton 3.6 or newer, and a CUDA NVIDIA GPU using SM86, SM89, SM90, SM100, SM120, or SM121 (such as RTX 30/40/50-series, H100/H200, B100/B200, or DGX Spark); the dropdown reports whether it is available on the current system.
-- **Text Encoder:** at the bottom of **Configs**, use the **Text Encoder** configuration to reduce system RAM. **Qwen3-VL BF16** uses the most memory; **Quanto INT8** is a balanced lower-memory choice; **NVFP4 AWQ**, **GGUF Q4_K_M**, and especially **GGUF Q2_K** reduce it further. More aggressive quantization can slightly affect prompt interpretation.
-- **Priority:** beside the Text Encoder configuration, choose which memory limit matters most. **Lower VRAM** uses all code optimizations and reduces greatly VRAM consumption while **Lower RAM** uses only VRAM optimizations that doesnt consume extra RAM.
+"""
+
+H3_TEXT_ENCODER_INFOS = """Choose how much system RAM to use for interpreting prompts.
+
+- **Default:** use this model's default text encoder and the applicable Text Encoder Quantization setting.
+- **Qwen3-VL BF16:** uses the most memory.
+- **Qwen3-VL Quanto INT8:** a balanced lower-memory choice.
+- **Qwen3-VL NVFP4 AWQ** and **Qwen3-VL GGUF Q4_K_M:** reduce memory further.
+- **Qwen3-VL GGUF Q2_K:** the most aggressive memory reduction.
+
+More aggressive quantization can slightly affect prompt interpretation.
+"""
+
+H3_VIDEO_VAE_INFOS = """Choose the decoder used to turn generated video into frames.
+
+- **Auto:** follows Transformer Quantization: INT8 selects INT8 ConvRot Decoder, FP8 selects FP8 Mixed Precision, and other choices select BF16.
+- **BF16:** use the full H3 VAE in BF16.
+- **FP8 Mixed Precision:** use the mixed-precision version of the full H3 VAE.
+- **INT8 ConvRot Decoder:** use the quantized full decoder.
+- **LightVAE Lite BF16** and **LightVAE Lite INT8 ConvRot:** use a smaller 12-layer decoder. Both keep the original H3 encoder for first/last frames and references. Decoded detail can differ from the full VAE.
+
+Selecting **MiniMax H3 VAE** spatial upsampling replaces the selected decoder, including LightVAE, with the X2 decoder.
+"""
+
+H3_DENOISING_PRIORITY_INFOS = """Choose which memory limit matters most during denoising and video decoding.
+
+- **Lower VRAM (default):** use all memory optimizations to greatly reduce GPU memory consumption, including optimizations that need extra system RAM.
+- **Lower RAM:** use only the GPU memory optimizations that do not need extra system RAM.
 """
 
 H3_AUDIO_GENERATOR_INFOS = """## MiniMax H3 audio generator
@@ -470,6 +498,7 @@ def _get_audio_generator_model_def(model_def):
         "text_encoder_URLs": [build_hf_url(REPO_ID, TEXT_ENCODER_FOLDER, filename) for filename in text_encoder_files],
         "system_configs": {
             "_name": "Text Encoder",
+            "_infos": H3_TEXT_ENCODER_INFOS,
             "bf16": {"name": "Qwen3-VL BF16", "text_encoder_URLs": [build_hf_url(REPO_ID, TEXT_ENCODER_FOLDER, TEXT_ENCODER_BF16)]},
             "int8": {"name": "Qwen3-VL Quanto INT8", "text_encoder_URLs": [build_hf_url(REPO_ID, TEXT_ENCODER_FOLDER, TEXT_ENCODER_INT8)]},
             "nvfp4_awq": {"name": "Qwen3-VL NVFP4 AWQ", "text_encoder_URLs": [build_hf_url(REPO_ID, TEXT_ENCODER_FOLDER, TEXT_ENCODER_NVFP4)]},
@@ -479,6 +508,7 @@ def _get_audio_generator_model_def(model_def):
         "system_configs2": {
             "_name": "DiT Denoising Priority",
             "_default_label": "Lower VRAM",
+            "_infos": H3_DENOISING_PRIORITY_INFOS,
             "lower_ram": {"name": "Lower RAM", "qkv_splitting": False},
         },
     }
@@ -600,6 +630,9 @@ class family_handler:
         pruned = base_model_type in (FL2VA_PRUNED_ARCHITECTURE, REF2VA_PRUNED_ARCHITECTURE)
         vdn = model_def.get("vdn", False)
         pdd = model_def.get("pdd", False)
+        ptd = model_def.get("ptd", False)
+        if ptd and not (reference_mode and pdd):
+            raise ValueError("PTD RefAsymOPD requires a Ref2VA architecture with PDD heads")
         veda = model_def.get("veda", False)
         fasth3 = model_def.get("fasth3", False)
         if fasth3 and not (reference_mode and pdd):
@@ -737,6 +770,7 @@ class family_handler:
             "text_encoder_URLs": [build_hf_url(REPO_ID, TEXT_ENCODER_FOLDER, filename) for filename in text_encoder_files],
             "system_configs": {
                 "_name": "Text Encoder",
+                "_infos": H3_TEXT_ENCODER_INFOS,
                 "bf16": {"name": "Qwen3-VL BF16", "text_encoder_URLs": [build_hf_url(REPO_ID, TEXT_ENCODER_FOLDER, TEXT_ENCODER_BF16)]},
                 "int8": {"name": "Qwen3-VL Quanto INT8", "text_encoder_URLs": [build_hf_url(REPO_ID, TEXT_ENCODER_FOLDER, TEXT_ENCODER_INT8)]},
                 "nvfp4_awq": {"name": "Qwen3-VL NVFP4 AWQ", "text_encoder_URLs": [build_hf_url(REPO_ID, TEXT_ENCODER_FOLDER, TEXT_ENCODER_NVFP4)]},
@@ -746,6 +780,7 @@ class family_handler:
             "system_configs2": {
                 "_name": "Video VAE",
                 "_default_label": "Auto",
+                "_infos": H3_VIDEO_VAE_INFOS,
                 "bf16": {"name": "BF16", "video_vae_file": VIDEO_VAE_FILE, "x2_vae_file": X2_VAE_FILE},
                 "fp8mix": {"name": "FP8 Mixed Precision", "video_vae_file": VIDEO_VAE_FP8MIX_FILE, "x2_vae_file": X2_VAE_FILE},
                 "int8_convrot": {"name": "INT8 ConvRot Decoder", "video_vae_file": VIDEO_VAE_INT8_FILE, "x2_vae_file": X2_VAE_INT8_FILE},
@@ -755,6 +790,7 @@ class family_handler:
             "system_configs3": {
                 "_name": "DiT Denoising Priority",
                 "_default_label": "Lower VRAM",
+                "_infos": H3_DENOISING_PRIORITY_INFOS,
                 "lower_ram": {"name": "Lower RAM", "qkv_splitting": False},
             },
         }
@@ -904,15 +940,24 @@ class family_handler:
         result["infos"] += still_infos
         result["deepy_infos"] += still_infos + " Set `image_mode` to `1`."
         result["infos"] += "\n\n**MiniMax H3 VAE:** " + X2_VAE_DESCRIPTION
-        result["infos"] += "\n\n**LightVAE Lite:** the Video VAE selector offers a smaller 12-layer decoder in BF16 or INT8 ConvRot. Both keep the original H3 encoder for first/last frames and references. Decoded detail can differ from the full VAE. Selecting MiniMax H3 VAE upsampling replaces LightVAE with the X2 decoder."
         result["deepy_infos"] += " MiniMax H3 VAE replaces the default VAE and handles decoding and upsampling together. Choose `h3_vae*2` to double the output width and height, `h3_vae*1.5` to enlarge them by half, or `h3_vae*1` to keep the original size."
         result["deepy_infos"] += " Video VAE configs `lightvae` and `lightvae_int8` select LightVAE's 12-layer decoder with the original H3 encoder; decoding may change detail. VAE upsampling overrides this choice with the X2 decoder."
         result["prompt_infos"] += still_prompt_infos
         result["deepy_prompt_infos"] += still_prompt_infos
+        if ptd:
+            result.update({
+                "infos": PTD_INFOS + "\n\n" + result["infos"],
+                "deepy_infos": PTD_DEEPY_INFOS + "\n\n" + result["deepy_infos"],
+                "profiles_dir": ["minimax_h3_pruned_ptd" if pruned else "minimax_h3_ptd"],
+                "spectrum_cache": False, "first_block_cache": False, "flow_shift": False,
+                "custom_settings": [setting for setting in result["custom_settings"] if setting["id"] != H3_AUDIO_REFINEMENT_SETTING],
+            })
         return result
 
     @staticmethod
     def validate_generative_settings(base_model_type, model_def, inputs):
+        if model_def.get("ptd", False):
+            inputs.update({"flow_shift": 12.0, "guidance_scale": 1.0, "guidance_phases": 1, "skip_steps_cache_type": ""})
         if model_def.get("veda", False):
             inputs["overrides"] = set_override(inputs["overrides"], "attention_mode", "veda")
         if model_def.get("fasth3", False):
@@ -1146,6 +1191,9 @@ class family_handler:
     def query_model_files(computeList, base_model_type, model_def=None):
         source_folders = []
         file_lists = []
+        if model_def.get("ptd", False):
+            source_folders.append(PTD_FOLDER)
+            file_lists.append([PTD_HEAD_FILE])
         vae_files = []
         video_vae_file = model_def.get("video_vae_file", VIDEO_VAE_FILE)
         if video_vae_file in (VIDEO_VAE_FILE, VIDEO_VAE_FP8MIX_FILE):
@@ -1188,6 +1236,9 @@ class family_handler:
 
         pdd = model_def.get("pdd", False)
         viggle = base_model_type == VIGGLE_ARCHITECTURE
+        if model_def.get("ptd", False):
+            model_filename = list(model_filename) if isinstance(model_filename, (list, tuple)) else [model_filename]
+            model_filename.append(fl.locate_file(os.path.join(PTD_FOLDER, PTD_HEAD_FILE)))
         video_vae_file = model_def.get("video_vae_file", VIDEO_VAE_FILE)
         if VAE_upsampling == X2_VAE_VALUE:  # the X2 decoder of the selected Video VAE replaces it; downloaded once both choices are known
             video_vae_file = model_def.get("x2_vae_file", X2_VAE_FILE)
@@ -1203,6 +1254,7 @@ class family_handler:
                                  vdn=model_def.get("vdn", False), veda=model_def.get("veda", False), vsa=model_def.get("fasth3", False),
                                  audio_only=base_model_type == TTS_REF2VA_PRUNED_ARCHITECTURE,
                                  fixed_prompt_filename=os.path.join(VIGGLE_ASSET_FOLDER, VIGGLE_PROMPT_FILE) if viggle else None)
+        pipeline.ptd = model_def.get("ptd", False)
         pipe = {"transformer": pipeline.transformer}
         if base_model_type == TTS_REF2VA_PRUNED_ARCHITECTURE and H3_DIALOGUE_GENERATION:
             pipeline.dialogue_whisper = load_dialogue_whisper()
@@ -1326,6 +1378,8 @@ class family_handler:
         })
         if reference_mode:
             ui_defaults.update({"image_refs_relative_size": 100, "remove_background_images_ref": 0})
+        if model_def.get("ptd", False):
+            ui_defaults.update({"num_inference_steps": 8, "video_prompt_type": "I", "prompt_enhancer": "", "skip_steps_cache_type": ""})
         if model_def.get("fasth3", False):
             ui_defaults.update({"num_inference_steps": FASTH3_STEPS, "flow_shift": FASTH3_VIDEO_SHIFT, "guidance_phases": 1, "sample_solver": "euler"})
         if base_model_type in CONTROL_ARCHITECTURES:

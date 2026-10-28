@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 MESH_EXTENSIONS = (".glb", ".ply")  # 3D gallery files: GLB meshes and Gaussian splat PLYs; other mesh formats are converted to GLB on import
 MESH_IMPORT_EXTENSIONS = (".glb", ".obj", ".ply", ".stl")
+WORLD_EXTENSIONS = (".wgpworld",)  # Worlds gallery files: worlds of interactive world models, explorable again from their stored state
 
 
 @dataclass(frozen=True)
@@ -41,10 +42,11 @@ class GallerySource:
 
 
 VIDEO = GallerySource("video", "Images / Videos", ("image", "video"), "", "video_images", "Video / Images", "image/*,video/*", "visual")
-AUDIO = GallerySource("audio", "Audio", ("audio",), "audio_", "audio", "Audio Files", "audio/*", "audio")
+AUDIO = GallerySource("audio", "Audio", ("audio",), "audio_", "audio", "Audio", "audio/*", "audio")
 MESH = GallerySource("mesh", "3D", ("3d",), "mesh_", "mesh", "3D", ".glb,.obj,.ply,.stl", "3d")
+WORLD = GallerySource("world", "Worlds", ("world",), "world_", "world", "Worlds", ".wgpworld", "world")
 
-GALLERY_SOURCES = (VIDEO, AUDIO, MESH)
+GALLERY_SOURCES = (VIDEO, AUDIO, MESH, WORLD)
 STRIP_SOURCES = GALLERY_SOURCES[1:]  # galleries rendered by shared.gradio.strip_gallery (all but the image/video gallery)
 SOURCES = {source.id: source for source in GALLERY_SOURCES}
 _KIND_SOURCES = {kind: source for source in GALLERY_SOURCES for kind in source.kinds}

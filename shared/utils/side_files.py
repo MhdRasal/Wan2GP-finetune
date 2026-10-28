@@ -4,6 +4,8 @@ from pathlib import Path
 import re
 import json
 
+from shared.utils.utils import has_world_file_extension
+
 
 def process_side_files(media_path, side_files, *, return_files=False):
     path = Path(media_path)
@@ -19,11 +21,11 @@ def process_side_files(media_path, side_files, *, return_files=False):
         named[target.name] = content
     from shared.utils.workspace_storage import current_binding
     binding = current_binding()
-    persist = binding is not None and binding[0].workspaces.media_dir(binding[1]) is not None
-    if not return_files or persist:
-        for filename, content in named.items():
-            (path.parent / filename).write_bytes(content)
-            print(f"Side file saved to Path: {(path.parent / filename).resolve()}", flush=True)
-        if named:
-            path.with_name(path.name + '.wangp-files.json').write_text(json.dumps(list(side_files)), encoding='utf-8')
+    persist = not return_files or binding is not None and binding[0].workspaces.media_dir(binding[1]) is not None
+    saved = [(suffix, filename) for suffix, filename in zip(side_files, named) if persist or has_world_file_extension(filename)]  # a world is a Worlds gallery item: always saved
+    for _suffix, filename in saved:
+        (path.parent / filename).write_bytes(named[filename])
+        print(f"Side file saved to Path: {(path.parent / filename).resolve()}", flush=True)
+    if saved:
+        path.with_name(path.name + '.wangp-files.json').write_text(json.dumps([suffix for suffix, _filename in saved]), encoding='utf-8')
     return named

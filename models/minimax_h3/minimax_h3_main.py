@@ -8,7 +8,7 @@ import torch
 from accelerate import init_empty_weights
 from safetensors import safe_open
 
-from mmgp import offload, quant_router
+from mmgp import offload, quant_router, runtime
 from shared.utils import files_locator as fl
 
 from .audio_vae import MiniMaxH3AudioVAE
@@ -17,7 +17,7 @@ from .latent_upscaler import MiniMaxH3LatentUpscaler
 from .pipeline import MiniMaxH3Pipeline
 from .text_encoder import MiniMaxH3TextEncoder, load_h3_qwen_config
 from .transformer import MiniMaxH3Model, get_linear_split_map
-from .video_vae import MiniMaxH3VideoVAE, get_video_vae_linear_split_map
+from .video_vae import MiniMaxH3VideoVAE, get_video_vae_linear_split_map, group_qkv_rows
 from .viggle import load_fixed_prompt
 from .vae_upsampler import X2_VAE_FILE, X2_VAE_INT8_FILE, X2_VAE_VALUE
 
@@ -27,6 +27,7 @@ VIDEO_VAE_FP8MIX_FILE = "minimax_h3_video_vae_fp8mix.safetensors"
 VIDEO_VAE_INT8_FILE = "minimax_h3/minimax_h3_video_vae_int8_convrot.safetensors"
 VIDEO_VAE_LIGHT_FILE = "minimax_h3/minimax_h3_lightvae_lite_bf16.safetensors"
 VIDEO_VAE_LIGHT_INT8_FILE = "minimax_h3/minimax_h3_lightvae_lite_int8_convrot.safetensors"
+VIDEO_VAE_SPLIT_INT8 = True  # comparison switch: the INT8 VAEs split their q / k / v projections too (decoder attention through the attention kit)
 AUDIO_VAE_FILE = "MiniMax-H3-audio_vae_fp32.safetensors"
 LATENT_UPSCALER_FOLDER = "minimax_h3"
 LATENT_UPSCALER_FILE = "minimax_h3_latent_upscaler_3d_bf16.safetensors"
@@ -80,7 +81,8 @@ def _strip_wrappers(state_dict, quantization_map=None, tied_weights_map=None, pd
 
     state_dict = strip(state_dict)
     if pdd:  # stacked PDD heads [num_steps, out, in]: head 0 is the base projection, the others are stored relative to it (FP32)
-        for key in [key for key in state_dict if key.startswith(("final_layer.video_out.", "final_layer.audio_out."))]:
+        for key in [f"final_layer.{head}.{suffix}" for head in ("video_out", "audio_out")
+                    for suffix in ("weight", "bias") if f"final_layer.{head}.{suffix}" in state_dict]:
             head, suffix = key.rsplit(".", 1)
             stacked = state_dict.pop(key)
             base = stacked[0].float()
@@ -107,11 +109,12 @@ def probe_h3_checkpoint(filename):
                 key = key[len(prefix):]
                 break
         normalized[key] = value
+    separate_qkv = any(key.endswith(".attn.q_proj.weight") for key in normalized)
     table = next((tensor for key, tensor in normalized.items() if key == "adaln_t_table"), None)
     if table is None:
         if hybrid_ref2va_blocks is not None:
             raise ValueError("MiniMax H3 FL2VA/Ref2VA hybrid checkpoints require compressed AdaLN tables")
-        return {"compressed_modulation": False, "adaln_curve_grid": None, "time_embed_dim": 2688, "adaln_dtype": None}
+        return {"compressed_modulation": False, "adaln_curve_grid": None, "time_embed_dim": 2688, "adaln_dtype": None, "separate_qkv": separate_qkv}
     if not table.dtype.is_floating_point:
         raise ValueError(f"H3 AdaLN curve table must use an unquantized floating-point GGUF qtype, got {table.dtype}")
     if len(table.shape) != 2 or table.shape[0] < 2:
@@ -123,7 +126,7 @@ def probe_h3_checkpoint(filename):
             "This file may be incompatible with MiniMax H3 LoRAs. Delete it and retry so WanGP can automatically download the official replacement."
         )
     return {"compressed_modulation": True, "adaln_curve_grid": int(table.shape[0]), "time_embed_dim": rank, "adaln_dtype": table.dtype,
-            "hybrid_ref2va_blocks": hybrid_ref2va_blocks}
+            "hybrid_ref2va_blocks": hybrid_ref2va_blocks, "separate_qkv": separate_qkv}
 
 
 def probe_h3_control_module(filenames, time_embed_dim):
@@ -167,6 +170,8 @@ def _qkv_layout(filenames, qkv_layout):
 def _load_transformer(filename, dtype, qkv_splitting=True, qkv_layout="interleaved", pdd=False,
                       pdd_num_steps=None, pdd_block_size=None, vdn=False, veda=False, vsa=False):
     checkpoint = probe_h3_checkpoint(filename)
+    # Checkpoints with separate projections require split modules even with the Lower RAM preference.
+    qkv_splitting = qkv_splitting or checkpoint["separate_qkv"]
     hybrid_ref2va_blocks = checkpoint.get("hybrid_ref2va_blocks")
     filenames = list(filename) if isinstance(filename, (list, tuple)) else [filename]
     ref2va_adaln_t_table = None
@@ -227,6 +232,7 @@ def _load_text_encoder(filename, dtype):
     text_encoder.requires_grad_(False)
     offload.load_model_data(text_encoder, filename, writable_tensors=False, default_dtype=dtype,
                             preprocess_sd=_strip_text_encoder_wrapper, ignore_unused_weights=True)
+    runtime.lookup_on_cpu(text_encoder.language_model.embed_tokens)  # the 1.5 GB token table stays in RAM: mmgp looks up the prompt's rows on the CPU
     text_encoder.set_tokenizer(os.path.dirname(config_path))
     text_encoder.eval().requires_grad_(False)
     return text_encoder
@@ -244,6 +250,8 @@ def _load_video_vae(filename, qkv_splitting=True, upsampling=False):
     if split_map is not None:
         offload.split_linear_modules(vae, split_map)
     def preprocess(state_dict):
+        if split_map is not None:  # q / k / v rows grouped, as MMGP splits them (quantized ones included)
+            group_qkv_rows(state_dict)
         for name in ("latents_mean", "latents_std"):
             if upsampling:
                 state_dict["_" + name] = state_dict.pop(name)
@@ -307,7 +315,8 @@ def model_factory(model_filename, text_encoder_filename, qkv_splitting, dtype=to
     transformer = _load_transformer(model_filename, dtype, qkv_splitting, qkv_layout, pdd, pdd_num_steps, pdd_block_size, vdn, veda, vsa)
     if shared_h3_pipeline is None:
         text_encoder = _load_text_encoder(text_encoder_filename, dtype) if fixed_prompt_filename is None else None
-        video_vae_qkv_splitting = qkv_splitting and video_vae_filename in (VIDEO_VAE_FILE, VIDEO_VAE_LIGHT_FILE, X2_VAE_FILE)
+        video_vae_qkv_splitting = qkv_splitting and video_vae_filename in (VIDEO_VAE_FILE, VIDEO_VAE_LIGHT_FILE, X2_VAE_FILE) + (
+            (VIDEO_VAE_INT8_FILE, VIDEO_VAE_LIGHT_INT8_FILE, X2_VAE_INT8_FILE) if VIDEO_VAE_SPLIT_INT8 else ())
         video_vae = _load_video_vae(video_vae_filename, video_vae_qkv_splitting, upsampling=video_vae_filename in (X2_VAE_FILE, X2_VAE_INT8_FILE))
         audio_vae = _load_audio_vae(audio_vae_filename)
         latent_upscaler = _load_latent_upscaler(latent_upscaler_filename) if fixed_prompt_filename is None else None

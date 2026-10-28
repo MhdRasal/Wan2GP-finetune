@@ -78,11 +78,11 @@ def _tool_button(kind, popup_id, title, icon):
     )
 
 
-def render_marker(elem_id, help_id, *, title=None, markdown=None, helper_popup_id=None, helper_title=None):
+def render_marker(elem_id, help_id, *, title=None, markdown=None, helper_popup_id=None, helper_title=None, keep_empty=False):
     title, markdown = _resolve_help(help_id, title=title, markdown=markdown)
     has_markdown = bool(str(markdown or "").strip())
     has_helper = bool(str(helper_popup_id or "").strip())
-    if not has_markdown and not has_helper:
+    if not has_markdown and not has_helper and not keep_empty:
         return ""
     popup_html = ""
     popup_id = ""
@@ -191,6 +191,9 @@ def get_css():
 }
 .wangp-field-help-inline {
     margin-left: 6px !important;
+}
+.wangp-field-help-inline:not(:has([data-wangp-model-info-open])) {
+    display: none !important;
 }
 .wangp-field-help-inline-host,
 .wangp-field-help-inline-host > *,
@@ -316,7 +319,8 @@ def get_javascript():
             const targetId = inline.getAttribute("data-wangp-field-help-for") || "";
             const target = document.getElementById(targetId);
             const label = target?.querySelector('[data-testid="block-info"]');
-            if (!label) return;
+            // Only mount incoming markers; an old mounted marker must not discard its replacement popup.
+            if (!label || inline.parentElement === label) return;
             movePopups(sourceRoot, inline.querySelectorAll("[data-wangp-model-info-open]"));
             label.querySelectorAll(".wangp-field-help-inline[data-wangp-field-help-for]").forEach((existing) => {
                 if (existing !== inline && existing.getAttribute("data-wangp-field-help-for") === targetId) existing.remove();

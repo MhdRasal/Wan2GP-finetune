@@ -4,6 +4,7 @@ each such model keeps in VRAM as many of its blocks as the VRAM left by its curr
 MMGP Optimized VRAM Allocator (mmgp.allocator)."""
 import dataclasses
 import threading
+import weakref
 
 import torch
 from tqdm import tqdm
@@ -18,7 +19,23 @@ PENALTY_PATIENCE = 8  # cycles without VRAM shortage or allocator recovery after
 PENALTY_PATIENCE_MAX = 1024  # a shortage after such a decrease doubles the cycles waited before the next one, up to this
 PENALTY_MIN = 64 * ONE_MB  # a smaller penalty is dropped when it halves
 _process_measures = {}  # with autoPreload=True: (model class, model id, structure, workload) -> peak of the activations measured, and
-# (..., workload, "penalty") -> its penalty (_penalty)
+# (..., workload, "penalty") -> its penalty (_penalty), (..., workload, "unmeasured") -> True while its measure is the 0 set by a shortage
+END_OTHER_CYCLES = True  # comparison switch: another model's load or cycle ends the cycles left open (end_open_cycles)
+FIRST_MEASURE_CLEARS_PENALTY = True  # comparison switch: a workload's first measure drops the penalty of the shortages met before it (_end_cycle)
+_planners = weakref.WeakSet()  # the AutoPreload objects of the process
+
+
+def end_open_cycles(manager=None, model_id=None):
+    """A model is loaded or starts a cycle: the cycles the other models left open end here (all offload objects). A cycle's measure is
+    the process' allocation peak since it started, and a measure only grows: left open, the VRAM of the next model's work (a
+    generation beside a language model kept loaded, a vision tower) would count as their activations for good, and their next plans
+    would keep fewer blocks."""
+    if not END_OTHER_CYCLES:
+        return
+    for planner in list(_planners):
+        for plan in list(planner.plans.values()):
+            if plan.workload is not None and not (planner.manager is manager and plan.model_id == model_id):
+                planner._end_cycle(plan)
 
 
 def _van_der_corput(n):
@@ -111,6 +128,9 @@ class _Plan:
         self.measuring = False  # the cycle running measures a new workload with the budget's preload: the next one may keep other blocks
         self.workload_of = workload  # or the model's _auto_preload_workload(args, kwargs): its own grouping of the inputs into workloads
         self.cap = None  # or the model's _auto_preload_max: the most VRAM its weights may hold (base, blocks kept, slots of the streamed ones)
+        self.margin = MARGIN  # or the model's _auto_preload_margin: left free beyond its measured peaks (e.g. passes replayed by CUDA graphs vary less)
+        self.state_room = 0  # VRAM left to the state its rings keep in VRAM (mmgp.state_ring) once every block is kept, nothing otherwise
+        self.state_short = False  # the state its rings kept in VRAM was released under pressure during the cycle
 
     def ranked(self, slow=()):
         """The order the blocks are kept in VRAM: those outside the towers first (embeddings, heads, short stacks: each runs at every pass as a
@@ -142,6 +162,7 @@ class AutoPreload:
             if plan is not None and manager.preloaded_blocks_per_model.get(model_id):
                 plan.manual = dict(manager.preloaded_blocks_per_model[model_id])
                 self.fixed[model_id] = plan
+        _planners.add(self)
         if self.plans or self.fixed:
             memory_pressure.register(self)
             if self.plans and self.verbose >= 1:
@@ -175,6 +196,7 @@ class AutoPreload:
         plan = _Plan(model_id, type(m.models[model_id]).__name__, towers, m.blocks_of_modules_sizes.get(model_id, 0), others)
         plan.workload_of = getattr(m.models[model_id], "_auto_preload_workload", None) or workload
         plan.cap = getattr(m.models[model_id], "_auto_preload_max", None)
+        plan.margin = getattr(m.models[model_id], "_auto_preload_margin", MARGIN)
         return plan
 
     def _penalty(self, key):
@@ -183,24 +205,35 @@ class AutoPreload:
         either; a shortage after such a decrease (probing) doubles the patience. The measured peak itself only grows, from real peaks."""
         return self.measures.setdefault((*key, "penalty"), [0, 0, PENALTY_PATIENCE, False])
 
+    def _state_penalty(self, key):
+        """[bytes, clean cycles] of a workload, kept with its measures once the state of the model's rings was released under pressure: the
+        VRAM that state leaves free since, which halves after PENALTY_PATIENCE cycles without such a release; None before any."""
+        return self.measures.get((*key, "state_penalty"))
+
     def _planned(self, key):
         # the VRAM a workload needs beside the weights (None until measured): its measured peak and its penalty
         peak = self.measures.get(key)
         return None if peak is None else peak + self.measures.get((*key, "penalty"), (0,))[0]
 
     def _weights(self, plan, preloaded):
-        """VRAM of the model's weights with these blocks preloaded: its base, the blocks and the slots of the blocks streamed."""
+        """VRAM of the model's weights with these blocks preloaded: its base, the blocks and the slots of the blocks streamed, and the state
+        its rings keep in VRAM (mmgp.state_ring), which the measures of its activations leave out as they leave out its weights."""
         streamed = len(preloaded) < len(plan.sizes)
         experts = sum(residency.nbytes for residency in self.manager.expert_residency.values())
-        return plan.base + sum(plan.sizes[name] for name in preloaded) + ((self.window + 1) * plan.largest if streamed else 0) + experts
+        return (plan.base + sum(plan.sizes[name] for name in preloaded) + ((self.window + 1) * plan.largest if streamed else 0) + experts
+                + self.manager.state_bytes(plan.model_id))
 
-    def _fit(self, plan, peak):
-        """The longest prefix of the ranking that fits beside a peak of activations, with the base and the slots of the streamed blocks."""
+    def _fit(self, plan, peak, work):
+        """The longest prefix of the ranking that fits beside a peak of activations, with the base and the slots of the streamed blocks. The
+        state the model's rings keep in VRAM gets what remains once every block fits (plan.state_room), less its own penalty for the workload
+        (_state_penalty): weights first, and a shortage of the state shrinks only the state's room."""
         stats = allocator.stats()
-        target = stats["reserved"] + allocator.room() - peak - MARGIN - int(MARGIN_SHARE * peak)
+        target = stats["reserved"] + allocator.room() - peak - plan.margin - int(MARGIN_SHARE * peak)
         if plan.cap is not None:
             target = min(target, plan.cap)
-        if plan.base + sum(plan.sizes.values()) <= target:
+        whole = plan.base + sum(plan.sizes.values())
+        plan.state_room = max(0, target - whole - (self._state_penalty((*plan.structure, work)) or (0,))[0])
+        if whole <= target:
             return list(plan.ranking)
         shuttle, used, count = (self.window + 1) * plan.largest, plan.base, 0
         for name in plan.ranking:
@@ -262,13 +295,14 @@ class AutoPreload:
         if block_name != plan.first or last == block_name:
             return
         self.thread = threading.get_ident()
+        end_open_cycles(self.manager, model_id)
         self._end_cycle(plan)
         loaded = self.manager.loaded_blocks[model_id]
         if loaded is not None and self.keep(model_id, loaded):  # the last block streamed to grow a plan: no streamed block retires it any more
             self.manager.loaded_blocks[model_id] = None
         work = plan.workload_of(args, kwargs)
         peak = self._planned((*plan.structure, work))
-        wanted = plan.ranking[:plan.floor] if peak is None else self._fit(plan, peak)
+        wanted = plan.ranking[:plan.floor] if peak is None else self._fit(plan, peak, work)
         current = self.manager.preloaded_blocks_per_model[model_id]
         experts = self.manager.expert_residency.get(model_id)
         if len(current) < len(plan.sizes) or len(wanted) < len(plan.sizes):
@@ -307,7 +341,7 @@ class AutoPreload:
             return
         peak = None if plan.last_work is None else self._planned((*plan.structure, plan.last_work))
         if peak is not None:
-            fit, floor = set(self._fit(plan, peak)), set(plan.ranking[:plan.floor])
+            fit, floor = set(self._fit(plan, peak, plan.last_work)), set(plan.ranking[:plan.floor])
             self._set(plan, [name for name in plan.ranking if name in floor or name in plan.previous and name in fit])
         plan.previous = set()
 
@@ -324,6 +358,21 @@ class AutoPreload:
                 fixed.last, fixed.relink = None, False
                 self.manager.preloaded_blocks_per_model[model_id] = dict(fixed.manual)  # the whole manual preload at the next load
                 self._link(fixed)
+
+    def on_state_pressure(self, plan, released):
+        """The state the model's rings kept in VRAM was released under pressure: its room shrinks by as much for the workload (not the
+        weights' penalty), and the cycle does not measure the activations."""
+        work = plan.workload if plan.workload is not None else plan.last_work
+        if work is not None:
+            self.measures.setdefault((*plan.structure, work, "state_penalty"), [0, 0])[0] += released
+        plan.state_room, plan.state_short, plan.grew = max(0, plan.state_room - released), True, True
+
+    def on_state_change(self, model_id):
+        """The state the model's rings keep in VRAM changed (mmgp.state_ring): the cycle running does not measure its activations."""
+        plan = self.plans.get(model_id)
+        if plan is not None and plan.workload is not None:
+            plan.grew = True
+            plan.min_weights = min(plan.min_weights, self._weights(plan, self.manager.preloaded_blocks_per_model[model_id]))
 
     def on_expert_change(self):
         # The allocator peak is shared by co-tenants. A cycle spanning a change
@@ -351,7 +400,7 @@ class AutoPreload:
                 continue
             plan.pending = set()
             preloaded = m.preloaded_blocks_per_model[model_id]
-            victims = [name for name in reversed(plan.ranking) if name in preloaded and name != plan.last]
+            victims = [name for name in reversed(plan.ranking) if name in preloaded and name != plan.last and model_id + "/" + name not in m.prefetch_futures]
             if not victims:
                 continue
             m.transfer_stream.wait_stream(torch.cuda.current_stream())  # their memory may still be read by the work queued
@@ -368,7 +417,8 @@ class AutoPreload:
             plan.relink = True  # back in the chain of the streamed blocks at the next cycle, not inside an allocation
             if plan.workload is not None:  # the plan was too large for this workload: its next plans leave the memory released free
                 key = (*plan.structure, plan.workload)
-                self.measures.setdefault(key, 0)  # measured from now on: not the budget's preload again (its cycles keep blocks, unmeasured)
+                if key not in self.measures:  # measured from now on: not the budget's preload again (its cycles keep blocks, unmeasured)
+                    self.measures[key], self.measures[(*key, "unmeasured")] = 0, True
                 self._penalty(key)[0] += released
                 plan.short = True
             if freed >= need:
@@ -380,9 +430,24 @@ class AutoPreload:
     def _end_cycle(self, plan):
         if plan.workload is not None:
             key = (*plan.structure, plan.workload)
+            state_penalty = self._state_penalty(key)
+            if state_penalty is None:
+                pass
+            elif plan.state_short:
+                state_penalty[1] = 0
+            elif state_penalty[0]:  # cycles without a shortage of the state: its room may grow back into half of that memory
+                state_penalty[1] += 1
+                if state_penalty[1] >= PENALTY_PATIENCE:
+                    state_penalty[0] = 0 if state_penalty[0] < 2 * PENALTY_MIN else state_penalty[0] // 2
+                    state_penalty[1] = 0
+            plan.state_short = False
+            penalty = self._penalty(key)
             if not plan.grew and not plan.short:  # a cycle that ran short peaked with the blocks it released still counted (the penalty has it)
                 self.measures[key] = max(self.measures.get(key, 0), allocator.mark_peak() - plan.min_weights)
-            penalty = self._penalty(key)
+                if self.measures.pop((*key, "unmeasured"), False) and FIRST_MEASURE_CLEARS_PENALTY:
+                    # the shortages before it came from plans that left no room for the activations, which this measure now leaves: their
+                    # penalty would count them twice (e.g. a 27B LLM decoding at 11 GiB kept 53 instead of 60 of its 64 blocks)
+                    penalty[0], penalty[1], penalty[3] = 0, 0, False
             recovered = plan.recoveries is not None and allocator.stats()["recoveries"] > plan.recoveries
             if recovered:
                 # the allocator found the VRAM short and waited for other streams or synchronized the device to reuse memory, which stalls the

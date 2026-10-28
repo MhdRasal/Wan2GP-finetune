@@ -115,8 +115,12 @@ def prepare_run(
         get_chunk_frames = getattr(system_handler, "get_chunk_frames", None) if system_handler is not None else None
         chunk_frames = int(get_chunk_frames(end_frame_exclusive - start_frame)) if callable(get_chunk_frames) else frames.normalize_chunk_frames(chunk_size_seconds, processing_fps, frame_step=chunk_frame_step, minimum_requested_frames=frame_plan_rules.minimum_requested_frames, frame_offset=frame_plan_rules.frame_offset)
         if system_handler is not None:
+            get_target_overlap_frames = getattr(system_handler, "get_overlap_frames_for_target", None)
             get_overlap_frames = getattr(system_handler, "get_overlap_frames", None)
-            overlap_frames = int(get_overlap_frames(chunk_frames)) if callable(get_overlap_frames) else int(getattr(system_handler, "overlap_frames", 0))
+            if callable(get_target_overlap_frames):
+                overlap_frames = int(get_target_overlap_frames(chunk_frames, system_target_control))
+            else:
+                overlap_frames = int(get_overlap_frames(chunk_frames)) if callable(get_overlap_frames) else int(getattr(system_handler, "overlap_frames", 0))
         else:
             overlap_frames = frames.normalize_overlap_frames(sliding_window_overlap, frame_step=frame_plan_rules.frame_step)
     except frames.ChunkSizeBelowMinimumError as exc:

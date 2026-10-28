@@ -1,15 +1,29 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
-"""Coordinate reclaimable VRAM: optional expert copies precede streamed blocks."""
+"""Coordinate reclaimable VRAM: optional expert copies precede streamed blocks.
+
+The clients release VRAM only on the thread that runs their blocks. A helper thread (the prefetch thread, whose staged transfers allocate
+the blocks they copy) hands its shortages to the thread waiting for its work (wait), which releases on its behalf."""
+import threading
 import weakref
 
 from . import allocator
 
 _clients = weakref.WeakKeyDictionary()
 HEADROOM = 256 << 20  # the allocator leaves this much free beyond a new allocation (vram_headroom)
+_helpers = set()  # idents of the helper threads
+_requests = []  # [size, device, done, freed] of the helpers' shortages, released by the thread waiting for their work
+_ready = threading.Condition()
 
 
 def _reclaim(size, device):
     # what the allocation of size bytes misses, the VRAM it may still take deducted (its size when the room did not refuse it)
+    if threading.get_ident() in _helpers:
+        request = [size, device, threading.Event(), 0]
+        with _ready:
+            _requests.append(request)
+            _ready.notify_all()
+        request[2].wait()
+        return request[3]
     room = allocator.room(device)
     size = size + HEADROOM - room if room < size + HEADROOM else size
     freed = 0
@@ -18,6 +32,33 @@ def _reclaim(size, device):
         if freed >= size:
             break
     return freed
+
+
+def helper_thread():
+    """Marks the calling thread as a helper (a thread pool's initializer)."""
+    _helpers.add(threading.get_ident())
+
+
+def wait(future):
+    """future.result() of a helper's work, releasing meanwhile the VRAM its allocations find short (on this thread, which runs the blocks)."""
+    future.add_done_callback(lambda _: _notify())
+    while True:
+        with _ready:
+            _ready.wait_for(lambda: future.done() or _requests)
+            requests = _requests[:]
+            _requests.clear()
+        for request in requests:
+            try:
+                request[3] = _reclaim(request[0], request[1])
+            finally:
+                request[2].set()
+        if future.done() and not requests:
+            return future.result()
+
+
+def _notify():
+    with _ready:
+        _ready.notify_all()
 
 
 def register(client, priority=1):

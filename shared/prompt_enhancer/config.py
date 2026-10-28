@@ -8,7 +8,8 @@ PROMPT_ENHANCER_SPECULATIVE_DECODING_KEY = "prompt_enhancer_speculative_decoding
 PROMPT_ENHANCER_SPECULATIVE_DECODING_AUTO = 2
 PROMPT_ENHANCER_SPECULATIVE_DECODING_DEFAULT = PROMPT_ENHANCER_SPECULATIVE_DECODING_AUTO
 PROMPT_ENHANCER_SPECULATIVE_DECODING_IDS = frozenset((4, 5, 6))
-PROMPT_ENHANCER_SPECULATIVE_DECODING_VRAM_GB = {4: 12, 5: 24, 6: 8}
+PROMPT_ENHANCER_SPECULATIVE_DECODING_VRAM_GB = {4: 12, 5: 24, 6: 8}  # Auto when the model's fit in VRAM is unknown (resolve_..., fit)
+MTP_AUTO_SLACK = 512 << 20  # Auto: MTP still pays when it leaves this much of the model out of VRAM (with the model in VRAM it decodes about twice as fast)
 PROMPT_ENHANCER_SPECULATIVE_DRAFT_COUNTS = (2, 3, 4)
 BLOCK_DRAFT_METHODS = ("dspark", "dflash2")
 SPECULATIVE_METHOD_LABELS = {"auto": "Auto", "disabled": "Disabled", "mtp": "MTP", "dspark": "DSpark", "dflash2": "DFlash2"}
@@ -126,7 +127,12 @@ def validate_prompt_enhancer_speculative_decoding(enhancer_enabled: Any, value: 
     return enabled
 
 
-def resolve_prompt_enhancer_speculative_decoding(enhancer_enabled: Any, value: Any, total_vram_gb: float | None = None, *, qwen_backend: str = "") -> tuple[int | str | dict, str]:
+def resolve_prompt_enhancer_speculative_decoding(enhancer_enabled: Any, value: Any, total_vram_gb: float | None = None, *, qwen_backend: str = "", fit=None) -> tuple[int | str | dict, str]:
+    """The speculative decoding a setting runs, and the message explaining an automatic choice. fit: a function giving (VRAM the model
+    needs without MTP, VRAM MTP adds, VRAM available) in bytes, or None if unknown. Auto then takes MTP unless it would push a model that
+    fits in VRAM without it out of VRAM: measured on Qwen3.8 27B IQ2_M, MTP decodes 2.1x faster when both fit (15 GiB) and 1.5-1.7x when
+    the weights stream either way (an 11 GB RTX 2080 Ti, a VRAM-limited RTX 4090 after a video), but 20% slower when the model fits
+    only without it (11 GiB). Without fit, a fixed VRAM size per model decides."""
     mode = validate_prompt_enhancer_speculative_decoding(enhancer_enabled, value)
     if speculative_decoding_runtime(mode)[0] != PROMPT_ENHANCER_SPECULATIVE_DECODING_AUTO:
         return mode, ""
@@ -151,6 +157,19 @@ def resolve_prompt_enhancer_speculative_decoding(enhancer_enabled: Any, value: A
         return 0, f"Speculative Decoding disabled automatically for Bonsai PTQ1: {detected_vram:.2f} GiB VRAM detected (10 GiB or less)."
     detected_vram_gb = max(0, int(float(total_vram_gb) + 0.5))
     model_label = {4: "Qwen3.5-9B", 6: "Qwen3.8-9B"}.get(enhancer_no, "Qwen3.8-27B")
+    if float(total_vram_gb) <= 8:  # 8 GB GPUs: the drafter, its caches and graphs would take room from the model's blocks
+        return 0, f"Speculative Decoding disabled automatically for {model_label}: {max(0.0, float(total_vram_gb)):.2f} GiB VRAM detected (8 GiB or less)."
+    sizes = None if fit is None else fit()
+    if sizes is not None:
+        needed, extra, available = sizes
+        gib = lambda nbytes: f"{nbytes / 2**30:.1f}"
+        if needed + extra - available <= MTP_AUTO_SLACK:
+            return 1, f"Speculative Decoding enabled automatically for {model_label}: with MTP it needs about {gib(needed + extra)} GiB of VRAM, {gib(available)} GiB available."
+        if needed - available <= MTP_AUTO_SLACK:
+            return 0, (f"Speculative Decoding disabled automatically for {model_label}: it fits or nearly fits in VRAM without MTP (about {gib(needed)} GiB needed, "
+                       f"{gib(available)} GiB available), not with it (+{gib(extra)} GiB would stream part of the model at every pass).")
+        return 1, (f"Speculative Decoding enabled automatically for {model_label}: part of the model streams from RAM either way (about {gib(needed)} GiB needed, "
+                   f"{gib(available)} GiB available), and MTP decodes several tokens per pass over it.")
     if detected_vram_gb >= required_vram_gb:
         return 1, f"Speculative Decoding enabled automatically for {model_label}: {detected_vram_gb} GB VRAM detected (minimum {required_vram_gb} GB)."
     return 0, f"Speculative Decoding disabled automatically for {model_label}: {detected_vram_gb} GB VRAM detected (minimum {required_vram_gb} GB)."

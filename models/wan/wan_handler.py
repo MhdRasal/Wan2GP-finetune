@@ -229,8 +229,9 @@ class family_handler():
                     "label": "Animate 2 KV Cache",
                     "type": "dropdown",
                     "default": "Disabled",
-                    "choices": [("Disabled", "Disabled"), ("GPU (faster, high VRAM)", "Enabled"), ("RAM (lower VRAM)", "RAM")],
-                    "info": "Caches the driving-video branch. GPU is fastest but uses substantial VRAM; RAM transfers each layer to the GPU as needed.",
+                    "choices": [("Disabled (Slower but lower VRAM/RAM)", "Disabled"), ("Enabled (Faster, best quality but requires more VRAM/RAM)", "Enabled"),
+                                ("INT8 in VRAM (Fastest, about half the VRAM of Enabled)", "INT8"), ("INT8 in RAM (Faster, lowest VRAM)", "RAM")],
+                    "info": "Caches the driving-video branch, which is the same at every step. Enabled keeps it exactly on the GPU. INT8 caches its keys and values in about half the memory, so cached steps skip recomputing them; images differ very slightly from Enabled. INT8 in RAM keeps them in system RAM and moves each layer to the GPU as it runs, for the lowest VRAM.",
                 }],
             })
         if shotplan:

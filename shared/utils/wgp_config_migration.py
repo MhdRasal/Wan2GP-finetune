@@ -317,6 +317,8 @@ def migrate_extension_defaults(server_config, server_config_filename="", *, work
 
     changed = _migrate_audio_processors_config(server_config, version) or changed
     changed = _migrate_temporal_upsamplers_config(server_config) or changed
+    from postprocessing.memory import migrate_config as migrate_postprocessor_memory
+    changed = migrate_postprocessor_memory(server_config) or changed
 
     if server_config.pop(LEGACY_EXTENSIONS_DEFAULTS_MIGRATED_KEY, None) is not None:
         changed = True

@@ -6,13 +6,13 @@ from typing import Any
 
 from shared.deepy import media_registry
 from shared.deepy.engine import get_or_create_assistant_session
-from shared.utils.gallery_sources import GALLERY_SOURCES, VIDEO, gallery_source, source_for_kind
+from shared.utils.gallery_sources import GALLERY_SOURCES, VIDEO, WORLD_EXTENSIONS, gallery_source, source_for_kind
 from shared.utils.utils import get_video_info, has_mesh_file_extension
 
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tif", ".tiff", ".jfif", ".pjpeg"}
 _VIDEO_EXTENSIONS = {".mkv", ".mov", ".mp4", ".webm"}
 _AUDIO_EXTENSIONS = {".wav", ".mp3", ".aac", ".flac", ".m4a", ".ogg", ".wma", ".opus"}
-_SCOPE_GROUPS = {"media": ("Media", VIDEO.id, None), "image": ("Images", VIDEO.id, "image"), "video": ("Videos", VIDEO.id, "video"), "audio": ("Audio", "audio", None), "3d": ("3D Assets", "mesh", None)}
+_SCOPE_GROUPS = {"media": ("Media", VIDEO.id, None), "image": ("Images", VIDEO.id, "image"), "video": ("Videos", VIDEO.id, "video"), "audio": ("Audio", "audio", None), "3d": ("3D Assets", "mesh", None), "world": ("Worlds", "world", None)}
 
 
 class Gallery:
@@ -35,6 +35,8 @@ class Gallery:
             return "audio"
         if has_mesh_file_extension(path):
             return "3d"
+        if ext in WORLD_EXTENSIONS:
+            return "world"
         return "any"
 
     def _resolve_lists(self, source_id: str) -> tuple[list[Any], list[Any]]:
@@ -150,7 +152,7 @@ class Gallery:
         gen = self._gen()
         lines = []
         groups = []
-        for group_scope in (("media", "audio", "3d") if scope == "all" else (scope,)):
+        for group_scope in (("media", "audio", "3d", "world") if scope == "all" else (scope,)):
             header, source_id, media_type = _SCOPE_GROUPS[group_scope]
             items = self._iter_records(source_id)
             groups.append((header, items if media_type is None else [item for item in items if item[2].get("media_type") == media_type]))

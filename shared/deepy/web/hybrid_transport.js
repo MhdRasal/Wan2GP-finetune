@@ -149,6 +149,21 @@
       return true;
     };
     WAC.prefillResumedSession = () => {};
+    // Images and videos of the image/video gallery open in its full-screen viewer, 3D assets in the 3D gallery's
+    // viewer (a new tab would only download them); other media keep their new tab and download cards their download.
+    WAC.openAttachment = link => {
+      const kind = link.dataset.mediaKind;
+      if (link.hasAttribute('download') || !(kind === '3d' || WAC.galleryMediaViewer && ['image', 'video'].includes(kind))) return false;
+      const scroll = WAC.captureAutoscrollState(), restore = () => WAC.scheduleComposerLayout(scroll);
+      const query = new URLSearchParams({url: link.getAttribute('href')});
+      const opened = kind === '3d'
+        ? transport.request('media/mesh-viewer?' + query).then(result => window.WanGPGallerySelection.viewMesh(result.html, restore))
+        : transport.request('media/locate?' + query).then(item => {
+          if (!item || !window.WanGPGallerySelection.view(item, restore)) window.open(link.href, '_blank', 'noopener');
+        });
+      opened.catch(error => showError(error.notification || error.message));
+      return true;
+    };
     window.addEventListener('online', () => transport.connect());
     window.addEventListener('focus', () => {if (!transport.source) transport.connect(); requestGallery();});
     document.addEventListener('visibilitychange', () => {if (!document.hidden) requestGallery();});

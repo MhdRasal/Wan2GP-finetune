@@ -14,7 +14,7 @@ from shared.utils.workspace_storage import OUTPUT_KEYS, background_workspace, ex
 from shared.utils.workspaces import WorkspaceStore, capture_gallery, load_gallery
 
 VISIBILITY_KEY, VISIBILITY_MODES = 'mcp_workspace_visibility', ('own', 'own_and_user', 'all')
-SCOPED_TOOLS = {'wangp_generate', 'wangp_validate', 'wangp_postprocess', 'wangp_toolbox', 'wangp_list_gallery', 'wangp_io', 'wangp_session'}
+SCOPED_TOOLS = {'wangp_generate', 'wangp_validate', 'wangp_postprocess', 'wangp_toolbox', 'wangp_list_gallery', 'wangp_io', 'wangp_session', 'wangp_plugins'}
 
 
 class StandaloneWorkspaceHost:

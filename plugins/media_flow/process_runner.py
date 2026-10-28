@@ -101,8 +101,52 @@ class ProcessRunResult:
     chunks_total: int = 0
 
 
+def plugin_active_job(plugin) -> dict:
+    """The one job state of the plugin, shared by its tab and its agent actions so that a single process runs at a time; made on first use."""
+    if getattr(plugin, "active_job", None) is None:
+        plugin.active_job = {"job": None, "running": False, "batch_running": False, "cancel_requested": False, "write_state": None, catalog.PRESERVE_ARTIFACTS_STORAGE_KEY: catalog.PRESERVE_ARTIFACTS_DEFAULT,
+                             catalog.PREVIEW_OUTPUT_STORAGE_KEY: catalog.PREVIEW_OUTPUT_DEFAULT, "generated_artifact_paths": []}
+    return plugin.active_job
+
+
+def remember_status(active_job: dict, status, batch_status) -> None:
+    """Keep the values of the last rendered statuses, for agents asking how the running process (from the tab or an agent) is going."""
+    if hasattr(status, "fields"):
+        active_job["status_fields"] = status.fields
+    if hasattr(batch_status, "fields"):
+        active_job["batch_fields"] = batch_status.fields
+
+
+def reset_live_chunk_status(state: dict) -> None:
+    gen = state.get("gen") if isinstance(state, dict) else None
+    if not isinstance(gen, dict):
+        return
+    gen["status"] = ""
+    gen["status_display"] = False
+    gen["progress_args"] = None
+    gen["progress_phase"] = None
+    gen["progress_status"] = ""
+    gen["preview"] = None
+
+
+def request_stop(active_job: dict) -> bool:
+    """Stop the running process after its current chunk (a later run with Continue resumes it); True when a process was running."""
+    active_job["cancel_requested"] = True
+    write_state = active_job.get("write_state")
+    if write_state is not None:
+        write_state.stopped = True
+    job = active_job.get("job")
+    if job is not None and not job.done:
+        try:
+            job.cancel()
+        except RuntimeError as exc:
+            print(f"[MediaFlow] Stop requested; WanGP abort bridge was not available: {exc}")
+        return True
+    return bool(active_job.get("running") or active_job.get("batch_running"))
+
+
 class ProcessRunner:
-    def __init__(self, *, plugin, api_session, library, get_model_def, active_job: dict, preview_state: dict, ui_skip, ui_update, info_exit, reset_live_chunk_status) -> None:
+    def __init__(self, *, plugin, api_session, library, get_model_def, active_job: dict, preview_state: dict, ui_skip, ui_update, info_exit, reset_live_chunk_status, remember_ui_settings: bool = True) -> None:
         self.plugin = plugin
         self.api_session = api_session
         self.library = library
@@ -113,6 +157,11 @@ class ProcessRunner:
         self.ui_update = ui_update
         self.info_exit = info_exit
         self.reset_live_chunk_status = reset_live_chunk_status
+        self.remember_ui_settings = remember_ui_settings  # agent runs leave the tab's saved form alone
+
+    def _save_ui_settings(self, settings: dict, media_kind: str, batch_mode: str) -> None:
+        if self.remember_ui_settings:
+            catalog.save_mediaflow_ui_settings(settings, media_kind, batch_mode)
 
     def _record_process_result(self, result: ProcessRunResult) -> ProcessRunResult:
         self.active_job["last_process_result"] = result
@@ -269,7 +318,7 @@ class ProcessRunner:
         target_output_path = output_paths.resolve_image_output_path(source_path, output_path, process_display_name, default_extension=self._image_output_extension(), notify=common.plugin_info)
         if not batch_internal:
             try:
-                catalog.save_mediaflow_ui_settings({
+                self._save_ui_settings({
                     "process_model_type": str(process_definition["settings"].get("model_type") or ""),
                     "process_name": request.process_name,
                     "source_path": source_path,
@@ -432,10 +481,11 @@ class ProcessRunner:
         elif files.batch_name:
             batch_name = files.batch_name
         batch_state = files.state if files.state is not None else batch_queue.make_state(batch_name, signature, items)
+        self.active_job["last_batch"] = {"name": batch_name, "state_file": str(files.state_path), "log_file": str(files.log_path), "state": batch_state}  # updated in place as items finish
         if files.renamed:
             common.plugin_info(f'Batch name "{requested_batch_name}" already has a state file. Using "{batch_name}".')
         try:
-            catalog.save_mediaflow_ui_settings({
+            self._save_ui_settings({
                 "process_model_type": model_type,
                 "process_name": request.process_name,
                 "source_path": source_path,
@@ -608,6 +658,7 @@ class ProcessRunner:
             return
         if not batch_internal:
             self._reset_generated_artifacts()
+            self.active_job.update(last_batch=None, batch_fields=None)
         self.active_job["last_process_result"] = None
         request = RunRequest.from_gradio(state, process_name, user_refs, selected_source_path, process_strength, output_path, prompt_text, continue_enabled, source_audio_track, output_resolution, target_ratio, chunk_size_seconds, sliding_window_overlap, start_seconds, end_seconds, spatial_upsampler_parameters)
         if process_definition is None:
@@ -679,7 +730,7 @@ class ProcessRunner:
             return
         if not batch_internal:
             try:
-                catalog.save_mediaflow_ui_settings({
+                self._save_ui_settings({
                     "process_model_type": model_type,
                     "process_name": request.process_name,
                     "source_path": source_path,

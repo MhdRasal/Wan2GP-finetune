@@ -865,7 +865,7 @@ class modelsManagerPlugin(WAN2GPPlugin):
         if isinstance(getattr(self, "models_def", None), dict) and self.models_def:
             types = sorted(self.models_def.keys())
         elif isinstance(self.transformer_types, list) and self.transformer_types:
-            types = list(self.transformer_types)
+            types = model_dropdowns.expand_model_selection(self.transformer_types, self.displayed_model_types, self.get_parent_model_type, self.get_model_family)
         elif isinstance(self.displayed_model_types, list):
             types = list(self.displayed_model_types)
         seen = set()

@@ -21,9 +21,9 @@ from shared.deepy import chat, session_store
 from shared.deepy.errors import error_payload
 from shared.deepy.gallery import _AUDIO_EXTENSIONS, _IMAGE_EXTENSIONS, _VIDEO_EXTENSIONS
 from shared.deepy.voice import mount_voice_routes, save_upload
-from shared.utils.downloads import _install_routes_on_app
+from shared.utils.downloads import _install_routes_on_app, registered_download_path
 from shared.utils.media_imports import persist_gallery_import
-from shared.utils.gallery_sources import MESH_IMPORT_EXTENSIONS
+from shared.utils.gallery_sources import MESH_EXTENSIONS, MESH_IMPORT_EXTENSIONS
 from shared.utils.mesh_outputs import import_mesh_file
 from shared.authentication import password
 from shared.authentication.web import WebAuthentication, WebAuthMiddleware
@@ -274,6 +274,18 @@ def create_app(service, *, token=None, auth=None, voice_language=None, https_por
     @app.post('/deepy_api/media/unattach-last')
     def unattach_last(payload: dict):
         return {'event': service.remove_last_chat_upload(payload.get('chat_session_id'))}
+
+    @app.get("/deepy_api/media/locate")
+    def locate_media(url: str):
+        return service.locate_gallery_media(url)
+
+    @app.get("/deepy_api/media/mesh-viewer")
+    def mesh_viewer(url: str):
+        from shared.gradio.strip_gallery import MeshGallery
+        path = registered_download_path(url)
+        if path is None or Path(path).suffix.lower() not in MESH_EXTENSIONS:
+            raise HTTPException(404, "3D asset not found.")
+        return {"html": MeshGallery.viewer_html(path, url)}
 
     @app.post("/deepy_api/media/{media_id}/select")
     def select(media_id: str):

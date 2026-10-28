@@ -16,9 +16,9 @@ from . import constants as ui_constants
 from . import process_catalog as catalog
 from . import prompt_schedule as prompts
 from . import status_ui
-from .form_controller import FormComponentValues, ProcessFormController
+from .form_controller import FormComponentValues, create_form_controller
 from .process_library import ProcessLibrary
-from .process_runner import ProcessRunner
+from .process_runner import ProcessRunner, plugin_active_job, remember_status, request_stop, reset_live_chunk_status
 
 
 def create_config_ui(self, api_session):
@@ -30,15 +30,9 @@ def create_config_ui(self, api_session):
     get_lora_dir = self.get_lora_dir
     get_base_model_type = self.get_base_model_type
     library = ProcessLibrary(get_model_def=get_model_def, get_lora_dir=get_lora_dir, get_base_model_type=get_base_model_type)
-    high_output_resolution_choices = [("2160p", "2160p"), ("1440p", "1440p")]
-    standard_output_resolution_choices = [("1080p", "1080p"), ("900p", "900p"), ("720p", "720p"), ("540p", "540p"), ("480p", "480p"), ("384p", "384p"), ("320p", "320p"), ("256p", "256p")]
-    output_resolution_choices = high_output_resolution_choices + standard_output_resolution_choices if self.server_config.get("enable_4k_resolutions", 0) == 1 else standard_output_resolution_choices
-    output_resolution_values = {value for _, value in high_output_resolution_choices + standard_output_resolution_choices}
-    source_audio_track_choices = [("Auto", "")] + [(f"Audio Track {track_no}", str(track_no)) for track_no in range(1, 10)]
-    source_audio_track_values = {value for _, value in source_audio_track_choices}
-    ratio_values = {value for _, value in ui_constants.RATIO_CHOICES}
-
-    form_controller = ProcessFormController(library=library, get_model_def=get_model_def, output_resolution_values=output_resolution_values, output_resolution_choices=output_resolution_choices, source_audio_track_values=source_audio_track_values, ratio_values=ratio_values)
+    output_resolution_choices = ui_constants.output_resolution_choices(self.server_config)
+    source_audio_track_choices = ui_constants.SOURCE_AUDIO_TRACK_CHOICES
+    form_controller = create_form_controller(library, get_model_def, self.server_config)
     form_event_options = {"queue": True, "concurrency_limit": 1, "concurrency_id": f"media_flow_form_{id(self)}", "trigger_mode": "always_last", "show_progress": "hidden"}
     saved_mediaflow_settings = catalog.ensure_mediaflow_settings_migrated(catalog.load_saved_mediaflow_settings(), library.media_kind_for_user_ref)
     default_media_kind = catalog.current_media_kind(saved_mediaflow_settings)
@@ -63,7 +57,8 @@ def create_config_ui(self, api_session):
     default_preview_enabled = catalog.normalize_preview_enabled(saved_ui_settings.get(catalog.PREVIEW_OUTPUT_STORAGE_KEY))
     initial_spatial_parameter_state = library.spatial_upsampler_parameter_state(default_process_name, self.state.value, initial_user_refs, saved_ui_settings.get("spatial_upsampler_parameters"))
     initial_image_process = default_media_kind == "image"
-    active_job = {"job": None, "running": False, "batch_running": False, "cancel_requested": False, "write_state": None, catalog.PRESERVE_ARTIFACTS_STORAGE_KEY: default_preserve_artifact_count, catalog.PREVIEW_OUTPUT_STORAGE_KEY: default_preview_enabled, "generated_artifact_paths": []}
+    active_job = plugin_active_job(self)  # shared with the plugin's agent actions: one process at a time, stoppable from either side
+    active_job.update({catalog.PRESERVE_ARTIFACTS_STORAGE_KEY: default_preserve_artifact_count, catalog.PREVIEW_OUTPUT_STORAGE_KEY: default_preview_enabled})
     preview_state = {"image": None}
     ui_skip = object()
     initial_status_html = status_ui.render_process_status_html("Idle", "Waiting to start...") if initial_image_process else status_ui.render_chunk_status_html(0, 0, 0, "Idle", "Waiting to start...")
@@ -113,6 +108,7 @@ def create_config_ui(self, api_session):
         return _html_update(last_html["status"])
 
     def _ui_update(status=ui_skip, output=ui_skip, preview_refresh=ui_skip, *, batch_status=ui_skip, start_enabled: bool | None = None, abort_enabled: bool | None = None, batch_name_value=ui_skip, gallery_refresh=ui_skip):
+        remember_status(active_job, status, batch_status)
         if status is not ui_skip:
             last_html["status"] = _html_value(status)
         if batch_status is not ui_skip:
@@ -132,17 +128,6 @@ def create_config_ui(self, api_session):
     def _info_exit(message: str, *, output=ui_skip, total_chunks: int = 1, completed_chunks: int = 0, current_chunk: int = 1, continued: bool = False):
         gr.Info(str(message or "").strip())
         return _ui_update(status_ui.render_chunk_status_html(total_chunks, completed_chunks, current_chunk, "Info", str(message or "").strip(), continued=continued), output, ui_skip, start_enabled=True, abort_enabled=False)
-
-    def _reset_live_chunk_status(state: dict) -> None:
-        gen = state.get("gen") if isinstance(state, dict) else None
-        if not isinstance(gen, dict):
-            return
-        gen["status"] = ""
-        gen["status_display"] = False
-        gen["progress_args"] = None
-        gen["progress_phase"] = None
-        gen["progress_status"] = ""
-        gen["preview"] = None
 
     def _add_user_process_link(process_value: str, media_kind: str, main_state: dict | None, main_lset_name: str | None, user_refs: list[str] | None):
         media_kind = catalog.normalize_media_kind(media_kind)
@@ -228,23 +213,15 @@ def create_config_ui(self, api_session):
         ui_skip=ui_skip,
         ui_update=_ui_update,
         info_exit=_info_exit,
-        reset_live_chunk_status=_reset_live_chunk_status,
+        reset_live_chunk_status=reset_live_chunk_status,
     )
 
     def stop_process():
-        active_job["cancel_requested"] = True
-        write_state = active_job.get("write_state")
-        if write_state is not None:
-            write_state.stopped = True
         job = active_job.get("job")
-        if job is not None and not job.done:
-            try:
-                job.cancel()
-            except RuntimeError as exc:
-                print(f"[MediaFlow] Stop requested; WanGP abort bridge was not available: {exc}")
-            common.plugin_info("Stopping current processing job...")
-            return _stopping_status_update(), _html_update(last_html["batch_status"]), gr.update(value="Start Process", interactive=False), gr.update(value="Stop", interactive=False)
-        if active_job.get("running") or active_job.get("batch_running"):
+        job_running = job is not None and not job.done
+        if request_stop(active_job):
+            if job_running:
+                common.plugin_info("Stopping current processing job...")
             return _stopping_status_update(), _html_update(last_html["batch_status"]), gr.update(value="Start Process", interactive=False), gr.update(value="Stop", interactive=False)
         return _html_update(last_html["status"]), _html_update(last_html["batch_status"]), gr.update(value="Start Process", interactive=True), gr.update(value="Stop", interactive=False)
 

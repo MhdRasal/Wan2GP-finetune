@@ -66,6 +66,17 @@ class ChunkCallbacks:
         self.total_steps = incoming_total
 
 
+class StatusHtml(str):
+    """A rendered status that keeps its values in fields, for agents following a run without the page."""
+    fields: dict
+
+
+def _status(text: str, **fields) -> StatusHtml:
+    status = StatusHtml(text)
+    status.fields = fields
+    return status
+
+
 def render_chunk_status_html(total_chunks: int, completed_chunks: int, current_chunk: int, phase_label: str, status_text: str, *, continued: bool = False, phase_current_step=None, phase_total_steps=None, elapsed_seconds: float | None = None, eta_seconds: float | None = None, prefer_status_phase: bool = False) -> str:
     total_chunks = int(total_chunks)
     completed_chunks = int(completed_chunks)
@@ -96,7 +107,7 @@ def render_chunk_status_html(total_chunks: int, completed_chunks: int, current_c
     normalized_status = raw_status_text
     show_status_line = (not prefer_status_phase) and len(normalized_status) > 0 and (len(normalized_phase) == 0 or normalized_phase not in normalized_status.lower())
     status_line_html = f"<div style='font-size:0.9em;color:#4b5563'>{status_html}</div>" if show_status_line else ""
-    return (
+    return _status(
         "<div style='display:flex;flex-direction:column;gap:8px'>"
         f"<div style='font-weight:600'>Chunks Processed: {chunks_text}{continued_suffix}</div>"
         "<div style='height:12px;border-radius:999px;background:#d7dce3;overflow:hidden'>"
@@ -108,7 +119,8 @@ def render_chunk_status_html(total_chunks: int, completed_chunks: int, current_c
         "</div>"
         f"<div style='font-size:0.9em;color:#4b5563'><b>Elapsed:</b> {elapsed_html} <span style='padding-left:12px'><b>ETA:</b> {eta_html}</span></div>"
         f"{status_line_html}"
-        "</div>"
+        "</div>",
+        total_chunks=total_chunks, completed_chunks=completed_chunks, current_chunk=current_chunk, phase=raw_phase_text, status=raw_status_text, step=phase_current_step, steps=phase_total_steps, eta_s=eta_seconds,
     )
 
 
@@ -130,7 +142,7 @@ def render_process_status_html(phase_label: str, status_text: str, *, phase_curr
     normalized_phase = raw_phase_text.lower()
     show_status_line = (not prefer_status_phase) and len(raw_status_text) > 0 and (len(normalized_phase) == 0 or normalized_phase not in raw_status_text.lower())
     status_line_html = f"<div style='font-size:0.9em;color:#4b5563'>{status_html}</div>" if show_status_line else ""
-    return (
+    return _status(
         "<div style='display:flex;flex-direction:column;gap:8px'>"
         f"<div style='font-size:0.95em'><b>Phase:</b> {phase_html}{phase_suffix}</div>"
         "<div style='height:12px;border-radius:999px;background:#d7dce3;overflow:hidden'>"
@@ -138,7 +150,8 @@ def render_process_status_html(phase_label: str, status_text: str, *, phase_curr
         "</div>"
         f"<div style='font-size:0.9em;color:#4b5563'><b>Elapsed:</b> {elapsed_html} <span style='padding-left:12px'><b>ETA:</b> {eta_html}</span></div>"
         f"{status_line_html}"
-        "</div>"
+        "</div>",
+        phase=raw_phase_text, status=raw_status_text, step=phase_current_step, steps=phase_total_steps, eta_s=eta_seconds,
     )
 
 
@@ -153,7 +166,7 @@ def render_batch_status_html(total_files: int, completed_files: int, current_ind
     status_html = html.escape(str(status_text or "").strip())
     failures_text = f" ({failed_files} {'failure' if failed_files == 1 else 'failures'})" if failed_files > 0 else ""
     current_line = f"<div style='font-size:0.9em;color:#4b5563'><b>Current:</b> {current_name}</div>" if current_name else ""
-    return (
+    return _status(
         "<div style='display:flex;flex-direction:column;gap:8px;margin-bottom:8px'>"
         f"<div style='font-weight:600'>Batch Files Processed: {completed_files} / {total_files}{failures_text}</div>"
         "<div style='height:12px;border-radius:999px;background:#d7dce3;overflow:hidden'>"
@@ -161,7 +174,8 @@ def render_batch_status_html(total_files: int, completed_files: int, current_ind
         "</div>"
         f"<div style='font-size:0.95em'><b>Batch:</b> {status_html}</div>"
         f"{current_line}"
-        "</div>"
+        "</div>",
+        total_files=total_files, completed_files=completed_files, failed_files=failed_files, current_index=current_index, current_file=str(current_file or ""), status=str(status_text or "").strip(),
     )
 
 

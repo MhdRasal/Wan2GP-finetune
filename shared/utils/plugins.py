@@ -1,3 +1,4 @@
+import glob
 import os
 import sys
 import importlib
@@ -58,8 +59,64 @@ class PluginDeepyTool:
         }
 
 
+@dataclass
+class PluginDeepyAction:
+    """One action of a plugin toolbox: called as function(ctx, **arguments) through wangp_plugins (MCP, Deepy Prime, Deepy Python)."""
+    name: str
+    function: callable
+    summary: str
+    description: str
+    parameters: Dict[str, Dict[str, Any]]  # JSON schema overrides of the arguments derived from the signature
+    example: Dict[str, Any] | None
+    uses_gpu: bool  # Deepy releases the GPU before the call: a plugin that submits generations would otherwise wait for Deepy forever
+    paths: Dict[str, str]  # argument -> "read" or "write": resolved (Gallery ids, @aliases) and authorized before the call
+    routing: str  # when to choose this action, added to the agents' instructions
+    instead_of: str  # a WanGP tool this action competes with: its discovery mentions the action
+    scripts: bool  # callable from Deepy Python scripts
+
+
+@dataclass
+class PluginDeepyToolbox:
+    toolbox_id: str
+    display_name: str
+    summary: str
+    guide: str
+    actions: Dict[str, PluginDeepyAction]
+    plugin_id: str = ""
+
+
+@dataclass
+class PluginDeepySkill:
+    """A skill a plugin ships in skills/<name>/SKILL.md, for Deepy Prime and MCP agents. With a routing line it extends Deepy for every
+    conversation (wangp://skills/<name>, listed with WanGP's skills, its routing in the agents' instructions); without one it is the method
+    of the plugin's own toolbox and jobs (wangp://skills/<plugin>/<name>, unlisted, named by the toolbox discovery)."""
+    name: str
+    path: str  # the SKILL.md file
+    description: str
+    plugin_id: str
+    routing: str = ""
+
+    @property
+    def uri(self) -> str:
+        return f"wangp://skills/{self.name}" if self.routing else f"wangp://skills/{self.plugin_id}/{self.name}"
+
+
+@dataclass
+class PluginWebApp:
+    """A plugin's own web application (an ASGI app such as FastAPI), served by the WanGP server under path, behind its authentication."""
+    path: str
+    factory: callable  # factory() -> ASGI application, called once when the server starts
+    plugin_id: str = ""
+
+
 _ACTIVE_DEEPY_PRIME_TOOLS: Dict[str, PluginDeepyTool] = {}
 _ACTIVE_DEEPY_ZERO_TOOLS: Dict[str, PluginDeepyTool] = {}
+_ACTIVE_DEEPY_TOOLBOXES: Dict[str, PluginDeepyToolbox] = {}
+_ACTIVE_WEB_APPS: Dict[str, PluginWebApp] = {}
+_ACTIVE_DEEPY_SKILLS: Dict[str, PluginDeepySkill] = {}
+_BUILTIN_SKILLS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "deepy", "skills")
+_WEB_APP_PATH_RE = re.compile(r"^/[a-z][a-z0-9_-]*$")
+_RESERVED_WEB_APP_PATHS = {"/deepy", "/deepy_api", "/gradio_api", "/file", "/assets", "/config", "/queue", "/upload", "/static", "/theme", "/login", "/logout", "/mcp"}
 
 
 def get_deepy_prime_plugin_tools() -> tuple[PluginDeepyTool, ...]:
@@ -70,9 +127,30 @@ def get_deepy_zero_plugin_tools() -> tuple[PluginDeepyTool, ...]:
     return tuple(_ACTIVE_DEEPY_ZERO_TOOLS.values())
 
 
+def get_deepy_plugin_toolboxes() -> Dict[str, PluginDeepyToolbox]:
+    return dict(_ACTIVE_DEEPY_TOOLBOXES)
+
+
 def _reset_deepy_plugin_tools() -> None:
     _ACTIVE_DEEPY_PRIME_TOOLS.clear()
     _ACTIVE_DEEPY_ZERO_TOOLS.clear()
+    _ACTIVE_DEEPY_TOOLBOXES.clear()
+    _ACTIVE_WEB_APPS.clear()
+    _ACTIVE_DEEPY_SKILLS.clear()
+
+
+def get_plugin_web_apps() -> tuple[PluginWebApp, ...]:
+    """Web applications of the enabled plugins, mounted by the WanGP server at their path."""
+    return tuple(_ACTIVE_WEB_APPS.values())
+
+
+def get_deepy_plugin_skills() -> tuple[PluginDeepySkill, ...]:
+    """Skills of the enabled plugins, for Deepy Prime and MCP agents (Deepy Zero does not read skills)."""
+    return tuple(_ACTIVE_DEEPY_SKILLS.values())
+
+
+def get_deepy_plugin_skill(uri: str) -> PluginDeepySkill | None:
+    return _ACTIVE_DEEPY_SKILLS.get(uri)
 
 def _has_value(value: Any) -> bool:
     if value is None:
@@ -290,6 +368,7 @@ BUNDLED_PLUGINS = {
     "models_manager",
     "motion_designer",
     "sample",
+    "showrunner",
 }
 USER_PLUGIN_INSERT_POSITION = 1
 
@@ -331,7 +410,9 @@ class WAN2GPPlugin:
         self._custom_js_snippets: List[str] = []
         self._deepy_prime_tools: List[PluginDeepyTool] = []
         self._deepy_zero_tools: List[PluginDeepyTool] = []
-        
+        self._deepy_toolbox: PluginDeepyToolbox | None = None
+        self._web_apps: List[PluginWebApp] = []
+
     def setup_ui(self) -> None:
         pass
         
@@ -358,6 +439,12 @@ class WAN2GPPlugin:
         if global_name not in self._global_requests:
             self._global_requests.append(global_name)
 
+    @property
+    def deepy(self):
+        """Deepy jobs for this plugin: list gallery media and run requests in their own session (WanGP web UI only)."""
+        from shared.deepy.plugin_jobs import DeepyClient
+        return DeepyClient(self.name)
+
     def sync_form(self, name, components, **kwargs):
         """Register a plugin form; request the shared 'state' component in setup_ui."""
         from shared.gradio.form_sync import GradioForm
@@ -383,6 +470,17 @@ class WAN2GPPlugin:
     def add_custom_js(self, js_code: str) -> None:
         if isinstance(js_code, str) and js_code.strip():
             self._custom_js_snippets.append(js_code)
+
+    def register_web_app(self, path: str, factory: callable) -> None:
+        """Serve factory() (an ASGI application, such as a FastAPI app) at path, for example "/my_plugin", from the WanGP server and
+        behind its authentication. factory runs once when the server starts; a tab can embed the page in an iframe."""
+        if not _WEB_APP_PATH_RE.fullmatch(str(path)) or path in _RESERVED_WEB_APP_PATHS:
+            raise ValueError(f"Invalid plugin web app path '{path}': use one lowercase segment such as '/my_plugin', not a WanGP route.")
+        if not callable(factory):
+            raise TypeError("A plugin web app needs a callable factory returning an ASGI application.")
+        if any(web_app.path == path for web_app in self._web_apps):
+            raise ValueError(f"Plugin web app path '{path}' is already registered by this plugin.")
+        self._web_apps.append(PluginWebApp(path, factory))
 
     @staticmethod
     def _deepy_tool_signature(function: callable) -> inspect.Signature:
@@ -436,6 +534,47 @@ class WAN2GPPlugin:
             tool_parameters[parameter.name] = metadata
         definition = PluginDeepyTool(tool_name, function, tool_display_name, tool_description, tool_parameters, bool(pause_runtime), str(pause_reason or "tool").strip() or "tool", bool(requires_file_system))
         return self._add_deepy_tool(self._deepy_zero_tools, definition)
+
+    def register_deepy_toolbox(self, summary: str, *, guide: str = "", toolbox_id: str | None = None, display_name: str | None = None) -> None:
+        """Expose this plugin to agents (MCP, Deepy Prime, Deepy Python) as one toolbox of wangp_plugins: summary is its one line in their instructions,
+        guide the usage rules returned with its actions. Actions are added with register_deepy_action."""
+        if self._deepy_toolbox is not None:
+            raise ValueError("This plugin already registered its Deepy toolbox.")
+        if toolbox_id is not None and not _DEEPY_TOOL_NAME_RE.fullmatch(str(toolbox_id)):
+            raise ValueError(f"Invalid Deepy toolbox id '{toolbox_id}'. Use letters, digits, and underscores, starting with a letter or underscore.")
+        if not str(summary or "").strip():
+            raise ValueError("A Deepy toolbox needs a one-line summary.")
+        self._deepy_toolbox = PluginDeepyToolbox(str(toolbox_id or ""), str(display_name or ""), " ".join(str(summary).split()), str(guide or "").strip(), {})
+
+    def register_deepy_action(self, function: callable, *, name: str | None = None, summary: str | None = None, description: str | None = None, parameters: Dict[str, Dict[str, Any]] | None = None, example: Dict[str, Any] | None = None,
+                              uses_gpu: bool = True, paths: Dict[str, str] | None = None, routing: str = "", instead_of: str = "", scripts: bool = True) -> callable:
+        """Add an action to this plugin's Deepy toolbox. function(ctx, **arguments) is synchronous; its arguments' schema comes from the type hints,
+        parameters overrides per-argument schema entries (description, enum, ...). uses_gpu=False only for actions that never run GPU work:
+        Deepy unloads before every other call so that the generations the action submits can run."""
+        if self._deepy_toolbox is None:
+            raise ValueError("Call register_deepy_toolbox before register_deepy_action.")
+        if inspect.iscoroutinefunction(function):
+            raise TypeError("Deepy toolbox actions must be synchronous.")
+        signature = self._deepy_tool_signature(function)
+        action_parameters = list(signature.parameters)
+        if not action_parameters or action_parameters[0] != "ctx":
+            raise TypeError("A Deepy toolbox action takes the call context as its first parameter, named ctx.")
+        action_name, _display_name, action_description = self._deepy_tool_identity(function, name, None, description)
+        if action_name in self._deepy_toolbox.actions:
+            raise ValueError(f"Deepy toolbox action '{action_name}' is already registered by this plugin.")
+        unknown = (set(parameters or {}) | set(paths or {})) - set(action_parameters[1:])
+        if unknown:
+            raise ValueError(f"Unknown parameters for Deepy toolbox action '{action_name}': {', '.join(sorted(unknown))}")
+        roles = {key: str(value) for key, value in dict(paths or {}).items()}
+        if set(roles.values()) - {"read", "write"}:
+            raise ValueError(f"Deepy toolbox action '{action_name}': paths roles are 'read' or 'write'.")
+        action_summary = " ".join(str(summary or action_description.split("\n", 1)[0]).split())
+        if not action_summary:
+            raise ValueError(f"Deepy toolbox action '{action_name}' needs a summary or a docstring.")
+        action_description = re.sub(r"(?<!\n)\n(?!\n)", " ", action_description)  # a docstring's wrapped lines form one paragraph
+        self._deepy_toolbox.actions[action_name] = PluginDeepyAction(action_name, function, action_summary, action_description or action_summary, {key: dict(value) for key, value in dict(parameters or {}).items()},
+                                                                     dict(example) if example else None, bool(uses_gpu), roles, " ".join(str(routing or "").split()), str(instead_of or "").strip(), bool(scripts))
+        return function
 
     @property
     def custom_js_snippets(self) -> List[str]:
@@ -1464,6 +1603,32 @@ class PluginManager:
                 print(f"[PluginManager] Failed to update {metadata_path}: {e}")
 
     @staticmethod
+    def _activate_plugin_deepy_skills(plugin_id: str, plugin_dir: str) -> None:
+        """Skills the plugin ships in skills/<name>/SKILL.md (front matter: name, description, optional routing), for Deepy Prime and MCP
+        agents; Deepy Zero does not read skills."""
+        import yaml
+        from shared.mcp.skills import skill_metadata
+        skills = []
+        for path in sorted(glob.glob(os.path.join(plugin_dir, "skills", "*", "SKILL.md"))):
+            name = os.path.basename(os.path.dirname(path))
+            if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name) or len(name) > 64:
+                raise ValueError(f"Invalid Deepy skill folder name '{name}' in plugin '{plugin_id}': use a lowercase hyphenated name of at most 64 characters.")
+            with open(path, encoding="utf-8") as reader:
+                text = reader.read()
+            description = skill_metadata(text, name)["description"]
+            routing = yaml.safe_load(text.split("---", 2)[1]).get("routing") or ""
+            if not isinstance(routing, str):
+                raise ValueError(f"The routing of Deepy skill '{name}' in plugin '{plugin_id}' must be one line of text.")
+            skill = PluginDeepySkill(name, path, description, plugin_id, " ".join(routing.split()))
+            if not skill.routing and (plugin_id == "user" or not re.fullmatch(r"[A-Za-z0-9._-]+", plugin_id)):
+                raise ValueError(f"Plugin folder '{plugin_id}' cannot hold toolbox skills: rename it with letters, digits, '.', '_' or '-' (not 'user').")
+            existing = _ACTIVE_DEEPY_SKILLS.get(skill.uri)
+            if existing is not None or (skill.routing and os.path.isfile(os.path.join(_BUILTIN_SKILLS_DIR, name, "SKILL.md"))):
+                raise ValueError(f"Deepy skill '{name}' of plugin '{plugin_id}' is already provided by {'plugin ' + repr(existing.plugin_id) if existing else 'WanGP'}.")
+            skills.append(skill)
+        _ACTIVE_DEEPY_SKILLS.update({skill.uri: skill for skill in skills})
+
+    @staticmethod
     def _activate_plugin_deepy_tools(plugin_id: str, plugin: WAN2GPPlugin) -> None:
         prime_tools = [replace(definition, plugin_id=plugin_id) for definition in plugin._deepy_prime_tools]
         zero_tools = [replace(definition, plugin_id=plugin_id) for definition in plugin._deepy_zero_tools]
@@ -1475,6 +1640,21 @@ class PluginManager:
                 raise ValueError(f"{runtime_name} tool '{definition.name}' is already registered by plugin '{existing.plugin_id}'.")
         _ACTIVE_DEEPY_PRIME_TOOLS.update({definition.name: definition for definition in prime_tools})
         _ACTIVE_DEEPY_ZERO_TOOLS.update({definition.name: definition for definition in zero_tools})
+        for web_app in plugin._web_apps:
+            existing = _ACTIVE_WEB_APPS.get(web_app.path)
+            if existing is not None:
+                raise ValueError(f"Plugin web app path '{web_app.path}' is already registered by plugin '{existing.plugin_id}'.")
+            _ACTIVE_WEB_APPS[web_app.path] = replace(web_app, plugin_id=plugin_id)
+        toolbox = plugin._deepy_toolbox
+        if toolbox is None:
+            return
+        if not toolbox.actions:
+            raise ValueError(f"Deepy toolbox of plugin '{plugin_id}' has no actions.")
+        toolbox = replace(toolbox, toolbox_id=toolbox.toolbox_id or re.sub(r"\W", "_", plugin_id), display_name=toolbox.display_name or plugin.name, plugin_id=plugin_id)
+        existing = _ACTIVE_DEEPY_TOOLBOXES.get(toolbox.toolbox_id)
+        if existing is not None:
+            raise ValueError(f"Deepy toolbox '{toolbox.toolbox_id}' is already registered by plugin '{existing.plugin_id}'.")
+        _ACTIVE_DEEPY_TOOLBOXES[toolbox.toolbox_id] = toolbox
 
     def discover_plugins(self) -> List[str]:
         discovered = []
@@ -1517,6 +1697,7 @@ class PluginManager:
                         if is_bundled:
                             plugin.uninstallable = False
                         plugin.setup_ui()
+                        self._activate_plugin_deepy_skills(plugin_dir_name, plugin_path)
                         self._activate_plugin_deepy_tools(plugin_dir_name, plugin)
                         self.plugins[plugin_dir_name] = plugin
                         if plugin.custom_js_snippets:

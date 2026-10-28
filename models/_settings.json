@@ -26,6 +26,7 @@
 	"video_length": 81,
 	"duration_seconds": 0,
 	"pause_seconds": 0,
+	"world_output": "world",
 	"force_fps": "",
 	"num_inference_steps": 30,
 	"num_inference_steps2": 3,

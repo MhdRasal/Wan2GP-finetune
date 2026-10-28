@@ -109,6 +109,41 @@ def execution_device(module):
     return torch.device("cpu") if tensor is None else tensor.device
 
 
+def lookup_on_cpu(*modules):
+    """Mark modules that MMGP computes on the CPU, their weights kept in RAM, never in VRAM: a token table only gathers the rows of a
+    prompt, the same values as on the GPU, without moving the whole table (2 GB for an umT5 or a Gemma 3) at each load. Their tensor
+    inputs go to the CPU and their output comes back to the execution device. Call it on the loaded modules, before the offload
+    profile: a quantized table (a module whose tensors are not plain) keeps the GPU path of its qtype. A module tied to a marked one
+    (a head sharing the table) must be marked too, with unused when it never runs."""
+    for module in modules:
+        module._mm_on_cpu = True
+
+
+def map_in_ram(*modules):
+    """Mark modules whose parameters MMGP keeps in reserved RAM mapped in the GPU's address space, never in VRAM: their kernels read the
+    rows they need in place, over the bus, inside CUDA graphs too and with indices computed on the GPU (a token table read for a few tokens
+    at each step). The parameters stay the modules' own, as CUDA views of their RAM, outside the blocks, base and budgets; the RAM is
+    charged to the reserved RAM while it exists. Parameters of other modules sharing their tensors follow them: never mark a table that a
+    module reads whole at each call (a head tied to it), which would read it over the bus. Call it on the loaded modules, before the offload
+    profile; without CUDA, or without reserved RAM left, the modules keep their usual placement."""
+    for module in modules:
+        module._mm_mapped = True
+
+
+def is_mapped(tensor):
+    """True for a parameter kept in mapped RAM (map_in_ram): a CUDA view of RAM, whose reads cross the bus."""
+    from .mapped import is_mapped
+    return is_mapped(tensor)
+
+
+def unused(*modules):
+    """Mark modules that never run, such as the output head of a language model whose hidden states condition a generator (called through
+    its base model): MMGP keeps their weights in RAM, out of VRAM, pinning and budgets, quantized or not, and raises if one runs. Call it on
+    the loaded modules, before the offload profile."""
+    for module in modules:
+        module._mm_unused = True
+
+
 def ensure_loaded(module):
     """Load a managed model's base/preloaded weights; leave block swapping to MMGP.
 
@@ -119,6 +154,25 @@ def ensure_loaded(module):
     if owner is not None:
         manager, model_id = owner
         manager.ensure_model_loaded(model_id)
+
+
+def state_ring(blocks, name="state", resident=False):
+    """A state ring (mmgp.state_ring.StateRing) for tensors a model computes once per block and reads at every pass (a cached attention
+    prefix), blocks: the model's blocks (a ModuleList, called one by one). Kept in RAM and streamed block by block on the transfer stream of
+    the model's offload object, with the weights, following MMGP's schedule for these blocks (its prefetch window; records locked for the
+    blocks whose weights are pinned, then, for a model MMGP pins, for those kept in VRAM, as far as the reserved RAM allows; the others moved
+    ahead through MMGP's staging ring with their blocks): each block's forward fetches its state. The model calls store(block, tensors) once per block, and release() at the end.
+    resident: blocks whose weights MMGP keeps in VRAM may keep their state there too, in the room their preload leaves (see mmgp.state_ring;
+    the model then reads the lists store() returns at each pass)."""
+    from .state_ring import StateRing
+    owner = _owner(blocks)
+    if owner is None:
+        return StateRing(len(blocks), torch.device("cuda", torch.cuda.current_device()), None, name, modules=blocks)
+    manager, model_id = owner
+    prefix = next(name for name, module in manager.models[model_id].named_modules() if module is blocks) + "."
+    entries = [f"{model_id}/{prefix}{index}" for index in range(len(blocks))]  # the blocks' entries: the ring follows their schedule
+    return StateRing(len(blocks), torch.device("cuda", torch.cuda.current_device()), manager, name, modules=blocks, model_id=model_id, entries=entries,
+                     resident=resident)
 
 
 def weights_resident(module):

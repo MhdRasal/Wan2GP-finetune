@@ -390,6 +390,7 @@ class MiniMaxH3Pipeline:
         self.latent_upscaler = latent_upscaler
         self._phase_2_loras = None
         self.reference_mode = bool(reference_mode)
+        self.ptd = False
         self.audio_only = bool(audio_only)
         self.dialogue_whisper = None
         self.dtype = dtype
@@ -1128,7 +1129,10 @@ class MiniMaxH3Pipeline:
         presentation = None  # the frames shown to the text encoder are no longer needed (phase 2 builds its own)
         self._check_abort()
         self._use_transformer()
-        context = self.transformer.preprocess_text_embeds(context)
+        # PTD changes the token-refiner adapters at every denoising step. Keep the
+        # encoder output here; forward refines it after the shared LoRA step is set.
+        if not self.ptd:
+            context = self.transformer.preprocess_text_embeds(context)
 
         latent_t = video_latent_frames(aligned_target_frames)
         latent_h, latent_w = math.ceil(height / 16), math.ceil(width / 16)

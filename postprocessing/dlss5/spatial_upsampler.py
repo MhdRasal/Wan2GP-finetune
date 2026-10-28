@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from postprocessing import spatial_upsamplers as api
-from .runtime import DEPTH_RESOLUTION_DIVISORS, MOTION_VECTOR_METHODS, NR_MODES, configure_depth_estimator, neural_render, release_flow_model, unavailable_reason
+from .runtime import DEPTH_RESOLUTION_DIVISORS, MOTION_VECTOR_METHODS, NR_MODES, USE_DEPTH_GUIDE, configure_depth_estimator, neural_render, release_flow_model, unavailable_reason
 
 
 class DLSS5SpatialUpsampler(api.SimpleScaleSuffixMixin):
@@ -31,6 +31,19 @@ class DLSS5SpatialUpsampler(api.SimpleScaleSuffixMixin):
 
     def config(self):
         return api.read_config_section(self.server_config, self)
+
+    def query_download_defs(self, enabled_only=True):
+        from preprocessing.processors import query_preprocessor_download_def
+
+        definitions = [query_preprocessor_download_def("depth", self.server_config)] if USE_DEPTH_GUIDE else []
+        if self.config()["motion_vector"] == "raft":
+            definitions.append(query_preprocessor_download_def("flow", self.server_config))
+        return definitions
+
+    def download(self, process_files, *, send_cmd=None, status_text=None, gen=None, **_kwargs):
+        from shared.utils.download import process_files_def_if_needed
+
+        return process_files_def_if_needed(self.query_download_defs(), send_cmd=send_cmd, status_text=status_text or "Downloading DLSS 5 Model Files", gen=gen, process_files=process_files)
 
     @property
     def status(self):

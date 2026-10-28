@@ -1,5 +1,9 @@
 # Copyright (c) 2024-2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
-import enum    
+import enum
+from tqdm import tqdm
+
+__version__ = "4.4.1"
+
 class profile_type(int, enum.Enum): 
     @staticmethod
     def tostr(v):
@@ -23,4 +27,7 @@ class profile_type(int, enum.Enum):
     LowRAM_HighVRAM  = 3
     LowRAM_LowVRAM  = 4
     VerylowRAM_LowVRAM  = 5
+
+_welcome_message = f" Memory Management for the GPU Poor (mmgp {__version__}) - Copyright (c) 2024-2026 DeepBeepMeep "
+tqdm.write(f"\033[1m\033[95m{_welcome_message:*^100}\033[0m")
 

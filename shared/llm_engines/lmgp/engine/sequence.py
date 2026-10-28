@@ -59,6 +59,8 @@ class Sequence:
         self.prompt_embeds = prompt_embeds
         self.prompt_position_ids = prompt_position_ids
         self.position_offset = int(position_offset or 0)
+        self.overlay_slot = -1  # mixed-precision KV cache: the sequence's exact-overlay slot (layers.kv_formats), -1 without one
+        self.ring_high = 0  # highest position written to the cache + 1: the exact ring holds [ring_high - recent, ring_high)
 
     def __len__(self):
         return self.num_tokens

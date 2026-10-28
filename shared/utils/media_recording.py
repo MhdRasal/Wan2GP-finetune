@@ -8,7 +8,7 @@ from typing import Any, Callable
 
 from shared.utils.audio_metadata import save_audio_metadata
 from shared.utils.audio_video import save_image_metadata
-from shared.utils.gallery_sources import AUDIO, MESH, VIDEO, source_for_path
+from shared.utils.gallery_sources import AUDIO, MESH, VIDEO, WORLD, source_for_path
 from shared.utils.video_metadata import save_video_metadata
 from shared.utils.workspace_storage import recording_gallery
 
@@ -43,6 +43,9 @@ def record_file_metadata(video_path: str | list[str], configs: Any, is_image: bo
             if metadata_choice in ("metadata", "json_metadata"):
                 if audio_only:
                     save_audio_metadata(path, saved_configs)
+                elif source is WORLD:
+                    from shared.utils.world_outputs import save_world_metadata
+                    save_world_metadata(path, saved_configs)
                 elif source is MESH:
                     from shared.utils.mesh_outputs import save_mesh_metadata
                     save_mesh_metadata(path, saved_configs)
@@ -56,6 +59,8 @@ def record_file_metadata(video_path: str | list[str], configs: Any, is_image: bo
                 print(f"Audio file {action} Path: {path}")
             elif source is MESH:
                 print(f"3D asset {action} Path: {path}")
+            elif source is WORLD:
+                print(f"World {action} Path: {path}")
             elif is_image:
                 print(f"Image file {action} Path: {path}")
             else:

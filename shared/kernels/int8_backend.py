@@ -206,6 +206,24 @@ def wgp_linear(input, weight, bias=None, group=0, precise=False, act=None, act_w
     return out
 
 
+def wgp_group_scales(input, weight):
+    """Whether WGPKernels computes an INT8 weight with one FP32 scale per output channel and 128-column block (scale (N, K / 128)):
+    the selected backend, with a library taking such scales, on BF16/FP16 CUDA activations (K a multiple of 16)."""
+    return (_backend == "wgpkernels" and getattr(_wgp, "weight_groups_supported", lambda: False)() and input.is_cuda and input.dtype in (torch.bfloat16, torch.float16)
+            and weight.is_cuda and input.shape[-1] % 16 == 0)
+
+
+def wgp_group_linear(input, weight, scale, bias=None):
+    """input @ (weight (N, K) INT8 * scale (N, K / 128) per 128-column block).T + bias with WGPKernels, which choose the path per GPU and
+    shape as for the other INT8 weights."""
+    x = input.reshape(-1, input.shape[-1])
+    if bias is not None and bias.dtype != x.dtype:
+        bias = bias.to(x.dtype)
+    if torch.compiler.is_compiling() or triton._is_fake_tensor(input):
+        return torch.ops.wan2gp_wgp.linear(x, weight, scale, bias, 0, False).reshape(*input.shape[:-1], weight.shape[0])
+    return _wgp_run(x, weight, scale, bias, 0, False).reshape(*input.shape[:-1], weight.shape[0])
+
+
 def linear_fused(input, weight, bias, group, input_act, act_weight, act_eps, residual, residual_scale, out=None):
     """linear_with_fusion's computation by the active backend (ConvRot layers, see can_fuse_linear)."""
     global _fusion_logged
@@ -408,15 +426,16 @@ def linear_with_fusion(module, x, *, input_act=None, act_weight=None, act_eps=0.
 
 def _call_prepared(module, x, prepared):
     """module(x) with its input already prepared (and its output tile): the module's own hooks run, MMGP's weight loading included."""
-    previous = getattr(module, '_wangp_prequantized_input', None)
-    module._wangp_prequantized_input = prepared
+    target = module.qweight if module.weight_qtype.name == "qint8" else module  # Quanto's forward receives the weight, not the module
+    previous = getattr(target, '_wangp_prequantized_input', None)
+    target._wangp_prequantized_input = prepared
     try:
         module(x)
     finally:
         if previous is None:
-            del module._wangp_prequantized_input
+            del target._wangp_prequantized_input
         else:
-            module._wangp_prequantized_input = previous
+            target._wangp_prequantized_input = previous
 
 
 def _wgp_path(module, x, group, precise=False):
@@ -426,10 +445,10 @@ def _wgp_path(module, x, group, precise=False):
 
 
 def linear_multi(modules, x):
-    """Reuse one bounded ConvRot input tile across projections, retaining MMGP hooks."""
+    """Reuse one bounded INT8 input tile across projections, retaining MMGP hooks."""
     if _backend == "wgpkernels":
-        group = modules[0]._convrot_group_size
-        if any(module._convrot_group_size != group for module in modules):
+        group = getattr(modules[0], '_convrot_group_size', 0)
+        if any(getattr(module, '_convrot_group_size', 0) != group for module in modules):
             return [module(x) for module in modules]
         x = _wgp_aligned(x)
         outputs = [x.new_empty((x.shape[0], module.out_features)) for module in modules]
@@ -737,6 +756,9 @@ def _quanto_forward(ctx, input, weight, bias=None):
 def _wgp_quanto_forward(ctx, input, weight, bias=None):
     if _wgp_supports(input, weight):
         ctx.save_for_backward(input, weight)
+        prepared = weight.__dict__.get('_wangp_prequantized_input')
+        if prepared is not None:
+            return linear_prequantized(weight, bias, *prepared)
         fusion = weight.__dict__.get('_wangp_linear_fusion')  # set by linear_with_fusion for this call (plain INT8: rotation group 0)
         if fusion is None:
             return wgp_linear(input, weight, bias)

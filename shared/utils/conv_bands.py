@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-BAND_BYTES = 128 << 20
+BAND_BYTES = 32 << 20  # against 128 MB: VAE encode / decode peaks 0.1-0.4 GiB lower at the 1024 tile, a few % of VAE time either way
 
 
 def conv_bands(x, conv, upsample=False, mode="nearest", band_bytes=BAND_BYTES):

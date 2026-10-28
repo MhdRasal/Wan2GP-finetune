@@ -8,7 +8,7 @@ import math
 from typing import Any
 
 from postprocessing import audio_processors, spatial_upsamplers, temporal_upsamplers
-from postprocessing.processor_status import PROCESSOR_STATUS_DISABLED, PROCESSOR_STATUS_ENABLED, PROCESSOR_STATUS_UNKNOWN
+from postprocessing.processor_status import PROCESSOR_STATUS_DISABLED, PROCESSOR_STATUS_ENABLED, PROCESSOR_STATUS_UNKNOWN, handler_method_available
 
 
 PROCESS_TYPE_SPATIAL_UPSAMPLING = "spatial_upsampling"
@@ -111,7 +111,7 @@ def _spatial_processes(media_type: str, enabled_only: bool) -> list[dict[str, An
             continue
         multipliers_by_method = handler_def.get("multipliers", {})
         for label, method in handler_def.get("methods", ()):
-            if hasattr(handler, "method_available") and not handler.method_available(method):
+            if not handler_method_available(handler, method):
                 continue
             display_label = handler.format_method_label(label, method) if hasattr(handler, "format_method_label") else label
             multipliers = tuple(multipliers_by_method.get(method, ()))
@@ -132,6 +132,8 @@ def _temporal_processes(media_type: str, enabled_only: bool) -> list[dict[str, A
         reason_disabled = temporal_upsamplers.handler_reason_disabled(handler)
         multipliers_by_method = handler_def.get("multipliers", {})
         for label, method in handler_def.get("methods", ()):
+            if not handler_method_available(handler, method):
+                continue
             multipliers = tuple(multipliers_by_method.get(method, ()))
             inferred = [_multiplier_parameter(multipliers)] if multipliers else []
             description = _method_description(handler_def, method, f"Increase the video frame rate with {label} frame interpolation.")
@@ -176,6 +178,8 @@ def _audio_processes(media_type: str, enabled_only: bool) -> list[dict[str, Any]
             status = audio_processors.handler_status(handler)
             reason_disabled = audio_processors.handler_reason_disabled(handler)
             for label, method in handler_def.get("methods", ()):
+                if not handler_method_available(handler, method):
+                    continue
                 metadata = audio_processors.method_metadata(method)
                 if processor_type not in metadata["types"] or method in seen:
                     continue

@@ -170,13 +170,14 @@ def configure_engine_kernels(model, features):
 class TextEngine:
     keep_loaded_for_phase2 = True
 
-    def __init__(self, model, model_path: str, tokenizer, enforce_eager: bool = False, graph_pool_handle=None, kv_cache_int8: bool = False):
+    def __init__(self, model, model_path: str, tokenizer, enforce_eager: bool = False, graph_pool_handle=None, kv_cache_int8: bool = False, kv_cache_layout: str = "int8"):
         self.model = model
         self.model_path = model_path
         self.tokenizer = tokenizer
         self.enforce_eager = bool(enforce_eager)
         self.graph_pool_handle = graph_pool_handle
         self.kv_cache_int8 = bool(kv_cache_int8)
+        self.kv_cache_layout = str(kv_cache_layout or "int8")
         self._kv_cache_options = {}
         self.hf_config = getattr(model, "config", None)
         self._llm = None
@@ -270,6 +271,7 @@ class TextEngine:
             model_object=self.model,
             graph_pool_handle=self.graph_pool_handle,
             kv_cache_int8=self.kv_cache_int8,
+            kv_cache_layout=self.kv_cache_layout,
             **self._kv_cache_options,
         )
         self._sampling_params_cls = SamplingParams

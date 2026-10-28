@@ -5,6 +5,7 @@ import logging
 import torch
 from shared.utils.phase_progress import vae_encoding_progress, PhaseProgress, check_abort, set_phase_status
 from shared.cuda_memory import mmgp_vram_allocator
+from shared.kernels import vae_ops
 import torch.cuda.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
@@ -298,12 +299,8 @@ class AttentionBlock(nn.Module):
                                    -1).permute(0, 1, 3,
                                                2).contiguous().chunk(3, dim=-1))
 
-        # apply attention
-        x = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-        )
+        # apply attention (by chunks of queries where SDPA has no memory-efficient kernel for the VAE's dtype)
+        x = vae_ops.attention(q, k, v)
         x = x.squeeze(1).permute(0, 2, 1).reshape(b * t, c, h, w)
 
         # output
