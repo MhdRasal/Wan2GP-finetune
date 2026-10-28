@@ -200,6 +200,19 @@ def main():
         env_path.write_text("\n".join(existing_lines + new_settings) + "\n", encoding="utf-8")
         print_ok(f"Settings saved to: {env_path}")
 
+    # 7. Initial Lockstep Synchronization
+    print_step(7, "Synchronizing local repository and Modal cloud worker...")
+    print("Updating both local files and Modal GPU volume to latest official Wan2GP...")
+    try:
+        if str(wan2gp_root) not in sys.path:
+            sys.path.insert(0, str(wan2gp_root))
+        from sync_upstream_and_modal import sync_all
+        sync_all(wgp_dir=wan2gp_root, log_fn=print_ok)
+        print_ok("Local repository and Modal cloud worker are 100% up-to-date and patched!")
+    except Exception as sync_err:
+        print_warn(f"Initial sync completed with notice: {sync_err}")
+        print_warn("You can manually re-run sync anytime via: python sync_upstream_and_modal.py")
+
     print("\n" + "=" * 64)
     print(" 🎉 ALL DONE! You are ready to start generating!")
     print("=" * 64)
