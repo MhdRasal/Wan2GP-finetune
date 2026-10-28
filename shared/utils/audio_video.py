@@ -215,41 +215,98 @@ def slice_audio_window(audio_path, start_frame, num_frames, fps, output_dir=None
     return data, sample_rate
 
 
+def _probe_duration_and_layouts_ffmpeg(media_path):
+    try:
+        import subprocess, re
+        ffmpeg_bin = resolve_media_binary("ffmpeg") or "ffmpeg"
+        res = subprocess.run([ffmpeg_bin, "-i", os.fspath(media_path)], capture_output=True, text=True, timeout=5)
+        err = res.stderr or ""
+        dur_m = re.search(r'Duration:\s*(\d+):(\d+):(\d+\.?\d*)', err)
+        duration = None
+        if dur_m:
+            duration = float(dur_m.group(1)) * 3600 + float(dur_m.group(2)) * 60 + float(dur_m.group(3))
+        layouts = []
+        for line in err.splitlines():
+            if "Audio:" in line:
+                if "stereo" in line:
+                    layouts.append("Stereo")
+                elif "mono" in line:
+                    layouts.append("Mono")
+                else:
+                    m = re.search(r'(\d+)\s*channels?', line)
+                    layouts.append(f"{m.group(1)} channels" if m else "Audio track")
+        return duration, layouts
+    except Exception:
+        return None, []
+
+
 def get_audio_file_sample_rate(audio_path):
-    probe = ffmpeg.probe(os.fspath(audio_path), cmd=_ffprobe_binary())
-    audio_stream = next((stream for stream in probe["streams"] if stream.get("codec_type") == "audio"), None)
-    if audio_stream is None or not audio_stream.get("sample_rate"):
-        raise ValueError(f"Unable to read audio sample rate from {audio_path}")
-    return int(audio_stream["sample_rate"])
+    try:
+        probe = ffmpeg.probe(os.fspath(audio_path), cmd=_ffprobe_binary())
+        audio_stream = next((stream for stream in probe["streams"] if stream.get("codec_type") == "audio"), None)
+        if audio_stream is not None and audio_stream.get("sample_rate"):
+            return int(audio_stream["sample_rate"])
+    except Exception:
+        pass
+    try:
+        import subprocess, re
+        ffmpeg_bin = resolve_media_binary("ffmpeg") or "ffmpeg"
+        res = subprocess.run([ffmpeg_bin, "-i", os.fspath(audio_path)], capture_output=True, text=True, timeout=5)
+        m = re.search(r'(\d{4,6})\s*Hz', res.stderr or "")
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    return 44100
 
 
 def get_audio_file_channels(audio_path):
-    probe = ffmpeg.probe(os.fspath(audio_path), cmd=_ffprobe_binary())
-    audio_stream = next((stream for stream in probe["streams"] if stream.get("codec_type") == "audio"), None)
-    if audio_stream is None or not audio_stream.get("channels"):
-        raise ValueError(f"Unable to read audio channel count from {audio_path}")
-    return int(audio_stream["channels"])
+    try:
+        probe = ffmpeg.probe(os.fspath(audio_path), cmd=_ffprobe_binary())
+        audio_stream = next((stream for stream in probe["streams"] if stream.get("codec_type") == "audio"), None)
+        if audio_stream is not None and audio_stream.get("channels"):
+            return int(audio_stream["channels"])
+    except Exception:
+        pass
+    try:
+        import subprocess, re
+        ffmpeg_bin = resolve_media_binary("ffmpeg") or "ffmpeg"
+        res = subprocess.run([ffmpeg_bin, "-i", os.fspath(audio_path)], capture_output=True, text=True, timeout=5)
+        err = res.stderr or ""
+        if "stereo" in err:
+            return 2
+        elif "mono" in err:
+            return 1
+        m = re.search(r'(\d+)\s*channels?', err)
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    return 2
 
 
 def get_media_duration_and_audio_layouts(media_path):
     """Read file duration and each audio track's channel layout, without decoding."""
-    probe = ffmpeg.probe(os.fspath(media_path), cmd=_ffprobe_binary())
-    duration = probe.get("format", {}).get("duration")
-    duration = float(duration) if duration not in (None, "", "N/A") else None
-    layouts = []
-    for stream in probe.get("streams", []):
-        if stream.get("codec_type") != "audio":
-            continue
-        channels = int(stream.get("channels", 0))
-        layout = stream.get("channel_layout", "")
-        if channels in (1, 2):
-            label = "Mono" if channels == 1 else "Stereo"
-        elif channels:
-            label = f"{layout} ({channels} channels)" if layout and layout != "unknown" else f"{channels} channels"
-        else:
-            label = "Unknown channel layout"
-        layouts.append(label)
-    return duration, layouts
+    try:
+        probe = ffmpeg.probe(os.fspath(media_path), cmd=_ffprobe_binary())
+        duration = probe.get("format", {}).get("duration")
+        duration = float(duration) if duration not in (None, "", "N/A") else None
+        layouts = []
+        for stream in probe.get("streams", []):
+            if stream.get("codec_type") != "audio":
+                continue
+            channels = int(stream.get("channels", 0))
+            layout = stream.get("channel_layout", "")
+            if channels in (1, 2):
+                label = "Mono" if channels == 1 else "Stereo"
+            elif channels:
+                label = f"{layout} ({channels} channels)" if layout and layout != "unknown" else f"{channels} channels"
+            else:
+                label = "Unknown channel layout"
+            layouts.append(label)
+        return duration, layouts
+    except Exception:
+        return _probe_duration_and_layouts_ffmpeg(media_path)
 
 
 def resolve_mux_audio_sampling_rate(default_rate, source_audio_metadata=None, audio_paths=None):

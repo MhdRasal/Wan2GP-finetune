@@ -86,16 +86,33 @@ def _resample_frame_indices(video_fps, video_frames_count, max_target_frames_cou
     return frame_ids[:max_target_frames_count]
 
 
+def _is_binary_working(path: str) -> bool:
+    try:
+        res = subprocess.run([path, "-version"], capture_output=True, timeout=1.0)
+        return res.returncode == 0
+    except Exception:
+        return False
+
+
 def _resolve_media_binary(binary_name: str):
     env_map = {"ffmpeg": "FFMPEG_BINARY", "ffprobe": "FFPROBE_BINARY", "ffplay": "FFPLAY_BINARY"}
     binary_path = os.environ.get(env_map.get(binary_name, ""), "")
-    if len(binary_path) > 0 and os.path.isfile(binary_path):
+    if len(binary_path) > 0 and os.path.isfile(binary_path) and _is_binary_working(binary_path):
         return binary_path
     repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     candidate = os.path.join(repo_root, "ffmpeg_bins", binary_name + (".exe" if os.name == "nt" else ""))
-    if os.path.isfile(candidate):
+    if os.path.isfile(candidate) and _is_binary_working(candidate):
         return candidate
-    return shutil.which(binary_name + (".exe" if os.name == "nt" else "")) or shutil.which(binary_name)
+    sys_bin = shutil.which(binary_name + (".exe" if os.name == "nt" else "")) or shutil.which(binary_name)
+    if sys_bin and _is_binary_working(sys_bin):
+        return sys_bin
+    if binary_name == "ffmpeg":
+        try:
+            import imageio_ffmpeg
+            return imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            pass
+    return sys_bin or candidate
 
 
 def resolve_media_binary(binary_name: str):
