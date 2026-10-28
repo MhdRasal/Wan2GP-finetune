@@ -38,6 +38,23 @@ else
     PY_BIN="python"
 fi
 
+# Check if sync requested or AUTO_SYNC configured
+SHOULD_SYNC=false
+PASSTHROUGH_ARGS=()
+for arg in "$@"; do
+    if [ "$arg" = "--sync" ] || [ "$arg" = "--update" ]; then
+        SHOULD_SYNC=true
+    else
+        PASSTHROUGH_ARGS+=("$arg")
+    fi
+done
+
+if [ "$SHOULD_SYNC" = "true" ] || [ "${AUTO_SYNC:-false}" = "true" ] || [ "${AUTO_SYNC:-0}" = "1" ]; then
+    echo "[*] Synchronizing local repository and Modal cloud worker in lockstep..."
+    "$PY_BIN" sync_upstream_and_modal.py || echo "[!] Sync finished with warnings; continuing..."
+    echo ""
+fi
+
 # Check if provider is RunPod or Modal
 PROV_CHECK="${WAN2GP_CLOUD_PROVIDER:-${WAN2GP_DEFAULT_PROVIDER:-modal}}"
 if [[ "$*" =~ "runpod" ]] || [ "$PROV_CHECK" = "runpod" ]; then
@@ -67,4 +84,4 @@ if [[ ! "$*" =~ "--provider" ]]; then
     PROVIDER_FLAG="--provider $PROV_CHECK"
 fi
 
-"$PY_BIN" wgp.py --cloud $PROVIDER_FLAG $BROWSER_FLAG "$@"
+"$PY_BIN" wgp.py --cloud $PROVIDER_FLAG $BROWSER_FLAG "${PASSTHROUGH_ARGS[@]}"

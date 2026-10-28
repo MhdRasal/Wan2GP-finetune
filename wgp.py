@@ -48,7 +48,12 @@ if is_mps:
     apply_mps_patch()
 from shared.cuda_memory import apply_startup_settings, write_vram_debug_report, write_ram_debug_report, ram_debug_mark, release_ram_cache; apply_startup_settings(sys.argv, "wgp_config.json") # VRAM allocator and CUDA stack reserve, before anything initializes CUDA
 
-# Universal RoPE compatibility shim for transformers (fixes KeyError: 'default')
+# Universal RoPE & Runtime compatibility shims
+try:
+    from shared.patch_manager import ensure_runtime_shims
+    ensure_runtime_shims()
+except Exception:
+    pass
 try:
     import transformers.modeling_rope_utils as _rope_utils
     if hasattr(_rope_utils, "ROPE_INIT_FUNCTIONS") and "default" not in _rope_utils.ROPE_INIT_FUNCTIONS:
@@ -13952,6 +13957,25 @@ def generate_media_tab(update_form = False, state_dict = None, ui_defaults = Non
                                     os.environ["WAN2GP_CLOUD_PROVIDER"] = val
                                     return val
                                 cloud_provider_selector.change(_on_cloud_provider_change, inputs=[cloud_provider_selector], outputs=[])
+
+                            with gr.Row():
+                                sync_cloud_btn = gr.Button("🔄 Sync Local Repo & Cloud Worker (Dual Update)", size="sm", variant="secondary")
+                            sync_cloud_status = gr.Markdown(value="", visible=False)
+                            if not update_form:
+                                def _on_sync_cloud_click():
+                                    try:
+                                        from sync_upstream_and_modal import sync_all
+                                        logs = []
+                                        res = sync_all(log_fn=lambda m: logs.append(m))
+                                        local_c = str(res.get("local_commit", "ok"))[:8]
+                                        modal_c = str(res.get("modal_commit", "ok"))[:8]
+                                        return gr.Markdown(
+                                            value=f"✅ **Synchronized in Lockstep!**<br>• Local Repo Commit: `{local_c}`<br>• Modal Cloud Commit: `{modal_c}`<br>• LoRA mappings synced: {res.get('lora_count', 0)}",
+                                            visible=True
+                                        )
+                                    except Exception as e:
+                                        return gr.Markdown(value=f"❌ **Sync Error:** {e}", visible=True)
+                                sync_cloud_btn.click(_on_sync_cloud_click, inputs=[], outputs=[sync_cloud_status])
 
             if not update_form:
                 with gr.Row(visible=(tab_id == 'edit'), elem_classes=["wangp-settings-actions"] if floating_generate_button else None):

@@ -24,6 +24,22 @@ if exist "%~dp0.venv\Scripts\python.exe" (
     set "PY_BIN=python"
 )
 
+REM Check if sync requested via argument
+echo "%*" | findstr /I "\--sync" >nul 2>nul
+if %ERRORLEVEL% equ 0 (
+    echo [*] Synchronizing local repository and Modal cloud worker in lockstep...
+    "%PY_BIN%" sync_upstream_and_modal.py
+    echo.
+) else (
+    REM Check if AUTO_SYNC is set in .env
+    findstr /C:"AUTO_SYNC=\"true\"" .env >nul 2>nul
+    if %ERRORLEVEL% equ 0 (
+        echo [*] AUTO_SYNC active: Synchronizing local repo and cloud worker...
+        "%PY_BIN%" sync_upstream_and_modal.py
+        echo.
+    )
+)
+
 REM Check if .env is configured with Modal (unless RunPod is selected)
 findstr /C:"WAN2GP_DEFAULT_PROVIDER=\"runpod\"" .env >nul 2>nul
 if %ERRORLEVEL% equ 0 (

@@ -74,6 +74,12 @@ def apply_source_patches(wgp_dir: Path, log_fn=print):
     3. download_progress.py (adds **kwargs to _http_get & _xet_get).
     Can be called during container build time OR dynamically at runtime on volume code.
     """
+    try:
+        from shared.patch_manager import apply_source_patches as _shared_apply
+        _shared_apply(wgp_dir, log_fn=log_fn)
+        return
+    except Exception:
+        pass
     import re
     if not wgp_dir or not wgp_dir.exists():
         return
@@ -1224,11 +1230,21 @@ def update_wan2gp_volume_repo() -> Dict[str, str]:
     # Re-apply source patches directly to volume repo
     apply_source_patches(target_dir, log_fn=print)
 
+    # Obtain exact commit hash for lockstep verification
+    commit_hash = "unknown"
+    try:
+        c_res = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(target_dir), capture_output=True, text=True)
+        if c_res.returncode == 0:
+            commit_hash = c_res.stdout.strip()
+    except Exception:
+        pass
+
     models_volume.commit()
     return {
         "status": "ok",
         "git_message": git_msg,
-        "venv_python": str(venv_py)
+        "venv_python": str(venv_py),
+        "commit": commit_hash
     }
 
 # ---------------------------------------------------------------------------
