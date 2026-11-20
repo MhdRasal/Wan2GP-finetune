@@ -11,6 +11,14 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.nvidia.ampere import async_copy, mma_v2
 
+# Triton 3.9 renamed the builtin; resolve it once, outside the launch path.
+_async_load = getattr(async_copy, "async_load", None)
+if _async_load is None:
+    _async_load = async_copy.async_copy_global_to_shared
+_barrier = getattr(gl, "barrier", None)
+if _barrier is None:
+    _barrier = gl.thread_barrier
+
 
 @gluon.jit
 def _stage_cache(k_ptr, v_ptr, k_smem, v_smem, slot, head, H_KV: gl.constexpr, D: gl.constexpr, N: gl.constexpr):
@@ -18,8 +26,8 @@ def _stage_cache(k_ptr, v_ptr, k_smem, v_smem, slot, head, H_KV: gl.constexpr, D
     rows = gl.arange(0, N, layout=gl.SliceLayout(1, layout))
     dims = gl.arange(0, D, layout=gl.SliceLayout(0, layout))
     offsets = ((slot + rows[:, None]) * H_KV + head) * D + dims[None, :]
-    async_copy.async_copy_global_to_shared(k_smem, k_ptr + offsets)
-    async_copy.async_copy_global_to_shared(v_smem, v_ptr + offsets)
+    _async_load(k_smem, k_ptr + offsets)
+    _async_load(v_smem, v_ptr + offsets)
     async_copy.commit_group()
 
 
@@ -69,7 +77,7 @@ def q8_prefill_async_kernel(
         k_smem = k_buffers.index(stage)
         v_smem = v_buffers.index(stage)
         async_copy.wait_group(0)
-        gl.thread_barrier()
+        _barrier()
         page = gl.load(tables_ptr + sequence * bt_stride + start // PAGE)
         token = start % PAGE
         next_start = start + N
@@ -109,15 +117,15 @@ def q8_prefill_async_kernel(
         accumulator = mma_v2(p_low, v_low, accumulator)
         maximum = next_maximum
         # All readers finish before a pipeline slot can be overwritten.
-        gl.thread_barrier()
+        _barrier()
     dims = gl.arange(0, D, layout=gl.SliceLayout(0, MMA))
     gl.store(out_ptr + (q_start + rows[:, None]) * out_stride_t + head * out_stride_h + dims[None, :], accumulator / denominator[:, None], mask=rows[:, None] < q_len)
 
 
 @gluon.jit(do_not_specialize=("Q_PER_SEQ", "TABLE_WIDTH"), do_not_specialize_on_alignment=("Q_PER_SEQ", "TABLE_WIDTH"))
-def q8_grouped_async_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tables_ptr, lengths_ptr, partial_ptr, maximum_ptr, sum_ptr,
+def q8_grouped_async_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tables_ptr, lengths_ptr, partial_ptr, maximum_ptr, sum_ptr, tree_ptr,
                          Q_PER_SEQ, H_Q: gl.constexpr, H_KV: gl.constexpr, D: gl.constexpr, PAGE: gl.constexpr,
-                         TABLE_WIDTH, SPLITS: gl.constexpr, SCALE: gl.constexpr):
+                         TABLE_WIDTH, SPLITS: gl.constexpr, SCALE: gl.constexpr, TREE: gl.constexpr):
     M: gl.constexpr = 16
     N: gl.constexpr = 32
     STAGES: gl.constexpr = 1
@@ -146,6 +154,8 @@ def q8_grouped_async_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tables_ptr, len
     v_buffers = gl.allocate_shared_memory(gl.int8, [STAGES, N, D], gl.NVMMASharedLayout(swizzle_byte_width=128, element_bitwidth=8))
     context_len = gl.load(lengths_ptr + sequence)
     prefix_len = context_len - Q_PER_SEQ
+    if TREE:  # tree verification: each row sees the prefix and the verify rows marked in its ancestor bits (itself included)
+        ancestors = gl.load(tree_ptr + sequence * Q_PER_SEQ + rows // group, mask=rows < Q_PER_SEQ * group, other=0)
     tiles_per_split = gl.cdiv(gl.cdiv(context_len, N), SPLITS)
     begin = split * tiles_per_split * N
     end = gl.minimum(context_len, (split + 1) * tiles_per_split * N)
@@ -158,7 +168,7 @@ def q8_grouped_async_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tables_ptr, len
         stage = iteration % STAGES
         k_smem, v_smem = k_buffers.index(stage), v_buffers.index(stage)
         async_copy.wait_group(0)
-        gl.thread_barrier()
+        _barrier()
         page = gl.load(tables_ptr + sequence * TABLE_WIDTH + start // PAGE)
         token = start % PAGE
         next_start = start + N
@@ -171,7 +181,12 @@ def q8_grouped_async_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tables_ptr, len
         k_low = (k - k_high.to(gl.float32)).to(q.dtype)
         scores = mma_v2(q, k_high, gl.full((M, N), 0, gl.float32, layout=MMA))
         scores = mma_v2(q, k_low, scores) * SCALE
-        valid = (rows[:, None] < Q_PER_SEQ * group) & (start + columns[None, :] < end) & (start + columns[None, :] <= prefix_len + rows[:, None] // group)
+        if TREE:
+            local = start + columns - prefix_len
+            visible = (local[None, :] < 0) | (((ancestors[:, None] >> gl.maximum(local, 0)[None, :].to(gl.int64)) & 1) != 0)
+            valid = (rows[:, None] < Q_PER_SEQ * group) & (start + columns[None, :] < end) & visible
+        else:
+            valid = (rows[:, None] < Q_PER_SEQ * group) & (start + columns[None, :] < end) & (start + columns[None, :] <= prefix_len + rows[:, None] // group)
         scores = gl.where(valid, scores, -1.0e20)
         next_maximum = gl.maximum(maximum, gl.max(scores, 1))
         correction = gl.exp2((maximum - next_maximum) * 1.4426950408889634)
@@ -191,7 +206,7 @@ def q8_grouped_async_kernel(q_ptr, k_ptr, v_ptr, ks_ptr, vs_ptr, tables_ptr, len
         accumulator = mma_v2(p_high, v_low, accumulator)
         accumulator = mma_v2(p_low, v_low, accumulator)
         maximum = next_maximum
-        gl.thread_barrier()
+        _barrier()
         if more:
             _stage_cache(k_ptr, v_ptr, k_buffers.index(0), v_buffers.index(0), next_slot, kv_head, H_KV, D, N)
     dims = gl.arange(0, D, layout=gl.SliceLayout(0, MMA))
@@ -210,12 +225,12 @@ def q8_paged_prefill(q, k_cache, v_cache, k_scale, v_scale, context, softmax_sca
     return output
 
 
-def q8_grouped_partials(q, k_cache, v_cache, k_scale, v_scale, block_tables, context_lens, partial, maximum, denominator, splits, softmax_scale):
+def q8_grouped_partials(q, k_cache, v_cache, k_scale, v_scale, block_tables, context_lens, partial, maximum, denominator, splits, softmax_scale, tree_mask=None):
     queries = q.shape[0] // context_lens.numel()
     query_rows = queries * (q.shape[1] // k_cache.shape[2])
     q8_grouped_async_kernel[(context_lens.numel(), k_cache.shape[2], triton.cdiv(query_rows, 16) * splits)](
-        q, k_cache, v_cache, k_scale, v_scale, block_tables, context_lens, partial, maximum, denominator,
-        queries, q.shape[1], k_cache.shape[2], q.shape[2], k_cache.shape[1], block_tables.shape[1], splits, softmax_scale, num_warps=4, num_stages=1)
+        q, k_cache, v_cache, k_scale, v_scale, block_tables, context_lens, partial, maximum, denominator, context_lens if tree_mask is None else tree_mask,
+        queries, q.shape[1], k_cache.shape[2], q.shape[2], k_cache.shape[1], block_tables.shape[1], splits, softmax_scale, tree_mask is not None, num_warps=4, num_stages=1)
 
 
 # Import-time registration also covers direct module use and CUDA graph warmup.

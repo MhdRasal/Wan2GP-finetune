@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from . import kernel_policy, ops, native_ops, video_kitchen as _kitchen
 from .dispatch import choose, cuda_inference, take
+from shared.utils.conv_bands import is_banded
 
 try:
     from . import video_triton as _video
@@ -25,6 +26,18 @@ try:
     from . import group_norm_silu as _norm_silu
 except (ImportError, OSError, RuntimeError):
     _norm_silu = None
+try:
+    from . import sparse_conv_triton as _sparse
+except (ImportError, OSError, RuntimeError):
+    _sparse = None
+try:
+    from . import causal_group_norm_triton as _causal
+except (ImportError, OSError, RuntimeError):
+    _causal = None
+try:
+    from . import causal_pad_triton as _causal_pad
+except (ImportError, OSError, RuntimeError):
+    _causal_pad = None
 
 _AUDIO_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 
@@ -154,6 +167,272 @@ def group_norm_silu(x, norm, dtype, chunk_bytes=256 << 20):
     for start in range(0, norm.num_groups, groups):
         c0, c1 = start * step, min(norm.num_groups, start + groups) * step
         out[:, c0:c1] = silu_(F.group_norm(x[:, c0:c1].float(), (c1 - c0) // step, norm.weight[c0:c1].float(), norm.bias[c0:c1].float(), norm.eps), chunk_bytes)
+    return out
+
+
+def image_norm_conv_supported(x, norm):
+    """Whether whole-image statistics + bounded normalized strips preserve this autocast path."""
+    valid = (torch.is_autocast_enabled(x.device.type) and _norm_silu is not None and norm.affine
+             and _norm_silu.strips_eligible(x, norm.num_groups, torch.get_autocast_dtype(x.device.type)))
+    return choose("Image Norm + Conv Strips", owned_triton=valid) is not None
+
+
+IMAGE_BAND_BYTES = 32 << 20
+
+
+def image_norm_conv_is_banded(x, band_bytes=IMAGE_BAND_BYTES):
+    """Whether a 16-bit normalized image exceeds the strip budget; smaller images need no interleaved workspace."""
+    return x.numel() * 2 > band_bytes
+
+
+def image_norm_conv_bands(x, norm, conv, band_bytes=IMAGE_BAND_BYTES, out=None, add=False):
+    """Yield (first,last,conv_band) with global GN + SiLU before a 3x3, stride-1, padding-1 convolution.
+    x is borrowed. Eligibility is checked by the caller. All statistics are read before the first yield; a one-row halo on each
+    side gives every convolution its original inputs. Call the module itself so MMGP still owns its weight loading and hooks.
+    A caller overwriting x must retain its last written row until the following band has consumed that row's halo.
+    A convolution prepared by band_convs computes the band's own rows only (no halo output rows) and, with out, writes them into
+    out's rows first..last (added to them with add): the yielded band is then that view of out."""
+    windows = is_banded(conv)
+    n, c, height, width = x.shape
+    dtype = torch.get_autocast_dtype(x.device.type)
+    row_bytes = n * c * width * 2  # eligible output types are both 16-bit
+    affine = _norm_silu.image_affine(x, norm.num_groups, norm.weight, norm.bias, norm.eps)
+    rows = height if height * row_bytes <= band_bytes else max(1, band_bytes // row_bytes - 2)
+    for start in range(0, height, rows):
+        stop = min(height, start + rows)
+        lo, hi = max(0, start - 1), min(height, stop + 1)
+        band = _norm_silu.image_rows(x, affine, lo, hi, dtype)
+        if windows:
+            band = conv(band, window=(start - lo, stop - start), out=out, out_row=0 if out is None else start, add=add)
+            band = band if out is None else out[:, :, start:stop]
+        else:
+            band = conv(band)[:, :, start-lo:stop-lo]
+        yield start, stop, band
+        del band
+
+
+def image_norm_conv(x_list, norm, conv, *, out=None, add=False):
+    """Consume x_list through image_norm_conv_bands. out is borrowed, disjoint from x, optionally a residual updated in place."""
+    x = take(x_list)
+    if is_banded(conv):  # the convolution writes (or adds) each band's rows in place: neither band copies nor a separate add
+        if out is None and image_norm_conv_is_banded(x):
+            out = torch.empty((x.shape[0], conv.out_channels, x.shape[2], x.shape[3]), dtype=torch.get_autocast_dtype(x.device.type),
+                              device=x.device, memory_format=torch.channels_last)
+        for _, _, band in image_norm_conv_bands(x, norm, conv, out=out, add=add):
+            pass
+        return band if out is None else out
+    for start, stop, band in image_norm_conv_bands(x, norm, conv):
+        if out is None:
+            if start == 0 and stop == x.shape[2]:
+                return band  # the whole result already exists; no destination allocation or copy is needed
+            out = torch.empty((x.shape[0], band.shape[1], x.shape[2], band.shape[3]), dtype=band.dtype,
+                              device=band.device, memory_format=torch.channels_last)
+        target = out[:, :, start:stop]
+        target.add_(band) if add else target.copy_(band)
+        del band
+    return out
+
+
+SPARSE_SCRATCH_BYTES = 256 << 20  # bound of the gathered neighbor rows (PyTorch) or of the neighbor map computed per launch (kernel)
+
+
+def sparse_conv(feats, level, weight, bias, *, rowmap=None, affine=None, residual=None, out=None, rows=None):
+    """Submanifold 3x3x3 convolution of feats (N, Ci) 16-bit over the voxels of level (len(level) rows; level.neighbors(start, stop):
+    their neighbor rows (rows, 27) int32 in FlexGEMM's tap order, -1 for inactive sites; level.cache["neighbors"]: the whole map when
+    kept), weight (Co, 3, 3, 3, Ci), bias (Co,) or None. rowmap (len(level),): the feats row of each voxel (features on a coarser level),
+    None when feats are the level's rows. affine: (scale, shift) FP32 (Ci,) of a group norm applied with SiLU to the neighbor features (in
+    FP32, rounded to the activation dtype; inactive sites stay zero). residual: (len(level), Co) or a callable (start, stop) -> rows,
+    added to the rounded convolution. out: the destination (len(level), Co), else a new tensor. rows: (start, stop), the output rows
+    of these voxels alone (out and a residual tensor then hold stop - start rows; a callable residual still takes voxel indices).
+    feats, weights and residual are borrowed. The WanGP implicit GEMM (shared.kernels.sparse_conv_triton: no gathered copy, FP32
+    accumulation over all taps), else the gathered rows and addmm by chunks of rows."""
+    first, last = (0, len(level)) if rows is None else rows
+    co = weight.shape[0]
+    out = feats.new_empty((last - first, co)) if out is None else out
+    flat = weight.reshape(co, -1)
+    # the kernel walks the input channels by K steps of 32 or 64
+    if choose("Sparse Conv3D", owned_triton=_sparse is not None and cuda_inference(feats, dtypes=_DTYPES) and feats.is_contiguous() and feats.shape[1] % 32 == 0):
+        full = level.cache.get("neighbors")
+        if full is not None and not callable(residual):
+            return _sparse.conv_(feats, full, flat, bias, out, rowmap=rowmap, affine=affine, residual=residual, rows=last - first, neighbor_offset=first)
+        # a chunk's neighbor map is looked up through int64 keys and positions (about 32 bytes per entry) unless the level keeps it whole
+        step = max(1, SPARSE_SCRATCH_BYTES // ((27 * 32 if full is None else 0) + (co * feats.element_size() if callable(residual) else 0)))
+        for start in range(first, last, step):
+            stop = min(start + step, last)
+            neighbors = level.neighbors(start, stop) if full is None else full
+            part = residual(start, stop) if callable(residual) else residual
+            _sparse.conv_(feats, neighbors, flat, bias, out, rowmap=rowmap, affine=affine, residual=part, rows=stop - start,
+                          neighbor_offset=0 if full is None else start, out_offset=start - first, residual_offset=0 if callable(residual) else start - first)
+            del neighbors, part
+        return out
+    channels = feats.shape[1]
+    step = max(1, SPARSE_SCRATCH_BYTES // (27 * channels * (4 + feats.element_size() if affine is not None else feats.element_size())))
+    for start in range(first, last, step):
+        stop = min(start + step, last)
+        neighbors = level.neighbors(start, stop)
+        index = neighbors.clamp(min=0)
+        cols = feats.index_select(0, (index if rowmap is None else rowmap[index]).view(-1)).view(stop - start, 27, channels)
+        if affine is not None:
+            cols = F.silu(cols.float().mul_(affine[0]).add_(affine[1]), inplace=True).to(feats.dtype)
+        cols.masked_fill_((neighbors < 0).unsqueeze(-1), 0)
+        rows_out = torch.addmm(bias, cols.view(stop - start, -1), flat.t()) if bias is not None else cols.view(stop - start, -1) @ flat.t()
+        del cols, index, neighbors
+        if residual is not None:
+            rows_out.add_(residual(start, stop) if callable(residual) else residual[start - first:stop - first])
+        out[start - first:stop - first] = rows_out
+    return out
+
+
+def channel_moments(x):
+    """(2, C) FP64 sums of x and of x^2 per channel of x (N, C), x borrowed: statistics of a group norm over voxels. The WanGP kernel
+    reads x once (FP64 partial sums of exact 16-bit products), PyTorch by chunks of rows (FP32 squares summed in FP64)."""
+    if choose("Channel Moments", owned_triton=_sparse is not None and cuda_inference(x, dtypes=_DTYPES) and x.is_contiguous()):
+        return _sparse.moments(x)
+    sums = torch.zeros((2, x.shape[1]), dtype=torch.float64, device=x.device)
+    rows = max(1, (64 << 20) // (x.shape[1] * 4))
+    for start in range(0, x.shape[0], rows):
+        part = x[start:start + rows].float()
+        sums[0] += part.sum(0, dtype=torch.float64)
+        sums[1] += part.square().sum(0, dtype=torch.float64)  # not in place: part is x itself for FP32 features
+        del part
+    return sums
+
+
+def replicate_conv_kernels(device):
+    """The Triton kernels of replicate_padded_conv3d serve 16-bit activations on device ("fast" kernel precision, compute capability
+    8.0+); else PyTorch's layers."""
+    device = torch.device(device)
+    return _causal_pad is not None and device.type == "cuda" and kernel_policy.allow_approximate() and _causal_pad.supported(device)
+
+
+def replicate_padded_conv3d(x, conv, pad, head=None, residual=None, norm=None):
+    """conv (stride 1, no padding of its own) of x (batch, channels, frames, height, width), or of silu(norm(x)) with an RMS norm over
+    the channels (a module with gamma and scale, no bias), replicate-padded in space by pad = (left, right, top, bottom, front) and
+    before its first frame by `front` copies of it, or preceded by `head` instead: the tail of the previous chunk of a streamed clip (a
+    causal convolution). residual (the output's shape) is added to the output. Returns (output, tail): tail = the last frames of the
+    convolution's input, at most `front`, without the spatial padding, for the next chunk.
+    "fast" kernel precision: the norm, SiLU, padding and tail in one pass written channels last (causal_pad_triton), and the Triton
+    convolution where it is the faster one (conv3d_triton.conv_eligible): the output is then channels last. Else PyTorch's layers, the
+    chunk written once into the padded input (no F.pad copy, no concatenation). x and residual are borrowed."""
+    left, right, top, bottom, front = pad
+    batch, channels, frames, height, width = x.shape
+    fast = cuda_inference(x, dtypes=_DTYPES, approximate=True)
+    pad_kernel = (fast and _causal_pad is not None and _causal_pad.supported(x.device) and left == right and top == bottom
+                  and (norm is None or not isinstance(norm.bias, torch.Tensor)))
+    conv_kernel = (fast and _conv is not None and batch * frames * height * width >= _conv._CONV_MIN_PIXELS
+                   and conv.groups == 1 and conv.dilation == (1, 1, 1) and conv.padding == (0, 0, 0) and conv.stride == (1, 1, 1)
+                   and conv.kernel_size == (front + 1, top + bottom + 1, left + right + 1) and channels % 32 == 0 and conv.out_channels % 32 == 0
+                   and conv.bias is not None and conv.weight.dtype == x.dtype and conv.weight.device == x.device and _conv.conv_supported(x.device))
+    conv_family = choose("Streamed Conv3D", triton=conv_kernel)
+    if choose("Causal Norm + SiLU + Pad", owned_triton=pad_kernel) is not None:
+        padded, tail = _causal_pad.causal_pad(x, (left, right, top, bottom, front, 0), head, norm, front, replicate=True)
+    else:
+        if norm is not None:
+            x = F.silu(norm(x).to(x.dtype), inplace=True)
+        padded = torch.empty((batch, channels, front + frames, top + height + bottom, left + width + right), dtype=x.dtype, device=x.device,
+                             memory_format=torch.channels_last_3d if conv_family is not None else torch.contiguous_format)
+        inner = padded[:, :, :, top:top + height, left:left + width]
+        inner[:, :, front:] = x
+        kept = 0 if head is None else head.shape[2]
+        if kept:
+            inner[:, :, front - kept:front] = head
+        if kept < front:
+            inner[:, :, :front - kept] = inner[:, :, front - kept:front - kept + 1]
+        if top:
+            padded[:, :, :, :top, left:left + width] = padded[:, :, :, top:top + 1, left:left + width]
+        if bottom:
+            padded[:, :, :, top + height:, left:left + width] = padded[:, :, :, top + height - 1:top + height, left:left + width]
+        if left:
+            padded[..., :left] = padded[..., left:left + 1]
+        if right:
+            padded[..., left + width:] = padded[..., left + width - 1:left + width]
+        tail = inner[:, :, padded.shape[2] - front:].clone() if front else None
+    if conv_family is not None:
+        return _conv.conv(padded, conv.weight, conv.bias, residual), tail
+    out = conv(padded)
+    return (out if residual is None else out.add_(residual)), tail
+
+
+CAUSAL_NORM_BYTES = 64 << 20  # FP32 working copy of causal_group_norm_silu_pad's PyTorch route, per slice of channels
+
+
+def causal_norm_kernels(x):
+    """The Triton kernels of causal_group_norm_silu_pad serve x ("fast" kernel precision, CUDA compute capability 8.0+)."""
+    return _causal is not None and x.is_cuda and kernel_policy.allow_approximate() and _causal.supported(x.device)
+
+
+def _causal_moments(x, groups, shared):
+    """FP64 (rows, 3) count, mean and sum of squared deviations of each group of x (batch, channels, frames, height, width), rows =
+    batch * groups, or groups when shared (the batch items are parts of one video). Each channel is summed in FP32 by the reduction
+    kernels (no copy of x), the channels of a group in FP64."""
+    batch, channels = x.shape[:2]
+    total = x.sum((2, 3, 4), dtype=torch.float32).double().view(batch, groups, -1).sum(2)
+    squares = torch.linalg.vector_norm(x, 2, (2, 3, 4), dtype=torch.float32).double().square_().view(batch, groups, -1).sum(2)
+    if shared:
+        total, squares = total.sum(0), squares.sum(0)
+    count = x.numel() // total.numel()
+    mean = total / count
+    return torch.stack((torch.full_like(mean, count), mean, (squares - total * mean).clamp_(min=0)), -1).view(-1, 3)
+
+
+def causal_group_norm_silu_pad(x, norm, pad=(0, 0, 0, 0, 0, 0), silu=True, running=None, frozen=False, shared=False, out=None, out_frame=0, apply=True):
+    """silu(norm(x)) of x (batch, channels, frames, height, width), replicate-padded by pad = (left, right, top, bottom, front, back) as
+    F.pad: the input of a causal 3x3x3 convolution of the GroupNorm video VAEs, as a new tensor of x's dtype or written from frame
+    out_frame of out. running: FP64 (batch * groups, 3) count, mean and sum of squared deviations of the previous chunks of a streamed
+    decode, merged with x's statistics (and updated) before normalizing, or used as given when frozen. shared: the batch items are parts
+    of one video, normalized with statistics merged over all of them (running: (groups, 3)). apply=False only merges x's statistics
+    into running. x is borrowed.
+    PyTorch route: the per-channel affine a * x + b in FP32 by slices of channels of at most CAUSAL_NORM_BYTES, rounded once to x's
+    dtype, PyTorch's SiLU in place, the padding written into the output (no padded copy)."""
+    if causal_norm_kernels(x):
+        return _causal.group_norm_silu_pad(x, norm, pad, silu, running, frozen, shared, out, out_frame, apply)
+    batch, channels, frames, height, width = x.shape
+    groups = norm.num_groups
+    if frozen:
+        stats = running
+    else:
+        stats = _causal_moments(x, groups, shared)
+        if running is not None:  # merged into the statistics of the chunks so far (Chan)
+            count, mean, m2 = stats.unbind(1)
+            total = running[:, 0] + count
+            delta = mean - running[:, 1]
+            running[:, 2] += m2 + delta * delta * (running[:, 0] * count / total)
+            running[:, 1] += delta * (count / total)
+            running[:, 0] = total
+            stats = running
+    if not apply:
+        return None
+    mean = stats[:, 1].float().to(x.dtype).float()  # the mean and 1 / std rounded to the activation dtype, as PyTorch stores them
+    rstd = (stats[:, 2] / stats[:, 0]).float().clamp_(min=0).add_(norm.eps).rsqrt_().to(x.dtype).float()
+    a = rstd.repeat_interleave(channels // groups).view(-1, channels) * norm.weight.float()
+    b = norm.bias.float() - a * mean.repeat_interleave(channels // groups).view(-1, channels)
+    a, b = a[:, :, None, None, None], b[:, :, None, None, None]
+    left, right, top, bottom, front, back = pad
+    if out is None:
+        out = x.new_empty(batch, channels, frames + front + back, height + top + bottom, width + left + right)
+    target = out[:, :, out_frame:out_frame + front + frames + back]
+    body = target[:, :, front:front + frames]
+    inner = body[:, :, :, top:top + height, left:left + width]
+    step = max(1, CAUSAL_NORM_BYTES // (4 * batch * frames * height * width))
+    for start in range(0, channels, step):
+        part = slice(start, start + step)
+        y = x[:, part].to(torch.float32, copy=True).mul_(a[:, part]).add_(b[:, part])
+        inner[:, part] = y
+        del y
+        if silu:
+            F.silu(inner[:, part], inplace=True)
+    if top:
+        body[:, :, :, :top, left:left + width] = body[:, :, :, top:top + 1, left:left + width]
+    if bottom:
+        body[:, :, :, top + height:, left:left + width] = body[:, :, :, top + height - 1:top + height, left:left + width]
+    if left:
+        body[..., :left] = body[..., left:left + 1]
+    if right:
+        body[..., left + width:] = body[..., left + width - 1:left + width]
+    if front:
+        target[:, :, :front] = body[:, :, :1]
+    if back:
+        target[:, :, front + frames:] = body[:, :, -1:]
     return out
 
 

@@ -353,6 +353,21 @@ def _json_safe(value: Any) -> Any:
     return str(value)
 
 
+def _tool_arguments_as_mappings(messages: list[Any]) -> list[Any]:
+    """Sessions saved after a turn of an external engine hold its tool-call arguments as JSON text: the local engines' chat templates
+    read them as a mapping."""
+    for message in messages:
+        for call in (message.get("tool_calls") or []) if isinstance(message, dict) else []:
+            function = call.get("function") if isinstance(call, dict) else None
+            if isinstance(function, dict) and isinstance(function.get("arguments"), str):
+                try:
+                    arguments = json.loads(function["arguments"] or "{}")
+                except json.JSONDecodeError:
+                    arguments = None
+                function["arguments"] = arguments if isinstance(arguments, dict) else {}
+    return messages
+
+
 def _read_json(path: Path) -> dict[str, Any]:
     try:
         # Windows cannot replace a file while another thread has it open.
@@ -415,6 +430,30 @@ def _compact_replay_event_classes(event: dict[str, Any]) -> dict[str, Any]:
     if str(event.get("type", "") or "") == "upsert_block" and isinstance(event.get("html"), str):
         event["html"] = _compact_replay_html_classes(event["html"])
     return event
+
+
+def read_ui_updates(directory: str | os.PathLike, after: int = 0) -> dict[str, Any]:
+    """What Deepy's window needs to show a saved conversation: the updates its journal gained since `after` (a position in the file, 0 for all of it),
+    each message and block at its latest. A journal that went back (the conversation was rewound) starts again, with `restart`."""
+    path = Path(directory) / UI_JOURNAL_FILENAME
+    if not path.is_file():
+        return {"next": 0, "restart": after > 0, "events": []}
+    restart = after > path.stat().st_size
+    with path.open("rb") as file:
+        file.seek(0 if restart else after)
+        data = file.read()
+    data = data[:data.rfind(b"\n") + 1]  # a line still being written waits for the next call
+    latest: dict[tuple, dict[str, Any]] = {}
+    for line in data.splitlines():
+        event = json.loads(line).get("event") or {}
+        if event.get("type") == "upsert_message":  # it holds its blocks
+            latest = {key: value for key, value in latest.items() if key[0] != event["message"]["id"]}
+            latest[(event["message"]["id"], "")] = event
+        elif event.get("type") == "upsert_block":
+            latest[(event["message_id"], event["block_id"])] = event
+        elif event.get("type") in ("remove_message", "remove_block"):
+            latest[(event["message_id"], event.get("block_id") or "", "removed", len(latest))] = event
+    return {"next": (0 if restart else after) + len(data), "restart": restart, "events": list(latest.values())}
 
 
 def _read_ui_journal(directory: Path, *, max_sequence: int | None = None) -> tuple[list[dict[str, Any]], int, int]:
@@ -1237,7 +1276,7 @@ def load_session(session, storage_id: str, deepy_type: str) -> dict[str, Any]:
     session.gallery_workspace_id = str(manifest.get("gallery_workspace_id", "") or "")
     session.session_environment = _json_safe(context.get("environment", {}))
     session.chat_session_id = storage_id
-    session.messages = list(chat.get("messages", []) or [])
+    session.messages = _tool_arguments_as_mappings(list(chat.get("messages", []) or []))
     session.chat_turn_durations = dict(durations)
     session.chat_transcript = list(chat.get("transcript", []) or [])
     for record_index, record in enumerate(session.chat_transcript):

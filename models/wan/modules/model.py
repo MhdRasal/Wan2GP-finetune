@@ -25,8 +25,12 @@ from ..steadydancer.small_archs import FactorConv3d, PoseRefNetNoBNV3
 from ..steadydancer.mobilenetv2_dcd import DYModule
 from ..shotplan import inject_shotplan_tokens
 from ..animate2 import animate2_attention_block, animate2_cached_attention_block, load_cached as animate2_load_cached, store_kv as animate2_store_kv
+from ..taomate import audio_attention as taomate_audio_attention
 
 __all__ = ['WanModel']
+HEAD_CHUNK_ROWS = 8192  # rows of the output head per chunk while the attention heads are split
+FFN_BY_ROWS = True  # comparison switch: False makes the FFN's normed and modulated input whole first
+CROSS_BY_CHUNKS = True  # comparison switch: False runs the text cross attention on all tokens at once (WanT2VCrossAttention.add_by_chunks_)
 
 
 def sinusoidal_embedding_1d(dim, position):
@@ -64,6 +68,16 @@ def modulate_frames(x, norm, shift, scale, dtype=None):
     borrowed; the norm output cast to dtype first when given."""
     segments = frame_segments(x.shape[0], x.shape[1], shift.shape[1])
     return kernels.norm_modulate([x.view(-1, x.shape[-1])], norm, shift[0], scale[0], segments, dtype=dtype).view(x.shape)
+
+def modulate_frames_rows(x, norm, shift, scale, dtype):
+    """modulate_frames(x, norm, shift, scale).to(dtype) as an mmgp RowSource made by ranges of rows of (batch * tokens, dim), for an
+    FFN that reads it chunk by chunk (shared.kernels.ops.mlp): never whole beside x. Rows as from the whole (row-wise operations)."""
+    rows, segments = x.view(-1, x.shape[-1]), frame_segments(x.shape[0], x.shape[1], shift.shape[1])
+
+    def fill(start, stop):
+        spans = [(max(first, start) - start, min(last, stop) - start, row) for first, last, row in segments if first < stop and last > start]
+        return kernels.norm_modulate([rows[start:stop]], norm, shift[0], scale[0], spans).to(dtype)
+    return offload.RowSource(x.shape, dtype, x.device, fill)
 
 def gated_frames_(x, y_list, gate):
     """x += y * gate per latent frame, in place (gate (1, frames, dim), y handed off in y_list); returns x."""
@@ -351,7 +365,9 @@ class WanSelfAttention(nn.Module):
         return kernels.gated_linear(self.o, x_list, rows, gate, frame_segments(residual.shape[0], residual.shape[1], gate.shape[0])).view(residual.shape)
 
     def _norm_rope_(self, query, key, group, freqs):
-        """attention_kit callback: norm_q/norm_k (over all heads) and RoPE of q and/or k in place."""
+        """attention_kit callback: norm_q/norm_k (over all heads) and RoPE of q and/or k in place (the tokens of group.rows when given)."""
+        if group.rows is not None:
+            freqs = (freqs[0][group.rows.start:group.rows.stop], freqs[1][group.rows.start:group.rows.stop])
         for tensor, norm, heads, index in ((query, self.norm_q, group.q, 0), (key, self.norm_k, group.kv, 1)):
             if tensor is None:
                 continue
@@ -359,8 +375,7 @@ class WanSelfAttention(nn.Module):
             if group.mean_squares is None:
                 norm(rows)
             else:
-                rows.mul_(group.mean_squares[index].add(norm.eps).rsqrt_())
-                rows.mul_(norm.weight[heads.start * self.head_dim:heads.stop * self.head_dim])
+                kernels.mean_square_scale_(rows, group.mean_squares[index], norm.eps, norm.weight[heads.start * self.head_dim:heads.stop * self.head_dim])
             apply_rotary_emb_single([tensor], freqs, head_first=False)
 
     def forward(self, xlist, grid_sizes, freqs, block_mask = None, ref_target_masks = None, ref_images_count = 0, standin_phase =-1, lynx_ref_buffer = None, lynx_ref_scale = 0, sub_x_no=0, residual=None, gate=None):
@@ -372,10 +387,13 @@ class WanSelfAttention(nn.Module):
         """
         if (block_mask is None and ref_target_masks is None and standin_phase < 1 and lynx_ref_buffer is None and isinstance(freqs, tuple)
                 and not offload.shared_state.get("_chipmunk", False) and not offload.shared_state.get("_radial", False)):
+            # the kit applies o as _project does: with the heads split, it reads each group's output as o's weight format allows
+            rows = None if residual is None else residual.view(-1, residual.shape[-1])
+            segments = None if residual is None else frame_segments(residual.shape[0], residual.shape[1], gate.shape[0])
             x = attention_kit.qkv_attention(xlist, self.q, self.k, self.v, self.num_heads, self.head_dim,
                                             lambda query, key, group: self._norm_rope_(query, key, group, freqs),
-                                            norm_spans_heads=isinstance(self.norm_q, WanRMSNorm))
-            return self._project(x.flatten(2), residual, gate), None
+                                            norm_spans_heads=isinstance(self.norm_q, WanRMSNorm), norm_rows="heads", out_proj=self.o, residual=rows, gate=gate, segments=segments)
+            return (x if residual is None else residual), None
         x = xlist[0]
         xlist.clear()
 
@@ -469,6 +487,32 @@ class WanSelfAttention(nn.Module):
 
 
 class WanT2VCrossAttention(WanSelfAttention):
+
+    QUERY_CHUNK_BYTES = 64 << 20  # 16-bit queries of all heads per chunk of tokens (add_by_chunks_)
+
+    def add_by_chunks_(self, x, norm, context, attention_dtype):
+        """x += cross_attn(norm(x)) by chunks of tokens: each chunk normed, projected, attended against the whole context, projected
+        by o and added into its rows, so that neither norm(x) nor q nor the output of all tokens exists. Every step is row-wise: a
+        chunk reads its own rows only, before its output is added to them."""
+        b, tokens, dim = x.shape
+        n, d = self.num_heads, self.head_dim
+        k = self.k(context)
+        self.norm_k(k)
+        k = k.view(context.shape[0], -1, n, d)
+        v = self.v(context).view(context.shape[0], -1, n, d)
+        chunk = max(128, self.QUERY_CHUNK_BYTES // (dim * 2) // 128 * 128)
+        for item in range(b):
+            item_k, item_v = (k[item:item + 1], v[item:item + 1]) if k.shape[0] > 1 else (k, v)
+            for start in range(0, tokens, chunk):
+                rows = x[item:item + 1, start:start + chunk]
+                q = self.q(norm(rows).to(attention_dtype))
+                self.norm_q(q)
+                qkv_list = [q.view(1, -1, n, d), item_k, item_v]
+                q = None
+                attention = pay_attention(qkv_list, recycle_q=True).flatten(2, 3)
+                rows += self.o(attention).to(rows.dtype)
+                attention = None
+        return x
 
     def forward(self, xlist, context, grid_sizes, lynx_ip_embeds = None, lynx_ip_scale = 0, *args, **kwargs):
         r"""
@@ -660,6 +704,7 @@ class WanAttentionBlock(nn.Module):
         sub_x_no =0,         
         animate2_generation = None,
         animate2_cached = False,
+        taomate_audio = None,
     ):
         r"""
         Args:
@@ -716,12 +761,17 @@ class WanAttentionBlock(nn.Module):
             x = gated_frames_(x, y_list, e[2])
         del y
 
-        if context is not None:
+        if context is not None and CROSS_BY_CHUNKS and type(self.cross_attn) is WanT2VCrossAttention and lynx_ip_embeds is None and (offload.shared_state.get("_nag_scale", 0) <= 1 or len(context) == 1):
+            self.cross_attn.add_by_chunks_(x, self.norm3, context, attention_dtype)  # no norm3(x), q or output of all tokens
+        elif context is not None:
             y = self.norm3(x)
             y = y.to(attention_dtype)
             ylist= [y]
             del y
             x += self.cross_attn(ylist, context, grid_sizes, audio_proj = audio_proj, audio_scale = audio_scale, audio_context_lens = audio_context_lens, lynx_ip_embeds=lynx_ip_embeds, lynx_ip_scale=lynx_ip_scale).to(dtype)
+
+        if taomate_audio is not None:
+            x = taomate_audio_attention(self, x, taomate_audio, attention_dtype)
 
         if multitalk_audio != None:
             # cross attn of multitalk audio
@@ -739,9 +789,10 @@ class WanAttentionBlock(nn.Module):
                 x = fuse_with_image_ref(x, y, ref_images_count, grid_sizes)
                 del y
 
-        y = modulate_frames(x, self.norm2, e[3], e[4]).to(attention_dtype)
+        # the FFN by chunks of rows, its input normed and modulated chunk by chunk, its output gated per latent frame into x
+        y = modulate_frames_rows(x, self.norm2, e[3], e[4], attention_dtype) if FFN_BY_ROWS else modulate_frames(x, self.norm2, e[3], e[4]).to(attention_dtype)
 
-        y_list, y = [y], None  # the FFN by chunks, its output gated per latent frame into x
+        y_list, y = [y], None
         kernels.mlp(y_list, self.ffn[0], self.ffn[2], "gelu", residual=x, segments=kernels.gate_segments(e[5], x.shape[0], x.shape[1]))
 
         if hints_processed is not None:
@@ -889,10 +940,26 @@ class Head(nn.Module):
         x_list.clear()
 
         e = frame_modulation(self.modulation.weight, e.unsqueeze(1))
-        x = modulate_frames(x, self.norm, e[0], e[1])
-        x= x.to(self.head.weight.dtype)
-        x = self.head(x)
-        return x
+        batch, tokens, dim = x.shape
+        whole = batch * tokens * (dim * x.element_size() + (dim + self.head.out_features) * self.head.weight.element_size())  # the norm output, its copy, the head's output
+        if batch * tokens <= HEAD_CHUNK_ROWS or not attention_kit.chunking_needed(x.device, whole, ("wan head", batch * tokens, dim)):
+            x = modulate_frames(x, self.norm, e[0], e[1])
+            x= x.to(self.head.weight.dtype)
+            x = self.head(x)
+            return x
+        # Smart Inputs Chunker: the norm output and its copy in the head's dtype by chunks of rows, where the whole stream's
+        # (with the other CFG branch's stream) would be the call's VRAM peak. cuBLAS sums the head's output in another order per row count.
+        rows, segments, out = x.view(-1, dim), frame_segments(batch, tokens, e[0].shape[1]), None
+        x = None
+        for start in range(0, rows.shape[0], HEAD_CHUNK_ROWS):
+            stop = min(start + HEAD_CHUNK_ROWS, rows.shape[0])
+            spans = [(max(first, start) - start, min(last, stop) - start, row) for first, last, row in segments if first < stop and last > start]
+            part = self.head(kernels.norm_modulate([rows[start:stop]], self.norm, e[0][0], e[1][0], spans).to(self.head.weight.dtype))
+            if out is None:
+                out = part.new_empty((rows.shape[0], part.shape[-1]))
+            out[start:stop] = part
+            part = None
+        return out.view(batch, tokens, -1)
 
 
 class MLPProj(torch.nn.Module):
@@ -919,6 +986,8 @@ class MLPProj(torch.nn.Module):
         return clip_extra_context_tokens
 
 class WanModel(ModelMixin, ConfigMixin):
+    _offload_hooks = ["project_audio"]
+
     def setup_chipmunk(self):
         # from chipmunk.util import LayerCounter
         # from chipmunk.modules import SparseDiffMlp, SparseDiffAttn
@@ -1119,11 +1188,13 @@ class WanModel(ModelMixin, ConfigMixin):
                  in_dim_control_adapter = 24,
                  downscale_factor_control_adapter = 8,
                  uni3c_controlnet = None,
+                 taomate = False,
                  ):
 
         super().__init__()
 
         self.model_type = model_type
+        self.taomate = taomate
 
         self.patch_size = patch_size
         self.text_len = text_len
@@ -1252,6 +1323,10 @@ class WanModel(ModelMixin, ConfigMixin):
             from ..vista4d.runtime import add_vista4d_modules
             add_vista4d_modules(self)
 
+        if taomate:
+            from ..taomate import add_modules as add_taomate_modules
+            add_taomate_modules(self)
+
         if add_control_adapter: # Wan Fun Control-Camera
             from ..camera_control.fun_camera import SimpleAdapter
             self.control_adapter = SimpleAdapter(in_dim_control_adapter, dim, kernel_size=patch_size[1:], stride=patch_size[1:], downscale_factor=downscale_factor_control_adapter)
@@ -1330,6 +1405,10 @@ class WanModel(ModelMixin, ConfigMixin):
                                                     hidden_dim=128,
                                                     num_heads=8)
 
+    def project_audio(self, features):
+        """TaoMate-FVSR: audio tokens (frames, window, dim) of hidden-state windows (frames, window, features). A hooked entry point of its own: they stay the same for the whole window."""
+        return self.audio_embedding(features.to(self.audio_embedding.proj_in.bias.dtype))
+
     def adapt_modulation(self, block_name ='blocks'):
         def move(v, param_name = "modulation"):
             module = torch.nn.Module()
@@ -1385,11 +1464,14 @@ class WanModel(ModelMixin, ConfigMixin):
             layer_list += [self.mask_patch_embedding]
         target_dype= dtype
         
-        layer_list2 = [ self.time_embedding, self.time_embedding[0], self.time_embedding[2], 
+        layer_list2 = [ self.time_embedding, self.time_embedding[0], self.time_embedding[2],
                     self.time_projection, self.time_projection[1]] #, self.text_embedding, self.text_embedding[0], self.text_embedding[2] ]
 
         for block in self.blocks:
-            layer_list2 += [block.norm3]
+            layer_list2 += [block.norm4 if self.taomate else block.norm3]
+
+        if self.taomate:
+            layer_list += [self.spark_ref_proj]
 
         if hasattr(self, "audio_proj"):
             for block in self.blocks:
@@ -1595,6 +1677,8 @@ class WanModel(ModelMixin, ConfigMixin):
         animate2_kv_cache = "Disabled",  # GPU (exact), INT8 (K/V on the GPU), RAM (INT8 K/V in RAM) (animate2.py)
         camera_adapter_features = None,
         uni3c_condition = None,
+        taomate_reference = None,  # per branch: the reference canvas, one tensor shared by the branches using it, or None for the all-zero canvas
+        taomate_audio = None,  # per branch: project_audio's tokens
     ):
         # patch_dtype =  self.patch_embedding.weight.dtype
         modulation_dtype = self.time_projection[1].weight.dtype
@@ -1768,6 +1852,13 @@ class WanModel(ModelMixin, ConfigMixin):
             output_grid_sizes = grid_sizes
             source_latents = source_masks = point_latents = point_masks = vista_source_tokens = vista_point_tokens = None
 
+        if taomate_reference is not None:
+            reference_tokens = self.spark_ref_proj(next(reference for reference in taomate_reference if reference is not None)).to(modulation_dtype)
+            for i, reference in enumerate(taomate_reference):
+                if reference is not None:
+                    x_list[i] += reference_tokens
+            reference_tokens = None
+
         motion_vec_list = []
         pose_tokens = None
         scail2_pose_tokens = None
@@ -1777,7 +1868,9 @@ class WanModel(ModelMixin, ConfigMixin):
             scail2_pose_tokens = build_scail2_pose_tokens(self, scail2_pose_latents, scail2_driving_masks, modulation_dtype)
         
         if face_pixel_values is None: face_pixel_values =  [None] * len(x_list)
-        for i, (x, one_face_pixel_values) in enumerate(zip(x_list, face_pixel_values)):
+        # by index: enumerate(zip()) keeps its last result tuple, the previous branch's embedded tokens beside this branch's copy
+        for i in range(min(len(x_list), len(face_pixel_values))):
+                x, one_face_pixel_values, x_list[i] = x_list[i], face_pixel_values[i], None
                 # animate/scail embeddings
                 motion_vec = None
                 if pose_latents is not None: 
@@ -1790,7 +1883,9 @@ class WanModel(ModelMixin, ConfigMixin):
                     x_og_shape = x.shape
                     x = voxel_chunk_no_padding(x, voxel_shape).squeeze(-1).transpose(1, 2)
                 else:
-                    x = x.flatten(2).transpose(1, 2)
+                    # the tokens' rows in order: a transposed view would be copied by every norm of every block (3 norms a block, each
+                    # a temporary as large as the stream) and updated in place with strided writes; TaoMate's fused INT8 kernels write into them
+                    x = x.flatten(2).transpose(1, 2).contiguous()
 
                 if vista_condition_tokens is not None:
                     x = torch.cat((x, vista_condition_tokens), dim=1)
@@ -1914,9 +2009,9 @@ class WanModel(ModelMixin, ConfigMixin):
             else:
                 e0 = e0 + self.fps_projection(fps_emb).unflatten(1, (6, self.dim))
 
-        if not (self.any_kiwi_source or self.any_kiwi_ref):
+        if not (self.any_kiwi_source or self.any_kiwi_ref or self.taomate):
             context = [self.text_embedding(u) for u in context]
-        
+
         if clip_fea is not None:
             context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
             if steadydancer_clip_fea_c is not None:
@@ -2102,6 +2197,8 @@ class WanModel(ModelMixin, ConfigMixin):
                             if bernini_enabled:
                                 block_kwargs = dict(kwargs)
                                 block_kwargs["freqs"] = bernini_freqs_list[i]
+                            elif taomate_audio is not None:
+                                block_kwargs = dict(kwargs, taomate_audio=taomate_audio[i])
                             x_list[i] = block(x, context = context, hints= hints, audio_scale= audio_scale, multitalk_audio = multitalk_audio, multitalk_masks =multitalk_masks, e= e0,  motion_vec = motion_vec, lynx_ip_embeds= lynx_ip_embeds, lynx_ref_buffer = lynx_ref_buffer, sub_x_no =i,  **block_kwargs)
                             del x
                     context = hints = None

@@ -69,7 +69,7 @@ def calculate_x_ref_attn_map_per_head(visual_q, ref_k, ref_target_masks, ref_ima
         attn = q_chunk @ ref_k.transpose(-2, -1)
         x_ref_attn_map_source = attn.softmax(-1) # B, H, x_seqlens, ref_seqlens
         del attn
-        ref_target_masks = ref_target_masks.to(dtype)
+        ref_target_masks = ref_target_masks.to(device=visual_q.device, dtype=dtype)
         x_ref_attn_map_source = x_ref_attn_map_source.to(dtype)
 
         for class_idx, ref_target_mask in enumerate(ref_target_masks):
@@ -101,7 +101,7 @@ def calculate_x_ref_attn_map(visual_q, ref_k, ref_target_masks, ref_images_count
     x_ref_attn_map_source = attn.softmax(-1) # B, H, x_seqlens, ref_seqlens
     del attn
     x_ref_attn_maps = []
-    ref_target_masks = ref_target_masks.to(dtype)
+    ref_target_masks = ref_target_masks.to(device=visual_q.device, dtype=dtype)
     x_ref_attn_map_source = x_ref_attn_map_source.to(dtype)
 
     for class_idx, ref_target_mask in enumerate(ref_target_masks):
@@ -297,7 +297,7 @@ def save_video_ffmpeg(gen_video_samples, save_path, vocal_audio_list, fps=25, qu
         f'{duration}',
         save_path_crop_audio,
     ]
-    subprocess.run(final_command, check=True)
+    subprocess.run(final_command, stdin=subprocess.DEVNULL, check=True)
 
     save_path = save_path + ".mp4"
     if high_quality_save:
@@ -313,7 +313,7 @@ def save_video_ffmpeg(gen_video_samples, save_path, vocal_audio_list, fps=25, qu
             "-shortest",
             save_path,
         ]
-        subprocess.run(final_command, check=True)
+        subprocess.run(final_command, stdin=subprocess.DEVNULL, check=True)
         os.remove(save_path_tmp)
         os.remove(save_path_crop_audio)
     else:
@@ -331,7 +331,7 @@ def save_video_ffmpeg(gen_video_samples, save_path, vocal_audio_list, fps=25, qu
             "-shortest",
             save_path,
         ]
-        subprocess.run(final_command, check=True)
+        subprocess.run(final_command, stdin=subprocess.DEVNULL, check=True)
         os.remove(save_path_tmp)
         os.remove(save_path_crop_audio)
 

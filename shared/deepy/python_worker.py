@@ -72,8 +72,27 @@ _ALIASES: dict[str, str] = {}
 _ALIAS_ROOTS: set[str] = set()  # local folders of the authorized roots seen so far (a write under one is pointed to wangp.io)
 
 
+def _own(path):
+    """The sandbox's own @alias path (@documents/sandbox/apps/x, as tool results print it, or /documents/sandbox/apps/x without its @) is its
+    local path, readable and writable like a relative one."""
+    alias, text = CONFIG.get("alias"), path.replace("\\", "/") if isinstance(path, str) else ""
+    for prefix in (alias, "/" + alias.lstrip("@")) if alias and text else ():
+        if text.startswith(prefix + "/"):
+            return os.path.join(ROOT, text[len(prefix) + 1:])
+    return path
+
+
+def _tool_path(path, new=False):
+    """A relative path of the sandbox (apps/x, out/a.png), as relative paths mean here, in the @alias form WanGP's tools take (they read a relative
+    path from the outputs folder). Only a path that exists in the sandbox, or a new one (new=True) in a folder of it: media ids stay as they are."""
+    if isinstance(path, str) and CONFIG.get("alias") and not path.startswith("@") and not os.path.isabs(path) and (os.path.exists(path) or new and os.path.isdir(os.path.dirname(path))):
+        return CONFIG["alias"] + "/" + path.replace("\\", "/").removeprefix("./")
+    return path
+
+
 def _real(path):
     """An authorized @alias/... path (what wangp.listdir and the other tools return) becomes its local path, resolved once by the host and readable afterwards; other paths are returned as they are."""
+    path = _own(path)
     if isinstance(path, str) and path.startswith("@") and len(path) > 1:
         if path not in _ALIASES:
             found = _rpc({"op": "realpath", "ref": path})
@@ -98,6 +117,7 @@ def _outside_write(path, what: str) -> PermissionError:
 def _check(path, writing: bool, what: str) -> None:
     if isinstance(path, int):
         return
+    path = _own(path)
     if writing and isinstance(path, str) and path.startswith("@"):
         raise _outside_write(path, what)
     key = _key(path)
@@ -113,6 +133,7 @@ def _check(path, writing: bool, what: str) -> None:
 
 
 def _guarded_open(file, mode="r", *args, **kwargs):
+    file = _own(file)
     if isinstance(file, str) and file.startswith("@") and any(flag in str(mode) for flag in "wax+"):
         raise PermissionError(f"The sandbox cannot write {file}: save the file inside the sandbox (out/result.csv, scratch/x.png), then copy it there with wangp.io('copy', source='@documents/sandbox/out/result.csv', destination={file!r}).")
     file = _real(file)
@@ -201,13 +222,35 @@ def _guard_network():
             setattr(socket, name, refuse)
 
 
+def _blockwise_ogg(soundfile):
+    """soundfile.write of a long OGG (Vorbis, Opus) in one call crashes libsndfile 1.2, and the sandbox process with it: OGG goes in blocks."""
+    write = soundfile.write
+
+    def blockwise(file, data, samplerate, subtype=None, endian=None, format=None, closefd=True, **kwargs):
+        kind = format or (os.path.splitext(os.fspath(file))[1][1:] if isinstance(file, (str, os.PathLike)) else "")
+        if str(kind).upper() not in ("OGG", "OGA", "OPUS"):
+            return write(file, data, samplerate, subtype, endian, format, closefd, **kwargs)
+        import numpy
+
+        data = numpy.asarray(data)
+        with soundfile.SoundFile(file, "w", samplerate, 1 if data.ndim == 1 else data.shape[1], subtype, endian, format, closefd, **kwargs) as handle:
+            for start in range(0, len(data), 65536):
+                handle.write(data[start:start + 65536])
+
+    soundfile.write = blockwise
+
+
 def _guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
     if level:
         raise ImportError("Relative imports are not available in the sandbox.")
     top = name.partition(".")[0]
     if top not in ALLOWED_MODULES:
         raise ImportError(f"'{top}' is not available in the sandbox. Available: {LIBRARY_SUMMARY}. No processes, raw network, GPU or ffmpeg: generate media with WanGP's models, cut or mix with its toolbox, download with wangp.download(url).")
-    return _real_import(name, globals, locals, fromlist, level)
+    module = _real_import(name, globals, locals, fromlist, level)
+    if top == "soundfile" and not getattr(sys.modules["soundfile"], "_wangp_blockwise", False):
+        _blockwise_ogg(sys.modules["soundfile"])
+        sys.modules["soundfile"]._wangp_blockwise = True
+    return module
 
 
 def _safe_builtins() -> dict:
@@ -290,12 +333,12 @@ def _external_references(markup: str) -> list[str]:
 
 
 def _build_wangp_module() -> types.ModuleType:
-    module = types.ModuleType("wangp", "WanGP helpers inside the Python sandbox: path, font, svg, publish_video, call, toolbox, inspect, generate, listdir, io, progress, out, root.")
+    module = types.ModuleType("wangp", "WanGP helpers inside the Python sandbox: path, video_frames, font, svg, publish_video, call, toolbox, inspect, generate, listdir, io, progress, out, root.")
     module.root = "."  # the sandbox folder is the working directory: relative paths, not virtual @documents paths
     module.out = "out"
 
     def path(ref: str) -> str:
-        """Local path of a Gallery media id (image_3, visual:..., audio:...) or an authorized @alias/file, readable from Python afterwards.
+        """Local path of a Gallery media id (visual:..., audio:..., 3d:...) or an authorized @alias/file, readable from Python afterwards.
         Files only: the sandbox folder itself is the working directory, so its content is addressed with relative paths ('out/x.png')."""
         ref = str(ref)
         if not ref.startswith("@") and not os.path.isabs(ref) and os.path.isfile(ref):  # the sandbox's own file ('out/x.png'): already readable here
@@ -305,6 +348,30 @@ def _build_wangp_module() -> types.ModuleType:
         value = _rpc({"op": "path", "ref": ref})
         GRANTED.add(_key(value))
         return value
+
+    def video_frames(ref: str, start: int = 0, stop: int | None = None, step: int = 1):
+        """The frames of a video or a view (@views/...) one by one, as RGB numpy arrays, numbered from its own first frame: start to stop (excluded), every step. Nothing is encoded: for a view it is the
+        quick way in, as wangp.path cuts a real clip the first time."""
+        import cv2
+
+        part = _rpc({"op": "part", "ref": str(ref)})
+        GRANTED.add(_key(part["path"]))
+        first = part["start_frame"] + int(start)
+        last = None if part["end_frame"] is None and stop is None else part["end_frame"] if stop is None else part["start_frame"] + int(stop) - 1 if part["end_frame"] is None else min(part["end_frame"], part["start_frame"] + int(stop) - 1)
+        capture = cv2.VideoCapture(part["path"])
+        try:
+            for _ in range(first):  # read on, not seek: exact to the frame on every file
+                capture.grab()
+            index = first
+            while (last is None or index <= last) and capture.grab():
+                if (index - first) % int(step) == 0:
+                    good, frame = capture.retrieve()
+                    if not good:
+                        return
+                    yield cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                index += 1
+        finally:
+            capture.release()
 
     def svg(markup: str, width: int | None = None, height: int | None = None, background: str | None = None):
         """Rasterize self-contained SVG markup (no external file references) to an RGBA PIL image; width/height scale it."""
@@ -531,7 +598,7 @@ def _build_wangp_module() -> types.ModuleType:
     def listdir(ref: str, pattern: str = "*", recursive: bool = False) -> list:
         """Files of an authorized folder as dicts: path (@alias path, for tools and open()), file (local path, for any library such as cv2),
         name, bytes, modified (epoch seconds), kind (image, video, audio, 3d, other) and type 'file'. pattern filters names, recursive walks subfolders."""
-        entries = _rpc({"op": "list", "ref": str(ref), "pattern": str(pattern), "recursive": bool(recursive)})
+        entries = _rpc({"op": "list", "ref": _tool_path(ref), "pattern": str(pattern), "recursive": bool(recursive)})
         for entry in entries:
             key = os.path.normcase(os.path.realpath(entry["file"]))
             (READ_PREFIXES.append if entry["type"] == "dir" else GRANTED.add)(key)
@@ -540,7 +607,8 @@ def _build_wangp_module() -> types.ModuleType:
 
     def io(action: str, arguments: dict | None = None, **kwargs) -> dict:
         """wangp_io file actions from a script: list, info, read_text, search_text, mkdir, copy, move, zip (no delete). io('move', source='@test/a.png', destination='@test/dups/a.png') or io('move', {...})."""
-        return call("wangp_io", action=str(action), arguments={**(arguments or {}), **kwargs})
+        arguments = {**(arguments or {}), **kwargs}
+        return call("wangp_io", action=str(action), arguments={key: _tool_path(value, new=key == "destination") if key in ("path", "source", "destination") else value for key, value in arguments.items()})
 
     def plugins(plugin: str | None = None) -> dict:
         """The toolboxes of enabled plugins: plugins() lists them, plugins('media_flow') lists that plugin's actions with their call signatures."""
@@ -556,16 +624,50 @@ def _build_wangp_module() -> types.ModuleType:
         """Report a loop's progress to the user: wangp.progress(i, len(items), name) as item i starts shows a progress bar from the first item, with the item
         running and the time left; wangp.progress(len(items), len(items)) after the loop completes it."""
         _check_stop()
+        if isinstance(done, str):  # a status alone: wangp.progress("Inspecting shot 3")
+            done, text = 0, done
         done, total = int(done), None if total is None else int(total)
         finished = total is not None and done >= total
         if finished or time.monotonic() - progress_state["sent"] >= 0.2:
             progress_state["sent"] = time.monotonic()
             _notify({"op": "progress", "done": done, "total": total, "text": str(text)[:120]})
 
+    def app_rpc(action: str, **arguments):
+        return _rpc({"op": "app", "action": action, "arguments": arguments})
+
+    def app_new(name: str, template: str = "three-scene", description: str = "") -> dict:
+        """Create the web app apps/<slug of name> from a template: three-scene, three-game, canvas-2d, phaser-game, physics-toy, audio-visualizer, blank."""
+        return app_rpc("app_new", name=str(name), template=str(template), description=str(description))
+
+    def app_check(app: str, steps: list | None = None, record: dict | None = None, viewport: str = "desktop") -> dict:
+        """Run the web app headless: findings, frame rate, state probe per step, screenshots, and a motion strip with record={'seconds': 3, 'fps': 4}."""
+        return app_rpc("app_check", app=str(app), steps=steps, record=record, viewport=str(viewport))
+
+    def app_logs(app: str, since: float = 0.0) -> dict:
+        """What the user's browser reported while the app was played: console lines, errors, frame rate."""
+        return app_rpc("app_logs", app=str(app), since=float(since))
+
+    def app_publish(app: str, note: str = "") -> dict:
+        """Publish the web app to the Apps gallery as a new version."""
+        return app_rpc("app_publish", app=str(app), note=str(note))
+
+    def import_asset(media: str, app: str, path: str, max_size: int | None = None, transparent: bool = False) -> dict:
+        """Copy a Gallery media id, @alias path or sandbox file into apps/<app>/<path>, converted to the format of path's extension (.webp/.png/.jpg
+        resized to max_size pixels on the longer side, transparent=True cutting the subject out of its background, .ogg/.mp3/.m4a/.wav, .mp4/.webm,
+        .glb): returns {file, bytes, size}."""
+        return app_rpc("import_asset", media=str(media), app=str(app), path=str(path), max_size=None if max_size is None else int(max_size), transparent=bool(transparent))
+
+    def progression(path: str) -> dict:
+        """Search every order of play of a story, quest or puzzle written as facts and actions (apps/<app>/assets/story.json): shortest path to
+        each ending, endings never reached, dead ends, states that lose the main ending, facts never needed, actions never possible."""
+        return app_rpc("progression", path=str(path))
+
+    module.app = types.SimpleNamespace(new=app_new, check=app_check, logs=app_logs, publish=app_publish, import_asset=import_asset, progression=progression)
+    module.video_frames = video_frames
     module.path, module.svg, module.font, module.text_mesh, module.extrude, module.extrude_parts, module.publish_video = path, svg, font, text_mesh, extrude, extrude_parts, publish_video
     module.call, module.toolbox, module.inspect, module.generate, module.listdir, module.progress, module.io = call, toolbox, inspect, generate, listdir, progress, io
     module.web, module.download, module.plugins, module.plugin = web, download, plugins, plugin
-    module.__all__ = ["path", "svg", "font", "text_mesh", "extrude", "extrude_parts", "publish_video", "call", "toolbox", "inspect", "generate", "listdir", "io", "web", "download", "plugins", "plugin", "progress", "out", "root"]
+    module.__all__ = ["path", "video_frames", "svg", "font", "text_mesh", "extrude", "extrude_parts", "publish_video", "call", "toolbox", "inspect", "generate", "listdir", "io", "web", "download", "plugins", "plugin", "progress", "app", "out", "root"]
     return module
 
 
@@ -578,7 +680,9 @@ def _truncate(text: str, limit: int) -> str:
 
 
 _TOOL_NAMES = {"inspect_media": "wangp.inspect(media, question)", "generate": "wangp.generate(settings)", "wangp_generate": "wangp.generate(settings)", "listdir": "wangp.listdir(folder)",
-               "download": "wangp.download(url)", "wangp_web_search": "wangp.web(action, ...)", "web_search": "wangp.web(action, ...)"}
+               "download": "wangp.download(url)", "wangp_web_search": "wangp.web(action, ...)", "web_search": "wangp.web(action, ...)",
+               "import_asset": "wangp.app.import_asset(media, app, path, max_size=None, transparent=False)", "app_check": "wangp.app.check(app, steps)",
+               "app_new": "wangp.app.new(name, template)", "app_publish": "wangp.app.publish(app)"}
 
 
 def _format_error(exc: BaseException) -> tuple[str, list[str]]:
@@ -586,8 +690,10 @@ def _format_error(exc: BaseException) -> tuple[str, list[str]]:
     name = getattr(exc, "name", None) if isinstance(exc, NameError) else None
     if name in _TOOL_NAMES:
         message += f". WanGP's tools are reached through the wangp module here: {_TOOL_NAMES[name]}"
-    elif name and (name.startswith("wangp_") or name in ("view_media", "render_3d_views", "transcribe_media", "inspect_audio", "extract_audio", "remux_media", "merge_videos", "resize_crop")):
+    elif name and (name.startswith("wangp_") or name in ("view_media", "render_3d_views", "transcribe_media", "inspect_audio", "check_lip_sync", "detect_video_cuts", "plan_video_windows", "check_video_edit", "extract_audio", "remux_media", "merge_videos", "resize_crop")):
         message += f". WanGP's tools are reached through the wangp module here: wangp.toolbox({name.removeprefix('wangp_')!r}, ...) or wangp.call({name!r}, ...)"
+    elif not isinstance(exc, PermissionError) and ("'@" in message or '"@' in message):  # open() knows @alias paths; libraries opening files in C do not
+        message += ". Libraries that open files themselves (soundfile, cv2, librosa) need the local path: pass wangp.path('@...') instead of the @alias path"
     if isinstance(exc, SyntaxError):
         return message, [f"line {exc.lineno}: {(exc.text or '').strip()}"] if exc.lineno else []
     frames = traceback.extract_tb(exc.__traceback__)
@@ -643,6 +749,20 @@ def facts() -> dict:
     return {"python": sys.version.split()[0], "libraries": versions, "pid": os.getpid()}
 
 
+def _upright_open(open_image):
+    """PIL.Image.open showing images as the Gallery does: a photo's EXIF orientation is applied to its pixels (Pillow's own lookup,
+    which decodes a PNG at once to find metadata after its image data)."""
+    import PIL.ImageOps
+
+    def upright_open(fp, *args, **kwargs):
+        image = open_image(fp, *args, **kwargs)
+        if image.getexif().get(0x0112, 1) != 1:
+            PIL.ImageOps.exif_transpose(image, in_place=True)
+        return image
+
+    return upright_open
+
+
 def main() -> None:
     global ROOT, ROOT_KEY, CONFIG, READ_PREFIXES
     ROOT = os.path.realpath(sys.argv[1])
@@ -653,8 +773,9 @@ def main() -> None:
     for folder in ("out", "tmp"):
         os.makedirs(os.path.join(ROOT, folder), exist_ok=True)
     import numpy  # noqa: F401  pre-imported so that their own imports happen before the guards and the first run stays fast
-    import PIL.Image  # noqa: F401
+    import PIL.Image
     import warnings
+    PIL.Image.open = _upright_open(PIL.Image.open)
     for category in (DeprecationWarning, PendingDeprecationWarning, FutureWarning):  # library deprecations are noise in the assistant's context
         warnings.simplefilter("ignore", category)
 
@@ -664,6 +785,8 @@ def main() -> None:
     _guard_network()
     wangp = _build_wangp_module()
     sys.modules["wangp"] = wangp
+    if hasattr(wangp, "app"):
+        sys.modules["wangp.app"] = wangp.app  # import wangp.app / from wangp.app import check, as scripts write them
     sys.argv = ["<deepy>"]
     namespace = {"__name__": "__main__", "__builtins__": _safe_builtins(), "wangp": wangp}
     while line := _IN.readline():

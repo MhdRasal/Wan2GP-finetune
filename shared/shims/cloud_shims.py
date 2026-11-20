@@ -44,46 +44,83 @@ class _DummyDevice:
 
 
 class _DummyTensor:
-    """Minimal mock torch.Tensor for type checks and lightweight operations."""
+    """NumPy-backed mock torch.Tensor for import-time metadata math in cloud client mode."""
     def __init__(self, data=None, dtype=None, device=None):
-        self.data = data
-        self.dtype = dtype or "float32"
-        self.device = _DummyDevice("cpu")
-        self.shape = (0,) if data is None else getattr(data, "shape", (0,))
-    def cpu(self):
-        return self
-    def cuda(self, device=None):
-        return self
-    def to(self, *args, **kwargs):
-        return self
-    def detach(self):
-        return self
-    def clone(self):
-        return self
-    def item(self):
-        if self.data is not None:
-            try:
-                return float(self.data)
-            except Exception:
-                return self.data
-        return 0.0
-    def float(self):
-        return self
-    def int(self):
-        return self
-    def long(self):
-        return self
-    def half(self):
-        return self
-    def bfloat16(self):
-        return self
-    def numpy(self):
         import numpy as np
-        return np.array(self.data) if self.data is not None else np.array([])
-    def __float__(self):
-        return float(self.item())
-    def __int__(self):
-        return int(self.item())
+        if isinstance(data, _DummyTensor):
+            data = data._array
+        if data is None:
+            self._array = np.array([], dtype=np.float32)
+        else:
+            try:
+                self._array = np.asarray(data)
+            except Exception:
+                self._array = np.array([], dtype=np.float32)
+        self.data = self._array
+        self.dtype = dtype or str(self._array.dtype)
+        self.device = _DummyDevice("cpu")
+
+    @property
+    def shape(self):
+        return self._array.shape
+
+    def __array__(self, dtype=None):
+        return self._array.astype(dtype) if dtype is not None else self._array
+
+    def _wrap(self, value):
+        return _DummyTensor(value)
+
+    def _binary(self, other, op):
+        other = other._array if isinstance(other, _DummyTensor) else other
+        return self._wrap(op(self._array, other))
+
+    def __add__(self, other): return self._binary(other, lambda a, b: a + b)
+    def __radd__(self, other): return self._binary(other, lambda a, b: b + a)
+    def __sub__(self, other): return self._binary(other, lambda a, b: a - b)
+    def __rsub__(self, other): return self._binary(other, lambda a, b: b - a)
+    def __mul__(self, other): return self._binary(other, lambda a, b: a * b)
+    def __rmul__(self, other): return self._binary(other, lambda a, b: b * a)
+    def __truediv__(self, other): return self._binary(other, lambda a, b: a / b)
+    def __rtruediv__(self, other): return self._binary(other, lambda a, b: b / a)
+    def __floordiv__(self, other): return self._binary(other, lambda a, b: a // b)
+    def __mod__(self, other): return self._binary(other, lambda a, b: a % b)
+    def __pow__(self, other): return self._binary(other, lambda a, b: a ** b)
+    def __neg__(self): return self._wrap(-self._array)
+    def __matmul__(self, other): return self._binary(other, lambda a, b: a @ b)
+    def __getitem__(self, key): return self._wrap(self._array[key])
+    def __len__(self): return len(self._array)
+    def __iter__(self): return iter(self._array)
+    def __float__(self): return float(self.item())
+    def __int__(self): return int(self.item())
+
+    def cpu(self): return self
+    def cuda(self, device=None): return self
+    def to(self, *args, **kwargs): return self
+    def detach(self): return self
+    def clone(self): return self._wrap(self._array.copy())
+    def contiguous(self): return self
+    def numpy(self): return self._array
+    def tolist(self): return self._array.tolist()
+    def item(self):
+        if self._array.size == 1:
+            return self._array.reshape(-1)[0].item()
+        return 0.0
+    def numel(self): return int(self._array.size)
+    def dim(self): return int(self._array.ndim)
+    def size(self, dim=None):
+        return self.shape if dim is None else self.shape[dim]
+    def squeeze(self, dim=None): return self._wrap(self._array.squeeze(dim))
+    def unsqueeze(self, dim): return self._wrap(__import__("numpy").expand_dims(self._array, dim))
+    def reshape(self, *shape): return self._wrap(self._array.reshape(*shape))
+    def view(self, *shape): return self.reshape(*shape)
+    def flatten(self, start_dim=0, end_dim=-1): return self._wrap(self._array.flatten())
+    def float(self): return self
+    def int(self): return self
+    def long(self): return self
+    def half(self): return self
+    def bfloat16(self): return self
+    def bool(self): return self
+    def type(self, *args, **kwargs): return self
     def __repr__(self):
         return f"DummyTensor(shape={self.shape}, dtype={self.dtype})"
 
@@ -554,15 +591,58 @@ def _create_mock_torch() -> types.ModuleType:
     torch_mod.channels_last = "channels_last"
     torch_mod.channels_last_3d = "channels_last_3d"
 
-    # Basic tensor creation stubs
+    # Basic tensor creation stubs (NumPy-backed so model metadata math works)
+    def _shape_of(args):
+        if len(args) == 1 and isinstance(args[0], (tuple, list)):
+            return tuple(args[0])
+        return tuple(args)
+
+    def _dtype_of(kwargs):
+        dtype = kwargs.get("dtype")
+        if isinstance(dtype, str) and dtype in ("float16", "bfloat16", "float32", "float64", "int8", "int16", "int32", "int64", "uint8", "bool"):
+            return {"bfloat16": "float32"}.get(dtype, dtype)
+        return None
+
+    def _make_tensor(data=None, **kwargs):
+        return _DummyTensor(data=data, dtype=kwargs.get("dtype"))
+
     torch_mod.from_numpy = lambda arr: _DummyTensor(data=arr)
-    torch_mod.zeros = lambda *a, **k: _DummyTensor()
-    torch_mod.ones = lambda *a, **k: _DummyTensor()
-    torch_mod.cat = lambda tensors, dim=0: _DummyTensor()
-    torch_mod.tensor = lambda data, **k: _DummyTensor(data=data)
+    torch_mod.tensor = lambda data, **k: _DummyTensor(data=data, dtype=k.get("dtype"))
+    torch_mod.as_tensor = torch_mod.tensor
+    torch_mod.zeros = lambda *a, **k: _DummyTensor(__import__("numpy").zeros(_shape_of(a), dtype=_dtype_of(k)))
+    torch_mod.ones = lambda *a, **k: _DummyTensor(__import__("numpy").ones(_shape_of(a), dtype=_dtype_of(k)))
+    torch_mod.empty = lambda *a, **k: _DummyTensor(__import__("numpy").empty(_shape_of(a), dtype=_dtype_of(k)))
+    torch_mod.full = lambda shape, fill_value, **k: _DummyTensor(__import__("numpy").full(tuple(shape) if isinstance(shape, (tuple, list)) else (shape,), fill_value, dtype=_dtype_of(k)))
+    torch_mod.zeros_like = lambda t, **k: _DummyTensor(__import__("numpy").zeros_like(t._array if isinstance(t, _DummyTensor) else t))
+    torch_mod.ones_like = lambda t, **k: _DummyTensor(__import__("numpy").ones_like(t._array if isinstance(t, _DummyTensor) else t))
+    torch_mod.arange = lambda *a, **k: _DummyTensor(__import__("numpy").arange(*a, dtype=_dtype_of(k)))
+    torch_mod.linspace = lambda *a, **k: _DummyTensor(__import__("numpy").linspace(*a, dtype=_dtype_of(k)))
+    torch_mod.stack = lambda tensors, dim=0, **k: _DummyTensor(__import__("numpy").stack([t._array if isinstance(t, _DummyTensor) else t for t in tensors], axis=dim))
+    torch_mod.cat = lambda tensors, dim=0, **k: _DummyTensor(__import__("numpy").concatenate([t._array if isinstance(t, _DummyTensor) else t for t in tensors], axis=dim))
+    torch_mod.concat = torch_mod.cat
     torch_mod.save = lambda obj, f, **k: None
     torch_mod.load = lambda f, **k: {}
     torch_mod.manual_seed = lambda s: None
+    torch_mod.seed = lambda: 0
+
+    def _tensor_op(fn, *args, **kwargs):
+        vals = [a._array if isinstance(a, _DummyTensor) else a for a in args]
+        return _DummyTensor(fn(*vals, **kwargs))
+    for _name, _fn in {
+        "max": lambda *a, **k: __import__("numpy").max(*[x._array if isinstance(x, _DummyTensor) else x for x in a], **k),
+        "min": lambda *a, **k: __import__("numpy").min(*[x._array if isinstance(x, _DummyTensor) else x for x in a], **k),
+        "sum": lambda *a, **k: __import__("numpy").sum(*[x._array if isinstance(x, _DummyTensor) else x for x in a], **k),
+        "mean": lambda *a, **k: __import__("numpy").mean(*[x._array if isinstance(x, _DummyTensor) else x for x in a], **k),
+        "sqrt": lambda x, **k: __import__("numpy").sqrt(x._array if isinstance(x, _DummyTensor) else x),
+        "exp": lambda x, **k: __import__("numpy").exp(x._array if isinstance(x, _DummyTensor) else x),
+        "log": lambda x, **k: __import__("numpy").log(x._array if isinstance(x, _DummyTensor) else x),
+        "abs": lambda x, **k: __import__("numpy").abs(x._array if isinstance(x, _DummyTensor) else x),
+        "round": lambda x, **k: __import__("numpy").round(x._array if isinstance(x, _DummyTensor) else x),
+        "floor": lambda x, **k: __import__("numpy").floor(x._array if isinstance(x, _DummyTensor) else x),
+        "ceil": lambda x, **k: __import__("numpy").ceil(x._array if isinstance(x, _DummyTensor) else x),
+        "sign": lambda x, **k: __import__("numpy").sign(x._array if isinstance(x, _DummyTensor) else x),
+    }.items():
+        setattr(torch_mod, _name, (lambda fn: (lambda *a, **k: _DummyTensor(fn(*a, **k))))(_fn))
 
     def _torch_getattr(name: str):
         if name.startswith("__"):
@@ -718,6 +798,20 @@ def _create_mock_mmgp() -> types.ModuleType:
     ap_mod.__file__ = "/mock/mmgp/auto_preload.py"
     ap_mod.__getattr__ = lambda name: (lambda *a, **k: None)
     mmgp_mod.auto_preload = ap_mod
+
+    # expert_compute (imported directly by shared.qtypes.gguf and LLM MoE layers)
+    experts_mod = types.ModuleType("mmgp.expert_compute")
+    experts_mod.__file__ = "/mock/mmgp/expert_compute.py"
+    experts_mod.__path__ = []
+    experts_mod.ExpertFormat = type("ExpertFormat", (MockClass,), {"name": "mock", "reports_usage": False})
+    experts_mod.RoutedExperts = type("RoutedExperts", (MockClass,), {})
+    experts_mod.SwiGLUExperts = type("SwiGLUExperts", (MockClass,), {})
+    experts_mod.ExpertBank = type("ExpertBank", (MockClass,), {})
+    experts_mod.DOORBELL = object()
+    experts_mod.launch_host_job = lambda *a, **k: None
+    experts_mod.cpu_threads = lambda *a, **k: 1
+    experts_mod.__getattr__ = lambda name: (MockClass if name[:1].isupper() else (lambda *a, **k: None))
+    mmgp_mod.expert_compute = experts_mod
 
     def _safe_mmgp_getattr(name: str):
         if name.startswith("__"):
@@ -880,4 +974,5 @@ def install_cloud_shims(force: bool = False) -> bool:
     sys.modules["mmgp.allocator.ram_debug"] = mmgp_mock.allocator.ram_debug
     sys.modules["mmgp.read_ahead"] = mmgp_mock.read_ahead
     sys.modules["mmgp.auto_preload"] = mmgp_mock.auto_preload
+    sys.modules["mmgp.expert_compute"] = mmgp_mock.expert_compute
     return True

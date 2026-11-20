@@ -11,17 +11,18 @@ import imageio
 import torch
 from PIL import Image
 import numpy as np
-from rembg import remove
+from preprocessing.rembg.native import remove
 import random
 import ffmpeg
 import os
 import tempfile
 import time
 from functools import lru_cache
+from mmgp import transfer
 from . import files_locator as fl
 from .video_decode import probe_video_stream_metadata, decode_video_frames_ffmpeg, get_video_summary_extras
 from .virtual_media import get_virtual_image, parse_virtual_media_path, strip_virtual_media_suffix
-from .gallery_sources import MESH_EXTENSIONS, MESH_IMPORT_EXTENSIONS, WORLD_EXTENSIONS
+from .gallery_sources import APP_EXTENSIONS, MESH_EXTENSIONS, MESH_IMPORT_EXTENSIONS, WORLD_EXTENSIONS
 
 
 from PIL import Image
@@ -57,10 +58,13 @@ def has_mesh_file_extension(filename):
 def has_world_file_extension(filename):
     return os.path.splitext(strip_virtual_media_suffix(filename))[-1].lower() in WORLD_EXTENSIONS
 
+def has_app_file_extension(filename):
+    return os.path.splitext(strip_virtual_media_suffix(filename))[-1].lower() in APP_EXTENSIONS
+
 def get_media_kind(filename):
-    """"image", "video", "audio", "3d", "world" or None, from the file extension."""
+    """"image", "video", "audio", "3d", "world", "app" or None, from the file extension."""
     for kind, test in (("video", has_video_file_extension), ("image", has_image_file_extension), ("audio", has_audio_file_extension), ("3d", has_mesh_file_extension),
-                       ("world", has_world_file_extension)):
+                       ("world", has_world_file_extension), ("app", has_app_file_extension)):
         if test(filename):
             return kind
     return None
@@ -293,6 +297,14 @@ def get_video_info_details(video_path):
         }
     return _get_video_info_details_cached(video_path)
 
+def get_video_real_fps(video_path):
+    """A video's real frame rate, 23.976 and not the 24 of get_video_info, for what is counted in seconds: its audio, its recording."""
+    metadata = None if isinstance(video_path, Image.Image) else probe_video_stream_metadata(video_path)
+    if metadata is None or not metadata["fps_float"]:
+        return get_video_info(video_path)[0]
+    return int(round(metadata["fps_float"])) if abs(metadata["fps_float"] - round(metadata["fps_float"])) < 0.001 else metadata["fps_float"]
+
+
 def get_video_frame(file_name: str, frame_no: int, return_last_if_missing: bool = False, target_fps = None,  return_PIL = True) -> torch.Tensor:
     """Extract nth frame from video as PyTorch tensor normalized to [-1, 1]."""
     metadata = probe_video_stream_metadata(file_name)
@@ -393,31 +405,16 @@ def resolve_rembg_home():
         rembg_home = fl.get_smart_download_location(force_path="rembg")
     return os.path.abspath(rembg_home)
 
-REMBG_ON_CPU = True  # CPU: ~1.3 s per image like a warm GPU (alpha matting runs on the CPU anyway), no 10-15 s CUDA provider start, no VRAM
-
-
 def new_rembg_session(model_name="u2net"):
-    if model_name == "u2net":
-        from preprocessing.rembg.assets import ensure_assets
-        ensure_assets()
-    os.environ["U2NET_HOME"] = resolve_rembg_home()
-    import onnxruntime as ort
-    from rembg.sessions import sessions_class
-    # rembg 2.0.65 hard-codes its providers, so the session is built here. On the GPU, onnxruntime's default exhaustive
-    # cuDNN search costs ~10 s on the first image; the heuristic choice gives the same masks.
-    session_class = next(cls for cls in sessions_class if cls.name() == model_name)
-    session = session_class.__new__(session_class)
-    session.model_name = model_name
-    cuda = not REMBG_ON_CPU and "CUDAExecutionProvider" in ort.get_available_providers()
-    providers = [("CUDAExecutionProvider", {"cudnn_conv_algo_search": "HEURISTIC"}), "CPUExecutionProvider"] if cuda else ["CPUExecutionProvider"]
-    session.inner_session = ort.InferenceSession(str(session_class.download_models()), sess_options=ort.SessionOptions(), providers=providers)
-    return session
+    from preprocessing.rembg.native import NativeSession
+    return NativeSession(model_name)
+
 
 def remove_background(img, session=None):
     if session ==None:
         session = new_rembg_session() 
     img = Image.fromarray(np.clip(255. * img.movedim(0, -1).cpu().numpy(), 0, 255).astype(np.uint8))
-    img = remove(img, session=session, alpha_matting = True, bgcolor=[255, 255, 255, 0]).convert('RGB')
+    img = remove(img, session=session, alpha_matting=session.model_name == "u2net", bgcolor=[255, 255, 255, 0]).convert('RGB')
     return torch.from_numpy(np.array(img).astype(np.float32) / 255.0).movedim(-1, 0)
 
 
@@ -457,7 +454,7 @@ def convert_video_tensor_to_uint8_chunked(video, value_range=(-1, 1), max_buffer
         work = buffer.narrow(time_dim, 0, size)
         work.copy_(video.narrow(time_dim, start, size))
         work.sub_(min_val).mul_(scale).clamp_(0, 255)
-        output.narrow(time_dim, start, size).copy_(work)
+        transfer.copy_(output.narrow(time_dim, start, size), work)  # (to RAM, without temporaries of the chunk)
     return output
 
 def save_image(tensor_image, name, frame_no = -1):
@@ -701,11 +698,12 @@ def calculate_dimensions_and_resize_image(image, canvas_height, canvas_width, fi
         image = image.resize((new_width, new_height), resample=Image.Resampling.LANCZOS) 
     return image, new_height, new_width
 
-def resize_and_remove_background(img_list, budget_width, budget_height, rm_background, any_background_ref, fit_into_canvas = 0, block_size= 16, outpainting_dims = None, outpainting_ratio = "", background_ref_outpainted = True, inpaint_color = 127.5, return_tensor = False, ignore_last_refs = 0, background_removal_color =  [255, 255, 255], outpainting_quantize_margins = 0, keep_alpha = False, *, max_width=None, max_height=None):
+def resize_and_remove_background(img_list, budget_width, budget_height, rm_background, any_background_ref, fit_into_canvas = 0, block_size= 16, outpainting_dims = None, outpainting_ratio = "", background_ref_outpainted = True, inpaint_color = 127.5, return_tensor = False, ignore_last_refs = 0, background_removal_color =  [255, 255, 255], outpainting_quantize_margins = 0, keep_alpha = False, *, max_width=None, max_height=None, rembg_model="u2net"):
     if max_width is not None or max_height is not None:
         budget_height, budget_width = calculate_new_dimensions(budget_height, budget_width, budget_height, budget_width, 0, block_size=block_size, max_width=max_width, max_height=max_height)
     if rm_background:
-        session = new_rembg_session() 
+        session = new_rembg_session(rembg_model)
+        matting = session.model_name == "u2net"  # BiRefNet and Bria already produce soft masks
 
     output_list =[]
     output_mask_list =[]
@@ -739,9 +737,9 @@ def resize_and_remove_background(img_list, budget_width, budget_height, rm_backg
             # resized_image = remove(resized_image, session=session, alpha_matting_erode_size = 1,alpha_matting_background_threshold = 70, alpha_foreground_background_threshold = 100, alpha_matting = True, bgcolor=[255, 255, 255, 0]).convert('RGB')
             if keep_alpha:  # models reading the alpha channel get the transparent cut-out; an image already transparent is kept as is
                 if not (img.mode == "RGBA" and img.getextrema()[3][0] < 255):
-                    resized_image = remove(resized_image, session=session, alpha_matting_erode_size = 1, alpha_matting = True)
+                    resized_image = remove(resized_image, session=session, alpha_matting_erode_size = 1, alpha_matting = matting)
             else:
-                resized_image = remove(resized_image, session=session, alpha_matting_erode_size = 1, alpha_matting = True, bgcolor=background_removal_color + [0]).convert('RGB')
+                resized_image = remove(resized_image, session=session, alpha_matting_erode_size = 1, alpha_matting = matting, bgcolor=background_removal_color + [0]).convert('RGB')
         if return_tensor:
             output_list.append(convert_image_to_tensor(resized_image).unsqueeze(1)) 
         else:

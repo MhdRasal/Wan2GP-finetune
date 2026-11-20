@@ -57,6 +57,8 @@ def action_definition(action) -> dict[str, Any]:
         replaced = {"type", "anyOf", "oneOf", "enum", "const"} & override.keys()
         properties[name] = {**({key: value for key, value in properties[name].items() if key == "default"} if replaced else properties[name]), **copy.deepcopy(override)}
     definition["_summary"] = action.summary
+    if not action.listed:
+        definition["_unlisted"] = True
     if action.routing:
         definition["use_when"] = action.routing
     if action.example is not None:
@@ -248,6 +250,10 @@ def register(mcp, session, jobs, policy, *, allow_async: bool, virtualized: bool
         return policy.virtualize_result(result) if virtualized else result
 
     def wangp_plugins(plugin: str | None = None, action: str | None = None, arguments: dict[str, Any] | None = None, wait: bool = True) -> dict[str, Any]:
+        if not plugin and isinstance(arguments, dict) and isinstance(arguments.get("plugin"), str):  # the call wrapped one level too deep:
+            arguments = dict(arguments)                                                                   # {"arguments": {"plugin", "action"?, "arguments"}}
+            plugin, action = arguments.pop("plugin"), action or arguments.pop("action", None)
+            arguments = arguments.pop("arguments", arguments)
         if not plugin:
             if action or arguments:
                 raise ValueError(f"Name the plugin beside action: {{\"plugin\": \"<plugin>\", \"action\": \"{action or '<action>'}\", \"arguments\": {{...}}}}. Plugins: {', '.join(toolboxes)}. Nothing was executed.")
@@ -261,7 +267,7 @@ def register(mcp, session, jobs, policy, *, allow_async: bool, virtualized: bool
             response["plugin"] = plugin
             if response["status"] == "discovery":
                 response["guide"] = box.guide
-                skills = {skill.uri: skill.description for skill in plugin_skills(box.plugin_id)}
+                skills = {skill.uri: skill.description for skill in plugin_skills(box.plugin_id) if skill.listed}
                 if skills:
                     response["skills"] = skills
                 response["usage"] = "Execute: plugin + action + arguments={...} following the call (* = required). Read the contract (arguments=null) for rules, defaults and examples." + (" Read the skills (resource URIs) for the plugin's method." if skills else "")

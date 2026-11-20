@@ -2,9 +2,11 @@
 import json
 import math
 import hashlib
+import re
 
 import numpy as np
 import torch
+from mmgp import runtime
 from diffusers import FlowMatchEulerDiscreteScheduler
 from tqdm import tqdm
 
@@ -32,6 +34,27 @@ PRUNA_SIGMAS = {
     5: (1.0, 0.94, 6 / 7, 2 / 3, 0.4),
     8: (1.0, 14 / 15, 6 / 7, 10 / 13, 2 / 3, 6 / 11, 0.4, 2 / 9),
 }
+ORDINALS = ("first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth")
+IMAGE_NUMBER = re.compile(r"\b(<?image\s*)(\d+)", re.IGNORECASE)
+IMAGE_ORDINAL = re.compile(r"\b(" + "|".join(ORDINALS) + r"|last)(?=\s+(?:(?:reference|input|source)\s+)?(?:image|picture|photo)s?\b)", re.IGNORECASE)
+
+
+def main_image_last_prompt(prompt, count):
+    """Renumber the prompt's image references for images passed with the main image moved last: image 1 becomes image `count` and
+    image k image k - 1, as numbers ("image 2", "<image2>") and as ordinals ("the first image" -> "the last image")."""
+    moved = lambda k: count if k == 1 else k - 1
+    def number(match):
+        k = int(match.group(2))
+        return match.group(1) + str(moved(k)) if 1 <= k <= count else match.group(0)
+    def ordinal(match):
+        word = match.group(1)
+        k = count if word.lower() == "last" else ORDINALS.index(word.lower()) + 1
+        if k > count:
+            return word
+        k = moved(k)
+        new = "last" if k == count else ORDINALS[k - 1]
+        return new.capitalize() if word[0].isupper() else new
+    return IMAGE_ORDINAL.sub(ordinal, IMAGE_NUMBER.sub(number, prompt))
 
 
 def reference_outpainting_offset(location, width, height):
@@ -163,8 +186,9 @@ def source_latent_canvas(source, width, height, location):
 
 
 class Qwen21Pipeline(QwenImage21Pipeline):
-    def __init__(self, transformer, text_encoder, vae, processor, scheduler_config):
+    def __init__(self, transformer, text_encoder, vae, processor, scheduler_config, main_image_last=False):
         self.transformer, self.text_encoder, self.vae = transformer, text_encoder, vae
+        self.main_image_last = main_image_last  # the model was trained with the main image after the other references
         self.processor, self.tokenizer = processor, processor.tokenizer
         self._interrupt = False
         self.text_encoder_cache = TextEncoderCache()
@@ -213,7 +237,7 @@ class Qwen21Pipeline(QwenImage21Pipeline):
         device = torch.device("cuda")
         output_channels = 4 if (custom_settings or {}).get("rgba", "Disabled") == "Enabled" else 3
         kv_cache_mode = (custom_settings or {}).get("qwen21_kv_cache", "Disabled")
-        use_kv_cache = kv_cache_mode in ("Enabled", "INT8", "INT8_RAM")
+        use_kv_cache = kv_cache_mode in ("INT8", "INT8_RAM")
         border_method = OUTPAINTING_METHOD
         if border_method not in ("Red Canvas", "Reference"):
             raise ValueError(f"Unknown outpainting border method: {border_method}")
@@ -221,6 +245,9 @@ class Qwen21Pipeline(QwenImage21Pipeline):
         images = list(input_ref_images) if input_ref_images else []
         if input_frames is not None:
             images.insert(0, convert_tensor_to_image(input_frames))
+        if self.main_image_last and len(images) > 1:
+            images.append(images.pop(0))
+            input_prompt = main_image_last_prompt(input_prompt, len(images))
         if len(images) > 10:
             raise ValueError("Qwen Image 2.1 accepts at most 10 reference images.")
         if width % 32 or height % 32:
@@ -290,9 +317,11 @@ class Qwen21Pipeline(QwenImage21Pipeline):
                 branch["img_mask"] = torch.cat([slots, slots.new_ones(slots.shape[0], latents.shape[1] // 4)], dim=1)
                 branch["img_shapes"] = [shapes] * batch_size
                 branch["target_rope_offset"] = target_rope_offset
-                # INT8_RAM: the layers in RAM, streamed to the GPU with the blocks (NAG reads its cache outside the blocks: kept in VRAM)
-                cache = QwenImage21KVCache(self.transformer.transformer_blocks, quantize=kv_cache_mode in ("INT8", "INT8_RAM"), native=nag_parameters is None,
-                                           ram=kv_cache_mode == "INT8_RAM" and nag_parameters is None) if use_kv_cache else None
+                # INT8_RAM: the layers in RAM, streamed to the GPU with the blocks (NAG reads its cache outside the blocks: kept in VRAM);
+                # Enabled / INT8: in VRAM as far as it fits beside the weights, the other layers in RAM and streamed
+                cache = QwenImage21KVCache(self.transformer.transformer_blocks, quantize=True, native=nag_parameters is None,
+                                           ram=kv_cache_mode == "INT8_RAM" and nag_parameters is None,
+                                           dynamic=kv_cache_mode == "INT8") if use_kv_cache else None
                 branch["kv_cache"] = cache
                 if cache is not None:
                     caches.append(cache)
@@ -364,7 +393,7 @@ class Qwen21Pipeline(QwenImage21Pipeline):
                 def denoise(value, guidance):
                     model_input = torch.cat([condition, value], dim=1) if condition is not None else value
                     inputs = [{**branch, "hidden_states": model_input, "timestep": timestep.expand(batch_size).to(dtype) / 1000, "kv_cache_mode": None if branch["kv_cache"] is None else ("extract" if branch["kv_cache"].layer_caches[0].empty() else "cached"), "return_dict": False} for branch in branches]
-                    predictions = self.transformer(branches=inputs, nag_parameters=nag_parameters) if nag_parameters or (joint_pass and len(inputs) > 1) else [self.transformer(**item)[0] for item in inputs]
+                    predictions = self.transformer(branches=inputs, nag_parameters=nag_parameters) if nag_parameters or (joint_pass and runtime.joint_pass_useful(self.transformer, model_input.shape[1], self.transformer.inner_dim, len(inputs))) else [self.transformer(**item)[0] for item in inputs]
                     return predictions[0][:, -value.shape[1]:], predictions[1][:, -value.shape[1]:] if len(predictions) > 1 else None
                 def combine(positive, negative, guidance, time):
                     return positive if negative is None else negative + guidance * (positive - negative)

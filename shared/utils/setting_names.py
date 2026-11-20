@@ -15,7 +15,7 @@ from pathlib import Path
 SETTINGS_CATALOG = Path(__file__).resolve().parents[2] / "models" / "_settings.json"
 
 NON_SETTING_KEYS = frozenset({
-    "model_type", "base_model_type", "model_filename", "type", "settings_version", "mode", "state", "spatial_upsampler_parameters",
+    "model_type", "base_model_type", "model_filename", "type", "settings_version", "mode", "state",
     "priority", "frame_scheduler", "send_cmd", "task", "target", "image_mask_guide", "loras_choices", "plugin_data",
     "profile_priority", "help", "creation_date", "creation_timestamp", "generation_time", "is_image", "window_no", "custom_guide_used", "_settings_bundle_task_count",
     "image_quality", "video_quality", "hdr", "hdr_video_crf", "modules", "transformer_loras_filenames", "transformer_loras_multipliers",
@@ -23,7 +23,8 @@ NON_SETTING_KEYS = frozenset({
 })
 
 DEPRECATED_SETTING_KEYS = frozenset({
-    "prompts", "lset_name", "slg_switch", "slg_layers", "slg_start_perc", "slg_end_perc", "tea_cache_setting", "tea_cache_start_step_perc", "spatial_upsampler_face_count",
+    "prompts", "lset_name", "slg_switch", "slg_layers", "slg_start_perc", "slg_end_perc", "tea_cache_setting", "tea_cache_start_step_perc", "spatial_upsampler_face_count", "spatial_upsampler_parameters", "postprocessing_parameters",
+    "temporal_upsampler_parameters", "spatial_upsampler_prompt", "spatial_upsampler_reference_images", "spatial_upsampler_param", "spatial_upsampler_param2",
     "scheduler_type", "shift", "adaptive_switch", "MMAudio_setting", "MMAudio_prompt", "MMAudio_neg_prompt", "seedvc_voice_sample", "seedvc_voice_sample2",
     "fps", "sampling_steps", "sampler_solver", "sample_solvers", "enhanced_prompt", "enhanced_alt_prompt", "audio_postprocess", "audio_cfg_scale", "pace", "exaggeration",
     "override_profile", "override_compile", "override_attention",
@@ -37,6 +38,7 @@ SETTING_HINTS = {
     "sampler": "sample_solver", "scheduler": "sample_solver", "solver": "sample_solver",
     "frames": "video_length", "num_frames": "video_length", "duration": "duration_seconds", "negative": "negative_prompt",
     "lora": "activated_loras", "loras": "activated_loras", **dict.fromkeys(("name", "filename", "output_name"), "output_filename"),
+    **dict.fromkeys(("image", "images", "reference_image", "reference_images"), "image_refs, a list of reference pictures, or image_start for an opening frame"), "mesh": "custom_guide",
     **dict.fromkeys(("accelerator", "accelerator_profile", "profile"), "an accelerator profile's settings"),
 }
 # Model information returned beside template settings and in model metadata: never a setting.

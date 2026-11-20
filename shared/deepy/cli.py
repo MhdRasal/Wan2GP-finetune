@@ -72,6 +72,12 @@ _TOOL_ALIASES = {
     "world": "gen_world",
     "gen_3d": "gen_3d",
     "3d": "gen_3d",
+    "texture_3d": "texture_3d",
+    "texture": "texture_3d",
+    "swap_video": "swap_video",
+    "video_swap": "swap_video",
+    "edit_video": "edit_video",
+    "video_edit": "edit_video",
 }
 
 

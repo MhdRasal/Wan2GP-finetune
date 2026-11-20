@@ -43,6 +43,12 @@ from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse
 APP_NAME = os.environ.get("MODAL_APP_NAME", "wan2gp-prod3")
 EXPECTED_API_KEY = os.environ.get("MODAL_API_KEY", "")
 
+# Source repository used by the Modal worker. Defaults to the cloud/finetune fork so
+# the worker runs the same code as the client. Override with WAN2GP_REPO_URL /
+# WAN2GP_GIT_REF for a different fork or branch.
+WAN2GP_REPO_URL = os.environ.get("WAN2GP_REPO_URL", "https://github.com/MhdRasal/Wan2GP-finetune.git")
+WAN2GP_GIT_REF = os.environ.get("WAN2GP_GIT_REF", "main")
+
 # Maximum concurrent GPU containers (0 = unlimited, Modal account quota applies)
 MAX_CONCURRENT_CLOUD_JOBS = int(os.environ.get("MAX_CONCURRENT_CLOUD_JOBS", "0"))
 
@@ -604,7 +610,7 @@ wan2gp_image = (
         extra_options="--extra-index-url https://download.pytorch.org/whl/cu124 --progress-bar off"
     )
     .run_commands(
-        "git clone --depth 1 https://github.com/deepbeepmeep/Wan2GP.git /root/Wan2GP",
+        f"git clone --depth 1 --branch {WAN2GP_GIT_REF} {WAN2GP_REPO_URL} /root/Wan2GP",
         "pip install 'https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.5cxx11abiFALSE-cp311-cp311-linux_x86_64.whl' --no-build-isolation || echo 'Flash-attn wheel install failed, non-fatal'"
     )
     .run_function(_bake_patches)
@@ -1202,27 +1208,28 @@ def patch_volume_repo() -> Dict[str, Any]:
 def update_wan2gp_volume_repo() -> Dict[str, str]:
     """
     CPU-Only update worker ($0 GPU cost):
-    1. Git pull official Wan2GP source into /models/Wan2GP
+    1. Git pull the configured Wan2GP fork into /models/Wan2GP
     2. Synchronizes /models/venv via pip install (all packages)
     3. Re-applies source patches to Wan2GP
     """
     target_dir = Path(MODELS_MOUNT) / "Wan2GP"
     if not target_dir.exists():
         res = subprocess.run(
-            ["git", "clone", "--depth", "1", "https://github.com/deepbeepmeep/Wan2GP.git", str(target_dir)],
+            ["git", "clone", "--depth", "1", "--branch", WAN2GP_GIT_REF, WAN2GP_REPO_URL, str(target_dir)],
             capture_output=True, text=True
         )
-        git_msg = f"Cloned fresh official repo: {res.stdout or res.stderr}"
+        git_msg = f"Cloned fresh Wan2GP fork: {res.stdout or res.stderr}"
     else:
-        # Reset altered files so git pull succeeds cleanly without conflict
+        # Reset altered files so fetch/reset succeeds cleanly without conflict
         subprocess.run(["git", "checkout", "--", "."], cwd=str(target_dir), capture_output=True)
-        subprocess.run(["git", "fetch", "origin", "main"], cwd=str(target_dir), capture_output=True)
+        subprocess.run(["git", "remote", "set-url", "origin", WAN2GP_REPO_URL], cwd=str(target_dir), capture_output=True)
+        subprocess.run(["git", "fetch", "origin", WAN2GP_GIT_REF], cwd=str(target_dir), capture_output=True)
         res = subprocess.run(
-            ["git", "pull", "origin", "main"],
+            ["git", "reset", "--hard", f"origin/{WAN2GP_GIT_REF}"],
             cwd=str(target_dir),
             capture_output=True, text=True
         )
-        git_msg = f"Pulled latest official updates: {res.stdout or res.stderr}"
+        git_msg = f"Pulled latest Wan2GP fork updates: {res.stdout or res.stderr}"
 
     # Sync volume venv with ALL requirements (installing full requirements.txt)
     venv_py = ensure_volume_venv(allow_install=True)

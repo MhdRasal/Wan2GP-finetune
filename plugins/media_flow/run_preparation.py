@@ -6,6 +6,7 @@ from pathlib import Path
 
 import gradio as gr
 
+from postprocessing import chunking
 from shared.utils.audio_video import extract_audio_tracks
 from shared.utils.utils import get_video_info_details
 from shared.utils.video_decode import resolve_media_binary
@@ -72,6 +73,7 @@ def prepare_run(
     source_audio_track: str,
     chunk_size_seconds: float,
     sliding_window_overlap: int,
+    sliding_window_size: int | None,
     start_seconds: float,
     end_seconds: float | None,
     model_type: str,
@@ -79,6 +81,7 @@ def prepare_run(
     uses_builtin_outpaint_ui: bool,
     system_handler=None,
     system_target_control: str = "",
+    expected_spatial_upsampling: str = "",
 ) -> PreparedRun:
     verbose_level = get_mmgp_verbose_level()
     try:
@@ -111,17 +114,18 @@ def prepare_run(
         budget_resolution = ""
         output_resolution_token = system_handler.output_resolution_token(system_target_control) if hasattr(system_handler, "output_resolution_token") else output_resolution
     try:
-        chunk_frame_step = int(getattr(system_handler, "chunk_frame_step", frame_plan_rules.frame_step)) if system_handler is not None else frame_plan_rules.frame_step
-        get_chunk_frames = getattr(system_handler, "get_chunk_frames", None) if system_handler is not None else None
-        chunk_frames = int(get_chunk_frames(end_frame_exclusive - start_frame)) if callable(get_chunk_frames) else frames.normalize_chunk_frames(chunk_size_seconds, processing_fps, frame_step=chunk_frame_step, minimum_requested_frames=frame_plan_rules.minimum_requested_frames, frame_offset=frame_plan_rules.frame_offset)
+        # the user's Chunk Size, unless the process has a window of its own
+        own_chunk_frames = lambda: frames.normalize_chunk_frames(chunk_size_seconds, processing_fps, frame_step=int(getattr(system_handler, "chunk_frame_step", frame_plan_rules.frame_step)), minimum_requested_frames=frame_plan_rules.minimum_requested_frames, frame_offset=frame_plan_rules.frame_offset)
         if system_handler is not None:
-            get_target_overlap_frames = getattr(system_handler, "get_overlap_frames_for_target", None)
-            get_overlap_frames = getattr(system_handler, "get_overlap_frames", None)
-            if callable(get_target_overlap_frames):
-                overlap_frames = int(get_target_overlap_frames(chunk_frames, system_target_control))
-            else:
-                overlap_frames = int(get_overlap_frames(chunk_frames)) if callable(get_overlap_frames) else int(getattr(system_handler, "overlap_frames", 0))
+            chunk_frames, overlap_frames = chunking.chunk_shape(system_handler, system_target_control, end_frame_exclusive - start_frame, own_chunk_frames)
         else:
+            chunk_frames = own_chunk_frames()
+            # WanGP splits a longer chunk into its own sliding windows: no gain, a coarser resume and a step counter that restarts in each window.
+            if sliding_window_size and frames.require_model_def(model_type, get_model_def).get("sliding_window", False):
+                window_frames = frames.align_requested_frames(int(sliding_window_size), frame_step=frame_plan_rules.frame_step, frame_offset=frame_plan_rules.frame_offset, round_up=False)
+                if chunk_frames > window_frames >= frame_plan_rules.minimum_requested_frames:
+                    common.plugin_info(f"Chunk Size reduced to {window_frames / processing_fps:.2f} seconds ({window_frames} frames), the longest piece this process generates in one pass.")
+                    chunk_frames = window_frames
             overlap_frames = frames.normalize_overlap_frames(sliding_window_overlap, frame_step=frame_plan_rules.frame_step)
     except frames.ChunkSizeBelowMinimumError as exc:
         raise ProcessInfoExit(str(exc)) from exc
@@ -149,7 +153,7 @@ def prepare_run(
     requested_output_path = str(output_paths.build_requested_output_path(source_path, output_path, process_display_name, active_target_ratio, output_resolution_token, start_seconds, end_seconds, has_outpaint=uses_builtin_outpaint_ui, default_container=default_output_container))
     if continue_enabled:
         existing_identity = process_metadata.read_output_identity(requested_output_path)
-        identity_mismatch_message = process_metadata.get_output_identity_mismatch_message(requested_output_path, process_name=process_display_name, source_path=source_path, source_segment=requested_source_segment)
+        identity_mismatch_message = process_metadata.get_output_identity_mismatch_message(requested_output_path, existing_identity, process_name=process_display_name, source_path=source_path, source_segment=requested_source_segment, spatial_upsampling=expected_spatial_upsampling)
         if identity_mismatch_message is not None:
             system_supports_continue_cache = system_handler is not None and (not callable(getattr(system_handler, "supports_continue_cache_for_target", None)) or system_handler.supports_continue_cache_for_target(system_target_control))
             can_resume_from_system_state = existing_identity is None and system_supports_continue_cache and callable(getattr(system_handler, "can_resume_without_output_metadata", None)) and system_handler.can_resume_without_output_metadata(requested_output_path)

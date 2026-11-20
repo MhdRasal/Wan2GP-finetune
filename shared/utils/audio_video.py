@@ -22,7 +22,7 @@ import zlib
 import re
 from .hdr import hdr10_x265_params, hdr10_zscale_filter, iter_hdr_gbrpf32_frames, iter_video_chunks
 
-from .video_decode import probe_video_stream_metadata, resolve_media_binary
+from .video_decode import picture_duration, probe_video_stream_metadata, resolve_media_binary
 from .video_codecs import SUPPORTED_VIDEO_CONTAINERS, get_imageio_codec_params, get_video_encode_args, validate_video_output_settings
 from .virtual_media import get_virtual_media_entry, parse_virtual_media_path, strip_virtual_media_suffix
 
@@ -475,7 +475,7 @@ def _run_ffmpeg_encode(input_path, output_path, codec, bitrate=None, sample_rate
     if sample_rate:
         cmd += ["-ar", str(int(sample_rate))]
     cmd.append(output_path)
-    subprocess.run(cmd, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    subprocess.run(cmd, stdin=subprocess.DEVNULL, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace")
 
 
 def save_audio_file(path, audio_data, sample_rate, codec_key="wav"):
@@ -511,8 +511,14 @@ def _resolve_virtual_audio_segment(video_path: str) -> tuple[str, dict[str, Any]
     time_args: dict[str, Any] = {}
     if spec is None:
         return source_path, time_args, 0
-    metadata = probe_video_stream_metadata(video_path)
-    if metadata is not None and metadata.get("virtual_end_frame") is not None:
+    if spec.start_s is not None or spec.end_s is not None:  # named in seconds: the sound at those seconds (an audio file has no frames; a video's picture takes the nearest ones)
+        time_args["ss"] = spec.start_s or 0.0
+        if spec.end_s is not None:
+            time_args["to"] = max(time_args["ss"], spec.end_s)
+    elif (metadata := probe_video_stream_metadata(video_path)) is None:
+        if spec.start_frame or spec.end_frame is not None:
+            raise ValueError(f"An audio file has no frames: name its part in seconds (start_s, end_s): {video_path}")
+    elif metadata.get("virtual_end_frame") is not None:
         start_frame = int(metadata.get("virtual_start_frame") or 0)
         end_frame = int(metadata.get("virtual_end_frame") or start_frame)
         fps_float = float(metadata.get("fps_float") or metadata.get("fps") or 0.0)
@@ -535,7 +541,7 @@ def extract_audio_track_to_wav(video_path, output_path):
     import ffmpeg
     try:
         output_kwargs = {"map": f"0:a:{audio_track_index}", "acodec": "pcm_s16le"}
-        ffmpeg.input(source_path, **time_args).output(output_path, **output_kwargs).overwrite_output().run(cmd=_ffmpeg_binary(), quiet=True)
+        ffmpeg.input(source_path, **time_args).output(output_path, **output_kwargs).overwrite_output().global_args("-nostdin").run(cmd=_ffmpeg_binary(), quiet=True)
     except ffmpeg.Error as err:
         stderr = getattr(err, "stderr", b"")
         if isinstance(stderr, (bytes, bytearray)):
@@ -621,7 +627,7 @@ def extract_audio_tracks(source_video, verbose=False, query_only=False, codec_ke
             output_kwargs['b:a'] = audio_settings["bitrate"]
         if audio_settings.get("sample_fmt"):
             output_kwargs["sample_fmt"] = audio_settings["sample_fmt"]
-        ffmpeg.input(source_path, **time_args).output(temp_path, **output_kwargs).overwrite_output().run(cmd=_ffmpeg_binary(), quiet=not verbose)
+        ffmpeg.input(source_path, **time_args).output(temp_path, **output_kwargs).overwrite_output().global_args("-nostdin").run(cmd=_ffmpeg_binary(), quiet=not verbose)
 
     return file_paths, metadata
 
@@ -707,10 +713,8 @@ def combine_and_concatenate_video_with_audio_tracks(
 
         maps += ['-map', f'[aout{i}]']
 
-    duration_args = ['-shortest']
-    if audio_tail_seconds > 0:
-        video_duration = float(next(s for s in ffmpeg.probe(video_path, cmd=_ffprobe_binary())['streams'] if s['codec_type'] == 'video')['duration'])
-        duration_args = ['-t', str(video_duration + audio_tail_seconds)]
+    # the sound ends with the picture, or with its tail: -shortest drops the last partial audio frame (AAC: up to 21 ms, a hole at each join of a merge)
+    duration_args = ['-t', f'{picture_duration(video_path) + audio_tail_seconds:.6f}']
     cmd = [_ffmpeg_binary(), '-y', *inputs,
            '-filter_complex', ';'.join(filters),  # ✅ Only change made
            *maps, *metadata_args,
@@ -723,7 +727,7 @@ def combine_and_concatenate_video_with_audio_tracks(
     if verbose:
         print(f"ffmpeg command: {cmd}")
     try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        subprocess.run(cmd, stdin=subprocess.DEVNULL, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace")
     except subprocess.CalledProcessError as e:
         raise Exception(f"FFmpeg error: {e.stderr}")
 
@@ -735,9 +739,10 @@ def subtitle_stream_count(path):
 
 
 def combine_video_with_audio_tracks(target_video, audio_tracks, output_video,
-                                     audio_metadata=None, audio_codec_key="aac_128", verbose=False, video_duration=None, subtitle_source=None):
-    """Mux audio tracks, and the subtitle tracks of subtitle_source when given, with the video stream of target_video."""
-    extra_audio_args = get_video_audio_extra_args(audio_codec_key, output_video)
+                                     audio_metadata=None, audio_codec_key="aac_128", verbose=False, video_duration=None, subtitle_source=None, audio_start_time=0.0):
+    """Mux audio from audio_start_time, limited to the picture's duration. The 'copy' codec preserves encoded audio packets.
+    Also mux the subtitle tracks of subtitle_source when given."""
+    extra_audio_args = [] if audio_codec_key == "copy" else get_video_audio_extra_args(audio_codec_key, output_video)
     if not audio_tracks and subtitle_source is None:
         if verbose: print("No audio tracks to combine."); return False
 
@@ -749,6 +754,8 @@ def combine_video_with_audio_tracks(target_video, audio_tracks, output_video,
 
     cmd = [_ffmpeg_binary(), '-y', '-i', target_video]
     for path in audio_tracks:
+        if audio_start_time > 0:
+            cmd += ['-ss', str(audio_start_time)]
         cmd += ['-i', path]
     if subtitle_source is not None:
         source_path, time_args, _ = _resolve_virtual_audio_segment(subtitle_source)
@@ -773,18 +780,34 @@ def combine_video_with_audio_tracks(target_video, audio_tracks, output_video,
         if (lang := meta.get('language')):
             cmd += ['-metadata:s:a:' + str(i), f'language={lang}']
 
-    audio_settings = get_mp4_audio_codec_settings(audio_codec_key)
+    audio_settings = {"codec": "copy", "bitrate": None} if audio_codec_key == "copy" else get_mp4_audio_codec_settings(audio_codec_key)
     cmd += ['-c:v', 'copy', '-c:a', audio_settings["codec"], *extra_audio_args]
     if audio_settings["bitrate"]:
         cmd += ['-b:a', audio_settings["bitrate"]]
     cmd += ['-t', str(dur), output_video]
 
-    result = subprocess.run(cmd, capture_output=not verbose, text=True, encoding="utf-8", errors="replace")
+    result = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=not verbose, text=True, encoding="utf-8", errors="replace")
     if result.returncode != 0:
         raise Exception(f"FFmpeg error:\n{result.stderr}")
     if verbose:
         print(f"Created {output_video} with {len(audio_tracks)} audio track(s)")
     return True
+
+
+def subtitled_video_extension(source_video):
+    """The container of a copy of source_video with an added text subtitle track: MP4 and MOV keep theirs (mov_text), others become MKV."""
+    extension = os.path.splitext(source_video)[1].lower()
+    return ".mov" if extension == ".mov" else ".mp4" if extension in (".mp4", ".m4v") else ".mkv"
+
+
+def add_subtitle_track(source_video, subtitles, output_video, title=None):
+    """Copy the video and audio streams of source_video (no re-encoding) into output_video with the SRT file subtitles as its subtitle track,
+    shown by default (the source's own subtitle tracks are not kept)."""
+    cmd = [_ffmpeg_binary(), '-y', '-v', 'error', '-i', source_video, '-i', subtitles, '-map', '0:V', '-map', '0:a?', '-map', '1:s', '-c:v', 'copy', '-c:a', 'copy',
+           '-c:s', 'srt' if output_video.lower().endswith('.mkv') else 'mov_text', '-disposition:s:0', 'default', *(['-metadata:s:s:0', f'title={title}'] if title else []), output_video]
+    result = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if result.returncode != 0:
+        raise Exception(f"FFmpeg error:\n{result.stderr}")
 
 
 def cleanup_temp_audio_files(audio_tracks, verbose=False):
@@ -818,6 +841,55 @@ def cleanup_temp_audio_files(audio_tracks, verbose=False):
     return deleted_count
 
 
+class FrameChunks:
+    """Frames given to save_video a few at a time: read(start, count) returns frames start to start + count - 1 as a (frames, H, W, C)
+    tensor. A long video is encoded without being held in memory."""
+    def __init__(self, read, frames_count, chunk_frames):
+        self.read, self.frames_count, self.chunk_frames = read, int(frames_count), max(1, int(chunk_frames))
+
+    def __iter__(self):
+        for start in range(0, self.frames_count, self.chunk_frames):
+            yield self.read(start, min(self.chunk_frames, self.frames_count - start))
+
+
+def video_stream_facts(video_path):
+    """What tells whether two files hold video streams encoded alike, so that one can follow the other without being encoded again:
+    codec, pixel format, size and the encoder's parameter sets; with them the number of pictures the file really holds (counted, not
+    announced) and when its picture starts inside the file (a sound track can shift it)."""
+    command = [_ffprobe_binary(), "-v", "error", "-select_streams", "v:0", "-count_packets", "-show_data_hash", "md5",
+               "-show_entries", "stream=codec_name,profile,pix_fmt,width,height,extradata_hash,nb_read_packets,start_time:format=start_time", "-of", "json", os.fspath(video_path)]
+    probe = json.loads(subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="ignore", check=True).stdout)
+    stream, start_times = probe["streams"][0], []
+    for value in (stream.get("start_time"), probe["format"].get("start_time")):
+        try:
+            start_times.append(float(value))
+        except (TypeError, ValueError):
+            start_times.append(0.0)
+    return {"encoding": tuple(stream.get(key) for key in ("codec_name", "profile", "pix_fmt", "width", "height", "extradata_hash")),
+            "frames": int(stream.get("nb_read_packets") or 0), "picture_start": start_times[0] - start_times[1]}
+
+
+def join_video_streams(video_paths, frame_counts, fps, output_path, picture_starts=None):
+    """Write to output_path the pictures of video_paths one after the other, copied as they are (nothing is encoded again; sound is left
+    out). The files must be encoded alike (video_stream_facts). Each file lasts its frame_counts frames at fps whatever length its
+    container states: a sound track running past the last picture does not open a gap before the next file."""
+    starts = [video_stream_facts(path)["picture_start"] for path in video_paths] if picture_starts is None else list(picture_starts)
+    listing = os.fspath(output_path) + ".txt"
+    with open(listing, "w", encoding="utf-8") as writer:
+        for no, (path, frames) in enumerate(zip(video_paths, frame_counts)):
+            duration = frames / fps + (starts[no] - starts[no + 1] if no + 1 < len(starts) else 0.0)
+            writer.write("file '" + os.path.abspath(path).replace("\\", "/").replace("'", "'\\''") + f"'\nduration {duration:.9f}\n")
+    try:
+        # auto_convert 0: the pictures keep their bytes (the demuxer would otherwise write the encoder's parameter sets again in each key frame)
+        result = subprocess.run([_ffmpeg_binary(), "-y", "-v", "error", "-f", "concat", "-safe", "0", "-auto_convert", "0", "-i", listing, "-map", "0:v:0", "-c", "copy", os.fspath(output_path)],
+                                stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    finally:
+        os.remove(listing)
+    if result.returncode != 0:
+        raise Exception(f"FFmpeg error: {result.stderr}")
+    return output_path
+
+
 def save_video(tensor,
                 save_file=None,
                 fps=30,
@@ -841,6 +913,8 @@ def save_video(tensor,
     
     # Configure codec parameters
     codec_params = _get_codec_params(codec_type, container)
+    if float(fps) != int(fps):  # the writer rounds a rate to 2 decimals: 23.98 for 23.976 drifts from the sound. A later -r replaces it
+        codec_params = {**codec_params, "input_params": ["-r", f"{fps:.9f}"]}
     
     # Process and save
     error = None
@@ -865,7 +939,7 @@ def save_video(tensor,
                             )
                             frame = grid.mul(255).type(torch.uint8).permute(1, 2, 0).cpu().numpy()
                             writer.append_data(frame)
-                elif isinstance(tensor, (list, tuple)) and tensor and torch.is_tensor(tensor[0]):
+                elif isinstance(tensor, FrameChunks) or isinstance(tensor, (list, tuple)) and tensor and torch.is_tensor(tensor[0]):
                     for chunk in tensor:
                         if chunk is None:
                             continue

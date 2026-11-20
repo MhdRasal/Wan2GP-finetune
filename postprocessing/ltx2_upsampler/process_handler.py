@@ -177,7 +177,7 @@ class LTXDetailRefinerProcessHandler:
 
     def build_queue_settings(self, process_settings: dict, *, source_path: str, start_frame: int, frame_count: int, target_control: str, seed: int, continue_cache: Any, audio_track_no: int | None = None) -> dict:
         settings = _queue_settings(process_settings, self.model_type, source_path, start_frame, frame_count, self.normalize_target_control(target_control), audio_track_no)
-        settings["spatial_upsampler_prompt"] = str(settings.get("prompt") or "")
+        settings["spatial_postprocessing_parameters"] = {**dict(settings.get("spatial_postprocessing_parameters") or {}), "refine_prompt": str(settings.get("prompt") or "")}
         if _chunk_mode() in ("fusion", "conditioning"):
             carry = continue_cache if continue_cache is not None and continue_cache[REFINE_CARRY_START_KEY] == int(start_frame) else None
             if continue_cache is not None and carry is None:
@@ -194,6 +194,8 @@ class LTXDetailRefinerProcessHandler:
     @staticmethod
     def supports_continue_cache_for_target(value: str | None) -> bool:
         return _chunk_mode() in ("fusion", "conditioning")
+
+    carries_cache = supports_continue_cache_for_target  # each chunk hands its refined shared frames to the next one
 
     @staticmethod
     def cache_sidecar_path(output_filename: str) -> str:

@@ -102,12 +102,17 @@ class LTXVideoUpsamplerBridge(SimpleScaleSuffixMixin):
                 REFINE_METHOD: "Rebuild fine texture, edges and grain in soft, compressed, upscaled or generated video with the LTX 2.5 Refine Details IC-LoRA, keeping framing, exposure and color. The source is resized with Lanczos, then refined in overlapping 1024x576 tiles fused at every step, so x1 (detail only), x1.5 and x2 outputs up to 8K can be processed. Best for 1080p to 4K. Slow: 4K needs 49 tiles per step. Temporal window and gentle mode are configurable in Extensions.",
             },
             "method_parameters": {REFINE_METHOD: [
-                {"name": "spatial_upsampler_prompt", "setting": "refine_prompt", "type": "string", "component": "textbox", "ui": (PARAMETER_UI_POSTPROCESSING, PARAMETER_UI_LATE_POSTPROCESSING), "required": False, "default": DEFAULT_REFINE_PROMPT, "label": "Refiner Style Prompt", "description": "Describe rendering only: sharpness, texture, grain, light. Every tile receives the whole prompt, so naming subjects can paint them into unrelated parts of the frame.", "lines": 2},
+                {"name": "refine_prompt", "setting": "refine_prompt", "type": "string", "component": "textbox", "ui": (PARAMETER_UI_POSTPROCESSING, PARAMETER_UI_LATE_POSTPROCESSING), "required": False, "default": DEFAULT_REFINE_PROMPT, "label": "Refiner Style Prompt", "description": "Describe rendering only: sharpness, texture, grain, light. Every tile receives the whole prompt, so naming subjects can paint them into unrelated parts of the frame.", "lines": 2},
             ]},
         }
 
     def enabled(self) -> bool:
         return True
+
+    def query_chunking(self, spatial_upsampling):
+        """How a long video goes through this upsampler a chunk at a time (postprocessing.chunking)."""
+        from .process_handler import HANDLER, REFINER_HANDLER
+        return REFINER_HANDLER if self.split_value(spatial_upsampling)[0] == REFINE_METHOD else HANDLER
 
     def validate_upsampling(self, spatial_upsampling, image_mode: int) -> str:
         split = self.split_value(spatial_upsampling)
@@ -118,6 +123,12 @@ class LTXVideoUpsamplerBridge(SimpleScaleSuffixMixin):
         if split is None or split[0] not in MODEL_TYPES or split[1] != 2.0:
             return "LTX video upsampling only supports x2"
         return ""
+
+    def query_checkpoint_inventory(self):
+        from .runtime import LORA_KEYS
+        for label, method in self.METHODS:
+            model = MODEL_TYPES[method]
+            yield {"name": "LTX", "variant": label.removeprefix("LTX "), "model_types": [model], "model_lora_keys": {model: LORA_KEYS[method]}}
 
     def download(self, process_files: Callable[..., Any], send_cmd=None, status_text: str | None = None, spatial_upsampling=None) -> bool:
         split = self.split_value(spatial_upsampling)
@@ -153,7 +164,7 @@ class LTXVideoUpsamplerBridge(SimpleScaleSuffixMixin):
 
         load_model(self.split_value(spatial_upsampling)[0])
 
-    def upscale(self, sample, spatial_upsampling, *, vae_config: int, vae_tile_size=None, seed=0, fps=24.0, frame_offset=0, prompt="", negative_prompt="", refine_prompt="", continue_cache=None, return_continue_cache=False, audio_waveform=None, audio_sample_rate=0, source_audio_path=None, still_image=False, abort_callback=None, progress_callback=None, **kwargs):
+    def upscale(self, sample, spatial_upsampling, *, vae_config: int, vae_tile_size=None, seed=0, fps=24.0, frame_offset=0, prompt="", negative_prompt="", refine_prompt="", continue_cache=None, return_continue_cache=False, audio_waveform=None, audio_sample_rate=0, source_audio_path=None, audio_frame_offset=0, still_image=False, abort_callback=None, progress_callback=None, **kwargs):
         if still_image:
             raise ValueError("LTX video upsampling is available for videos only")
         split = self.split_value(spatial_upsampling)
@@ -164,8 +175,13 @@ class LTXVideoUpsamplerBridge(SimpleScaleSuffixMixin):
 
             config = self.config()
             return refine_video(sample, scale=split[1], prompt=str(refine_prompt or "").strip() or DEFAULT_REFINE_PROMPT, seed=seed, fps=fps, window_frames=config["refiner_window_size"], window_overlap=config["window_overlap"], gentle=config["refiner_gentle"], vae_config=vae_config, tiles_per_call=config["refiner_tiles_per_call"], frame_offset=frame_offset, continue_cache=continue_cache, return_continue_cache=return_continue_cache, abort_callback=abort_callback, progress_callback=progress_callback)
-        from .runtime import RUNTIME, upscale_video
+        from .runtime import RUNTIME, slice_audio_for_window, upscale_video
 
+        # File streaming passes the full soundtrack and its chunk offset. Media Flow and generated windows already supply local audio;
+        # their global frame_offset addresses noise only. The runtime's inner windows always read from this chunk's audio start.
+        if audio_frame_offset:
+            audio_waveform, audio_sample_rate = slice_audio_for_window(audio_waveform, audio_sample_rate, source_audio_path, audio_frame_offset, sample.shape[1], sample.shape[1], fps)
+            source_audio_path = None
         if vae_tile_size is None:
             vae_tile_size = RUNTIME.vae_tile_size(vae_config, supported_spatial_size(sample.shape[-2]) * 2, supported_spatial_size(sample.shape[-1]) * 2)
         config = self.config()

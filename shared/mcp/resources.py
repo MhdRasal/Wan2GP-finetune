@@ -8,17 +8,20 @@ import re
 from pathlib import Path
 from typing import Any
 
+from .skills import USER_SKILL_PREFIX
+
 WORKFLOWS_URI = "wangp://guides/workflows"
 GUIDE_PATH = Path(__file__).parents[1] / "deepy" / "prime_guide.md"
 INDEXED_DOCUMENTS = {WORKFLOWS_URI: GUIDE_PATH}  # index resources whose searches and section reads cover the whole document
 RESOURCE_ALIASES = {"wangp://guides/v2": "wangp://guides/workflows"}
-RESOURCE_DESCRIPTION = "Find documentation, skills and workflows. Without uri, query filters the resource index (e.g. 'skills' or a task). With uri, query searches passages ('*' lists headings), section reads matching headings; omit both for full text. User skills include a revision for updates with wangp_io(action='save_skill'). limit caps results/text blocks per page; cursor continues unchanged filters. Follow next_call for more."
+RESOURCE_DESCRIPTION = "Find and read WanGP documentation, skills and workflows. Without uri, query filters the resource index (e.g. 'skills' or a task). With uri, query searches passages ('*' lists headings), section reads matching headings; omit both for full text. Follow next_call for more."
 _MARKDOWN_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 
 
 GUIDE_SECTIONS = {  # heading -> when to read it; the workflows index lists these, each section is its own resource
     "Templates and generation": "choosing a template or model and building settings: defaults, accelerator profiles, presets, LoRAs, batches",
     "Media selection and inputs": "giving a generation images, videos or audio: start/end frames, references, control videos, masks, selected Gallery media",
+    "3D assets and worlds": "3D assets from text or a picture, refiners and texturers, retexturing a mesh, checking 3D views and animations; explorable worlds: walks, continuation, a picture from another viewpoint",
     "Post-processing and media utilities": "upscaling, frame interpolation, sound treatments, and the toolbox utilities (extract, merge, remux, resize, 3D views, SVG drawings)",
     "Speech and chained media": "speech, songs and media made from other generated media, such as talking videos driven by a speech clip",
     "Extraction by spoken words": "cutting audio or video where given words are spoken",
@@ -67,6 +70,14 @@ def plugin_skill_record(uri: str) -> dict[str, Any] | None:
     return {"server": "wangp", "uri": uri, "name": skill.name, "title": skill.name.replace("-", " ").title(), "description": skill.description, "mime_type": "text/markdown"}
 
 
+def user_skill_file_record(uri: str, resources) -> dict[str, Any] | None:
+    """The record of a file in a listed user skill (wangp://skills/user/<name>/<path>): its SKILL.md names it, listings do not."""
+    name, _, relative = uri.removeprefix(USER_SKILL_PREFIX).partition("/")
+    if not uri.startswith(USER_SKILL_PREFIX) or not relative or not any(resource["server"] == "wangp" and resource["uri"] == USER_SKILL_PREFIX + name for resource in resources):
+        return None
+    return {"server": "wangp", "uri": uri, "name": relative, "title": f"{name}/{relative}", "description": f"A file of the {name} skill.", "mime_type": "text/markdown" if relative.lower().endswith(".md") else "text/plain"}
+
+
 def resource_record(item, server="wangp"):
     return {"server": server, "uri": str(item.uri), "name": item.name, "title": item.title or item.name, "description": item.description or "", "mime_type": item.mimeType or ""}
 
@@ -94,7 +105,7 @@ async def query_resources(pages, resources, read_resource, arguments, *, servers
         page = pages.page(["resources", server, query], records, key="resources", limit=arguments.get("limit", 20), cursor=arguments.get("cursor"), metadata={"unavailable_servers": dict(unavailable_servers or {})})
     else:
         matches = [resource for resource in resources if resource["uri"] == uri and (not server or resource["server"] == server)]
-        if not matches and (not server or server == "wangp") and (section_record := indexed_section_record(uri) or plugin_skill_record(uri)) is not None:
+        if not matches and (not server or server == "wangp") and (section_record := indexed_section_record(uri) or plugin_skill_record(uri) or user_skill_file_record(uri, resources)) is not None:
             matches = [section_record]
         if not matches:
             prefix = uri.rsplit("/", 1)[0] + "/" if "/" in uri.removeprefix("wangp://") else ""
@@ -114,7 +125,7 @@ async def query_resources(pages, resources, read_resource, arguments, *, servers
             indexed = INDEXED_DOCUMENTS.get(uri) if server == "wangp" and (query or section) else None
             contents = [{"uri": uri, "mime_type": "text/markdown", "text": indexed.read_text(encoding="utf-8")}] if indexed else await read_resource(server, uri)
             metadata = {"server": server, "uri": uri}
-            if server == "wangp" and uri.startswith("wangp://skills/user/"):
+            if server == "wangp" and uri.startswith(USER_SKILL_PREFIX) and "/" not in uri.removeprefix(USER_SKILL_PREFIX):
                 metadata["revision"] = hashlib.sha256(contents[0]["text"].encode("utf-8")).hexdigest()
             if server == "wangp" and uri.startswith("wangp://docs/"):
                 metadata["applicability"] = matches[0]["description"]
@@ -196,7 +207,7 @@ def _select_markdown_sections(markdown: str, section_filter: str) -> tuple[str, 
         if not matches:
             matches = [section for section in sections if any(pattern in str(section[key]).casefold() for key in ("section", "heading"))]
     if not matches:
-        raise ValueError(f"Markdown section not found: {section_filter}")
+        raise ValueError(f"Markdown section not found: {section_filter}. Its sections: " + "; ".join(str(section["section"]) for section in sections))
     return "\n\n".join(str(section["content"]) for section in matches), [str(section["section"]) for section in matches]
 
 

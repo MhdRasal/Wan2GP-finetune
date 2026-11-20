@@ -143,7 +143,7 @@ def _serialize_request_into_zip(
     for bad_k in disallowed:
         params.pop(bad_k, None)
 
-    params.setdefault("settings_version", 2.79)
+    params.setdefault("settings_version", 2.83)
 
     return {
         "id": resolved_id,

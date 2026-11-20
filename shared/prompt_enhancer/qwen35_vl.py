@@ -6,7 +6,7 @@ import os
 import re
 import types
 from collections import OrderedDict
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 
 import torch
 
@@ -25,6 +25,7 @@ from shared.utils import files_locator as fl
 from shared.utils.cancellation import cancellation_context, check_cancelled
 
 from .assets import (
+    QWEN_CHECKPOINTS, qwen_download_defs,
     QWEN35_4B_TEXT_GGUF_FILENAME,
     QWEN35_4B_TEXT_INT8_FILENAME,
     QWEN35_4B_VISION_FILENAME,
@@ -38,6 +39,7 @@ from .assets import (
     QWEN35_VISION_FILENAME,
     QWEN38_VARIANT_27B,
     QWEN38_VARIANT_9B,
+    QWEN38_VARIANT_FLASH_NEXT,
 )
 from .qwen3_5 import load_qwen35_model_class
 from .progress import EnhancementProgress
@@ -73,6 +75,7 @@ QWEN35_VARIANT_ALIASES = {
     "qwen3.8-27b uncensored": QWEN38_VARIANT_27B,
     "qwen3.8-9b": QWEN38_VARIANT_9B,
     "qwen3.8-9b uncensored": QWEN38_VARIANT_9B,
+    "qwen3.8 flash-next": QWEN38_VARIANT_FLASH_NEXT,
 }
 
 
@@ -88,7 +91,7 @@ def get_qwen35_assets_dir_name(variant: str | None = None) -> str:
 
 
 def get_qwen35_prompt_enhancer_variant(model_no) -> str:
-    return {3: QWEN35_VARIANT_4B, 4: QWEN35_VARIANT_9B, 5: QWEN38_VARIANT_27B, 6: QWEN38_VARIANT_9B}[int(model_no)]
+    return {3: QWEN35_VARIANT_4B, 4: QWEN35_VARIANT_9B, 5: QWEN38_VARIANT_27B, 6: QWEN38_VARIANT_9B, 7: QWEN38_VARIANT_FLASH_NEXT}[int(model_no)]
 
 
 def get_qwen35_quantization(backend: str, variant: str | None = None) -> str:
@@ -102,22 +105,25 @@ def get_qwen35_quantization(backend: str, variant: str | None = None) -> str:
 
 
 def _get_qwen35_gguf_filename(spec: dict, backend: str) -> str:
-    key = {
-        enhancer_quantization_GGUF: "text_gguf_filename",
-        enhancer_quantization_GGUF_Q3: "text_gguf_q3_filename",
-        enhancer_quantization_GGUF_Q2: "text_gguf_q2_filename",
-        enhancer_quantization_GGUF_PTQ1: "text_gguf_ptq1_filename",
-        enhancer_quantization_GGUF_Q8: "text_gguf_q8_filename",
-    }[backend]
-    return spec[key]
+    return spec[QWEN_CHECKPOINTS[backend][0]]
+
+
+def locate_qwen35_folder(folder_name: str) -> str | None:
+    """A Qwen model's folder among the checkpoint roots: the first that holds its config.json, else the first that exists. Its large files may sit in
+    the folder of the same name of another root (a table moved to a faster drive), which _resolve_qwen35_checkpoint_file finds."""
+    if not os.path.isabs(folder_name):
+        configured = fl.installed_copies(os.path.join(folder_name, "config.json"))
+        if configured:
+            return os.path.dirname(configured[0])
+    return fl.locate_folder(folder_name, error_if_none=False)
 
 
 def _resolve_qwen35_assets_dir(assets_dir: str | None, variant: str | None = None, error_if_none: bool = True) -> str | None:
     folder_name = get_qwen35_assets_dir_name(variant)
     candidate = folder_name if assets_dir is None else assets_dir
-    resolved = fl.locate_folder(candidate, error_if_none=False)
+    resolved = locate_qwen35_folder(candidate)
     if resolved is None and assets_dir is not None and candidate != folder_name:
-        resolved = fl.locate_folder(folder_name, error_if_none=False)
+        resolved = locate_qwen35_folder(folder_name)
     if resolved is None and error_if_none:
         raise FileNotFoundError(f"Missing Qwen3.5 assets folder '{candidate}'")
     return resolved
@@ -147,7 +153,9 @@ def _resolve_qwen35_checkpoint_file(
     del variant
     if assets_dir is None:
         return None
-    resolved = fl.locate_file(filename, error_if_none=False, extra_paths=[assets_dir])
+    # the downloads' relative path (folder/file) in the first root that has it, so that a model's files may be spread over the roots
+    resolved = fl.locate_file(filename, error_if_none=False) or fl.locate_file(os.path.join(os.path.basename(os.path.normpath(assets_dir)), filename), error_if_none=False) \
+        or fl.locate_file(filename, error_if_none=False, extra_paths=[assets_dir])
     if resolved is not None:
         return resolved
     fallback_path = os.path.join(assets_dir, filename)
@@ -167,36 +175,8 @@ def ensure_qwen35_prompt_enhancer_assets(process_files_def, backend: str = enhan
         speculative_decoding = False
     spec = get_qwen35_variant_spec(variant)
     backend = get_qwen35_quantization(backend, variant=variant)
-    repo_subfolder = spec.get("repo_subfolder", "")
-    qwen35_shared_files = list(spec["root_files"])
-    if spec["root_repo"] == spec.get("gguf_repo"):
-        gguf_backend = backend in (enhancer_quantization_GGUF, enhancer_quantization_GGUF_Q3, enhancer_quantization_GGUF_Q2, enhancer_quantization_GGUF_PTQ1, enhancer_quantization_GGUF_Q8)
-        checkpoint_filename = _get_qwen35_gguf_filename(spec, backend) if gguf_backend else spec["text_int8_filename"]
-        qwen35_shared_files.append(spec["vision_filename"])
-        checkpoint_folder = spec.get("gguf_repo_subfolder", repo_subfolder)
-        if checkpoint_folder == repo_subfolder:
-            qwen35_shared_files.append(checkpoint_filename)
-        else:
-            process_files_def(repoId=spec["gguf_repo"], sourceFolderList=[checkpoint_folder], targetFolderList=[spec["assets_dir_name"]], fileList=[[checkpoint_filename]])
-        if speculative_decoding:
-            mtp_filename = spec.get("text_gguf_q3_mtp_filename" if backend == enhancer_quantization_GGUF_Q3 else "text_mtp_filename")
-            if mtp_filename:
-                qwen35_shared_files.append(mtp_filename)
-    download_def = {"repoId": spec["root_repo"], "sourceFolderList": [repo_subfolder], "fileList": [qwen35_shared_files]}
-    if len(repo_subfolder) == 0:
-        download_def["targetFolderList"] = [spec["assets_dir_name"]]
-    process_files_def(**download_def)
-    if spec["root_repo"] != spec.get("gguf_repo"):
-        if backend not in (enhancer_quantization_GGUF, enhancer_quantization_GGUF_Q3, enhancer_quantization_GGUF_Q2, enhancer_quantization_GGUF_PTQ1, enhancer_quantization_GGUF_Q8):
-            raise ValueError(f"{spec['display_name']} supports only the GGUF backend.")
-        gguf_files = [spec["vision_filename"], _get_qwen35_gguf_filename(spec, backend)]
-        if speculative_decoding and backend == enhancer_quantization_GGUF_Q3:
-            gguf_files.append(spec["text_gguf_q3_mtp_filename"])
-        if speculative_decoding and backend == enhancer_quantization_GGUF_PTQ1:
-            gguf_files.append(spec["text_gguf_ptq1_mtp_filename"])
-        process_files_def(repoId=spec["gguf_repo"], sourceFolderList=[spec.get("gguf_repo_subfolder", "")], fileList=[gguf_files])
-    if spec.get("text_repo") and spec.get("text_required_files"):
-        process_files_def(repoId=spec["text_repo"], sourceFolderList=[repo_subfolder], fileList=[list(spec["text_required_files"])])
+    for definition in qwen_download_defs(spec, backend, speculative_decoding):
+        process_files_def(**definition)
     qwen35_modeling_path = get_qwen35_modeling_path()
     if not os.path.isfile(qwen35_modeling_path):
         raise FileNotFoundError(f"Missing repo-local Qwen3.5 modeling file: {qwen35_modeling_path}")
@@ -807,132 +787,191 @@ def _prepare_multimodal_vllm_prompt(self, model_inputs, image_features=None):
     return prompt_token_ids, prompt_embeds, prompt_position_ids, position_offset
 
 
-def _generate_image_captions_vllm(self, images, *, image_contexts=None, offload_manager=None, enhancement_progress=None):
+TEXT_MODEL_ID = "llm_model"
+VISION_MODEL_ID = "vision_tower_model"
+
+
+@contextmanager
+def vision_beside_text(caption_model, manager):
+    """The vision tower loads beside the resident language model, whose weights stay (MMGP co-tenants), and the prompt's text embeddings
+    read the language model's own token table (the separate embedding alias would load a second copy). Yields unload_vision, which
+    releases the tower alone."""
+    cotenants = manager.cotenants_map
+    adapter = caption_model.model.language_model
+    input_embedding = adapter._input_embedding_model
+
+    def unload_vision():
+        if VISION_MODEL_ID not in manager.active_models_ids:
+            return
+        torch.cuda.synchronize()
+        # MMGP owns the CPU originals, including any streamed vision blocks.
+        prefix = VISION_MODEL_ID + "/"
+        for name in manager.blocks_of_modules:
+            if name == VISION_MODEL_ID or name.startswith(prefix):
+                manager.gpu_unload_blocks(VISION_MODEL_ID, None if name == VISION_MODEL_ID else name[len(prefix):])
+        index = manager.active_models_ids.index(VISION_MODEL_ID)
+        manager.active_models_ids.pop(index)
+        manager.active_models.pop(index)
+        torch.cuda.empty_cache()
+
+    try:
+        manager.cotenants_map = {**cotenants, TEXT_MODEL_ID: [*cotenants.get(TEXT_MODEL_ID, []), VISION_MODEL_ID], VISION_MODEL_ID: [*cotenants.get(VISION_MODEL_ID, []), TEXT_MODEL_ID]}
+        object.__setattr__(adapter, "_input_embedding_model", caption_model._prompt_enhancer_text_model.token_embd)
+        yield unload_vision
+    finally:
+        unload_vision()
+        object.__setattr__(adapter, "_input_embedding_model", input_embedding)
+        manager.cotenants_map = cotenants
+
+
+def _captions_beside(self, offload_manager) -> bool:
+    """An assistant's live context in the engine (Deepy kept loaded) and the MMGP dynamic preload: the captions run beside it (the tower
+    beside the resident language model, the requests in the free pages of its cache) instead of closing it."""
+    from mmgp import runtime as mmgp_runtime
+    text_model = self._prompt_enhancer_text_model
+    engine = getattr(text_model, "_prompt_enhancer_vllm_engine", None)
+    return (offload_manager is not None and engine is not None and engine.has_live_context() and mmgp_runtime.dynamic_preload(text_model)
+            and offload_manager.models.get(TEXT_MODEL_ID) is text_model and TEXT_MODEL_ID in offload_manager.active_models_ids)
+
+
+def _generate_image_captions_vllm(self, images, *, image_contexts=None, offload_manager=None, enhancement_progress=None, beside=False):
     qwen35_text_mod = _get_qwen35_text_runtime_helpers()
     text_model = self._prompt_enhancer_text_model
     tokenizer = self._prompt_enhancer_tokenizer
     processor = self._prompt_enhancer_processor
-    # Finish every vision pass before loading the shared decoder. A previous
-    # request's graphs must be closed before MMGP can change its weight storage.
-    text_model.unload()
-    if offload_manager is not None:
-        offload_manager.unload_all()
+    live = text_model._prompt_enhancer_vllm_engine if beside else None
+    if not beside:
+        # Finish every vision pass before loading the shared decoder. A previous
+        # request's graphs must be closed before MMGP can change its weight storage.
+        text_model.unload()
+        if offload_manager is not None:
+            offload_manager.unload_all()
     groups = [([image], None) for image in images] if image_contexts is None else [(context.images, context.labels) for context in image_contexts]
     progress = enhancement_progress or EnhancementProgress()
     image_count = len({id(image) for group, _ in groups for image in group})
     prepared = []
     features = {}
     outputs = []
-    for group_images, labels in tqdm(groups, desc="Encoding Prompt Images", dynamic_ncols=True, leave=False):
-        check_cancelled()
-        if not group_images:
-            prepared.append(None)
-            continue
-        caption_tokens = 128 if labels is None else 128 * len(group_images) + 128
-        content = []
-        for index, image in enumerate(group_images):
-            if labels is not None:
-                content.append({"type": "text", "text": labels[index]})
-            content.append({"type": "image", "image": image})
-        if labels is None:
-            message = [{"role": "user", "content": content + [{"type": "text", "text": "Describe this image accurately in one concise paragraph, focusing on the main subject, setting, and notable objects. Output only the description."}]}]
-        else:
-            names = "; ".join(labels)
-            instructions = f"Describe these labeled images accurately: {names}. Use each exact image name as a heading, followed by a concise description of its subject, setting and notable details. Start and end images anchor the opening and ending of this window; frame labels locate intermediate anchors within it. Reference images guide appearance. Distinguish the images and mention visible relationships without inventing motion or unseen events. Output only the labeled descriptions."
-            headings = "\n".join(f"{label}: <visible details>" for label in labels)
-            content.append({"type": "text", "text": f"Describe all {len(labels)} separate still images in the order shown. Use each heading below exactly once, without renaming, adding or omitting any heading. Describe only visible details; do not infer movement from still images.\n{headings}"})
-            message = [{"role": "system", "content": instructions}, {"role": "user", "content": content}]
-        text = processor.apply_chat_template(
-            message,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=False,
-        )
-        # PIL sources and pending pixel batches stay in RAM even if another
-        # model left PyTorch's default device set to CUDA.
-        with torch.device("cpu"):
-            model_inputs = processor(
-                text=[text],
-                images=[_resize_image_for_caption(image) for image in group_images],
-                return_tensors="pt",
-                padding=True,
-                return_mm_token_type_ids=True,
+    # beside: the tower may take the idle cache's VRAM if it runs short (its owner saves the context first)
+    with vision_beside_text(self, offload_manager) if beside else nullcontext(), live.idle() if beside else nullcontext():
+        for group_images, labels in tqdm(groups, desc="Encoding Prompt Images", dynamic_ncols=True, leave=False):
+            check_cancelled()
+            if not group_images:
+                prepared.append(None)
+                continue
+            caption_tokens = 128 if labels is None else 128 * len(group_images) + 128
+            content = []
+            for index, image in enumerate(group_images):
+                if labels is not None:
+                    content.append({"type": "text", "text": labels[index]})
+                content.append({"type": "image", "image": image})
+            if labels is None:
+                message = [{"role": "user", "content": content + [{"type": "text", "text": "Describe this image accurately in one concise paragraph, focusing on the main subject, setting, and notable objects. Output only the description."}]}]
+            else:
+                names = "; ".join(labels)
+                instructions = f"Describe these labeled images accurately: {names}. Use each exact image name as a heading, followed by a concise description of its subject, setting and notable details. Start and end images anchor the opening and ending of this window; frame labels locate intermediate anchors within it. Reference images guide appearance. Distinguish the images and mention visible relationships without inventing motion or unseen events. Output only the labeled descriptions."
+                headings = "\n".join(f"{label}: <visible details>" for label in labels)
+                content.append({"type": "text", "text": f"Describe all {len(labels)} separate still images in the order shown. Use each heading below exactly once, without renaming, adding or omitting any heading. Describe only visible details; do not infer movement from still images.\n{headings}"})
+                message = [{"role": "system", "content": instructions}, {"role": "user", "content": content}]
+            text = processor.apply_chat_template(
+                message,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
             )
-        # Bound vision activation memory to one image and reuse repeated window
-        # anchors. Retain features/embeddings on CPU between phases.
-        pixels = model_inputs.pop("pixel_values")
-        grids = model_inputs["image_grid_thw"]
-        image_features, first_patch = [], 0
-        with torch.inference_mode():
-            for image, grid in zip(group_images, grids.tolist()):
-                check_cancelled()
-                patch_count = grid[0] * grid[1] * grid[2]
-                key = (id(image), tuple(grid))
-                if key not in features:
-                    with progress.vision(self.vision_tower_model.blocks, len(features), image_count):
-                        output = self.model.get_image_features(pixels[first_patch:first_patch + patch_count], grids.new_tensor([grid]), return_dict=True)
-                    features[key] = output.pooler_output[0].to("cpu")
-                    del output
-                image_features.append(features[key])
-                first_patch += patch_count
-            prompt_token_ids, prompt_embeds, prompt_position_ids, position_offset = _prepare_multimodal_vllm_prompt(self, model_inputs, image_features=image_features)
-            prepared.append((prompt_token_ids, prompt_embeds.to("cpu"), None if prompt_position_ids is None else prompt_position_ids.to("cpu"), position_offset, caption_tokens, message, text))
-        del pixels, image_features, model_inputs, prompt_embeds, prompt_position_ids
+            # PIL sources and pending pixel batches stay in RAM even if another
+            # model left PyTorch's default device set to CUDA.
+            with torch.device("cpu"):
+                model_inputs = processor(
+                    text=[text],
+                    images=[_resize_image_for_caption(image) for image in group_images],
+                    return_tensors="pt",
+                    padding=True,
+                    return_mm_token_type_ids=True,
+                )
+            # Bound vision activation memory to one image and reuse repeated window
+            # anchors. Retain features/embeddings on CPU between phases.
+            pixels = model_inputs.pop("pixel_values")
+            grids = model_inputs["image_grid_thw"]
+            image_features, first_patch = [], 0
+            with torch.inference_mode():
+                for image, grid in zip(group_images, grids.tolist()):
+                    check_cancelled()
+                    patch_count = grid[0] * grid[1] * grid[2]
+                    key = (id(image), tuple(grid))
+                    if key not in features:
+                        with progress.vision(self.vision_tower_model.blocks, len(features), image_count):
+                            output = self.model.get_image_features(pixels[first_patch:first_patch + patch_count], grids.new_tensor([grid]), return_dict=True)
+                        features[key] = output.pooler_output[0].to("cpu")
+                        del output
+                    image_features.append(features[key])
+                    first_patch += patch_count
+                prompt_token_ids, prompt_embeds, prompt_position_ids, position_offset = _prepare_multimodal_vllm_prompt(self, model_inputs, image_features=image_features)
+                prepared.append((prompt_token_ids, prompt_embeds.to("cpu"), None if prompt_position_ids is None else prompt_position_ids.to("cpu"), position_offset, caption_tokens, message, text))
+            del pixels, image_features, model_inputs, prompt_embeds, prompt_position_ids
     features.clear()
-    if offload_manager is not None:
-        offload_manager.unload_all()
-    # Captioning and enhancement use the same cache policy and engine identity.
-    engine = qwen35_text_mod._get_or_create_vllm_engine(text_model, usage_mode="text")
-    for request in prepared:
-        if request is not None:
-            engine.reserve_runtime(prompt_len=len(request[0]), max_tokens=request[4], cfg_scale=1.0, min_model_len=qwen35_text_mod.QWEN35_PROMPT_MIN_MODEL_LEN)
-    for index, request in enumerate(prepared):
-        check_cancelled()
-        if request is None:
-            outputs.append("")
-            continue
-        prompt_token_ids, prompt_embeds, prompt_position_ids, position_offset, caption_tokens, message, text = request
-        progress.caption(index, len(groups), caption_tokens)
-        engine._ensure_llm()
-        if engine._llm is None:
-            raise RuntimeError("Qwen3.5 caption vLLM runtime is not available.")
-        temp, normalized_top_p, normalized_top_k = qwen35_text_mod._normalize_vllm_sampling(
-            do_sample=False,
-            temperature=None,
-            top_p=None,
-            top_k=None,
-        )
-        if llm_io_enabled():
-            log_llm_io("OUT", "local-image-captioner", "qwen-visual-generation", {
-                "prompt": text,
-                "messages": message,
-                "input_token_ids": prompt_token_ids,
-                "known_token_ids": known_token_ids(tokenizer),
-                "prompt_embeddings": prompt_embeds,
-                "prompt_position_ids": prompt_position_ids,
-                "position_offset": position_offset,
-                "generation": {"max_new_tokens": caption_tokens, "temperature": temp, "top_p": normalized_top_p, "top_k": normalized_top_k, "do_sample": False},
-            })
-        response = engine.generate_embedded(
-            prompt_token_ids=prompt_token_ids,
-            prompt_embeds=prompt_embeds,
-            prompt_position_ids=prompt_position_ids,
-            max_tokens=caption_tokens,
-            temperature=temp,
-            top_p=normalized_top_p,
-            top_k=normalized_top_k,
-            cfg_scale=1.0,
-            seed=None,
-            use_tqdm=True,
-            release_vram_after=False,
-            ignore_eos=False,
-            position_offset=position_offset,
-            stream_callback=progress.tokens if enhancement_progress is not None else None,
-        )
-        raw_text = "" if response is None else response.get("text", "")
-        log_llm_io("IN", "local-image-captioner", "qwen-visual-generation", {"text": raw_text, "response": response})
-        outputs.append(_clean_generated_text(raw_text))
-        reset_context()
+    # MMGP may have released the idle cache meanwhile, or the requests may not fit beside the context: then as without it
+    beside = beside and live.has_live_context() and live._llm.can_aside(max((len(request[0]) + request[4] for request in prepared if request is not None), default=0))
+    if beside:
+        engine = live
+    else:
+        if live is not None:
+            live.save_context()  # no room beside it: its owner saves it to RAM (restored at its next use), the captions run as alone
+        elif offload_manager is not None:
+            offload_manager.unload_all()
+        # Captioning and enhancement use the same cache policy and engine identity.
+        engine = qwen35_text_mod._get_or_create_vllm_engine(text_model, usage_mode="text")
+        for request in prepared:
+            if request is not None:
+                engine.reserve_runtime(prompt_len=len(request[0]), max_tokens=request[4], cfg_scale=1.0, min_model_len=qwen35_text_mod.QWEN35_PROMPT_MIN_MODEL_LEN)
+    with live._llm.aside() if beside else nullcontext():
+        for index, request in enumerate(prepared):
+            check_cancelled()
+            if request is None:
+                outputs.append("")
+                continue
+            prompt_token_ids, prompt_embeds, prompt_position_ids, position_offset, caption_tokens, message, text = request
+            progress.caption(index, len(groups), caption_tokens)
+            engine._ensure_llm()
+            if engine._llm is None:
+                raise RuntimeError("Qwen3.5 caption vLLM runtime is not available.")
+            temp, normalized_top_p, normalized_top_k = qwen35_text_mod._normalize_vllm_sampling(
+                do_sample=False,
+                temperature=None,
+                top_p=None,
+                top_k=None,
+            )
+            if llm_io_enabled():
+                log_llm_io("OUT", "local-image-captioner", "qwen-visual-generation", {
+                    "prompt": text,
+                    "messages": message,
+                    "input_token_ids": prompt_token_ids,
+                    "known_token_ids": known_token_ids(tokenizer),
+                    "prompt_embeddings": prompt_embeds,
+                    "prompt_position_ids": prompt_position_ids,
+                    "position_offset": position_offset,
+                    "generation": {"max_new_tokens": caption_tokens, "temperature": temp, "top_p": normalized_top_p, "top_k": normalized_top_k, "do_sample": False},
+                })
+            response = engine.generate_embedded(
+                prompt_token_ids=prompt_token_ids,
+                prompt_embeds=prompt_embeds,
+                prompt_position_ids=prompt_position_ids,
+                max_tokens=caption_tokens,
+                temperature=temp,
+                top_p=normalized_top_p,
+                top_k=normalized_top_k,
+                cfg_scale=1.0,
+                seed=0,  # greedy: the seed settles exact ties, so an image's caption does not depend on the sampler's state
+                use_tqdm=True,
+                release_vram_after=False,
+                ignore_eos=False,
+                position_offset=position_offset,
+                stream_callback=progress.tokens if enhancement_progress is not None else None,
+            )
+            raw_text = "" if response is None else response.get("text", "")
+            log_llm_io("IN", "local-image-captioner", "qwen-visual-generation", {"text": raw_text, "response": response})
+            outputs.append(_clean_generated_text(raw_text))
+            reset_context()
     return outputs
 
 
@@ -943,13 +982,15 @@ def _generate_image_captions(self, images, *, image_contexts=None, offload_manag
             if stop_requested is not None and stop_requested():
                 raise InterruptedError("Prompt Enhancement Cancelled")
         hooks = [block.register_forward_pre_hook(lambda *_: check_cancelled()) for block in self.vision_tower_model.blocks]
+        beside = _captions_beside(self, offload_manager)
         try:
             with cancellation_context(check_stop) if stop_requested is not None else nullcontext():
-                return _generate_image_captions_vllm(self, images, image_contexts=image_contexts, offload_manager=offload_manager, enhancement_progress=enhancement_progress)
+                return _generate_image_captions_vllm(self, images, image_contexts=image_contexts, offload_manager=offload_manager, enhancement_progress=enhancement_progress, beside=beside)
         except BaseException:
-            self._prompt_enhancer_text_model.unload()
-            if offload_manager is not None:
-                offload_manager.unload_all()
+            if not beside:  # beside, the tower is already released and the assistant's context stays
+                self._prompt_enhancer_text_model.unload()
+                if offload_manager is not None:
+                    offload_manager.unload_all()
             raise
         finally:
             for hook in hooks:
@@ -1057,7 +1098,15 @@ def load_qwen35_vl_prompt_enhancer(
         raise FileNotFoundError(f"Qwen3.5VL checkpoint not found: {model_path}")
 
     model_class = load_qwen35_model_class(modeling_path, class_name="Qwen3_5ForConditionalGeneration")
-    config = AutoConfig.from_pretrained(assets_dir, trust_remote_code=True)
+    if get_qwen35_variant_spec(variant).get("architecture") == "qwen4_exp":
+        # the vision tower of Qwen3.5 under the name of this architecture; the text model is the shared one below
+        with open(config_path, "r", encoding="utf-8") as reader:
+            config_values = json.load(reader)
+        for values in (config_values, config_values["text_config"], config_values["vision_config"]):
+            values["model_type"] = values["model_type"].replace("qwen4_exp", "qwen3_5")
+        config = AutoConfig.for_model(**config_values)
+    else:
+        config = AutoConfig.from_pretrained(assets_dir, trust_remote_code=True)
     config._prompt_enhancer_safe_legacy = legacy_safe_mode
     config._attn_implementation = attn_implementation
     if hasattr(config, "text_config") and config.text_config is not None:

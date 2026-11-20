@@ -19,6 +19,11 @@ class DLSSGTemporalUpsampler(api.SimpleScaleSuffixMixin):
     def config(self):
         return DLSS5SpatialUpsampler.normalize_config_section(spatial_api.read_config_section_by_key(self.server_config, "dlss5"))
 
+    def query_checkpoint_inventory(self):
+        from preprocessing.processors import query_preprocessor_download_def
+
+        return [{"name": "DLSS 5", "variant": "Frame Generation - RAFT Optical Flow", "download_defs": [query_preprocessor_download_def("flow")]}]
+
     def query_download_defs(self, enabled_only=True):
         from preprocessing.processors import query_preprocessor_download_def
 
@@ -61,6 +66,11 @@ class DLSSGTemporalUpsampler(api.SimpleScaleSuffixMixin):
             "default_temporal_upsampling": "dlssg*2",
             "description": "NVIDIA DLSS Frame Generation using video motion estimation. Linux supports experimental x2 with the NVIDIA Vulkan driver and a compatible RTX GPU. Windows supports x2-x4 and capability-gated x5/x6 on RTX 50 series, and requires Windows 11, HAGS, and RTX 40 or newer.",
         }
+
+    def query_chunking(self, temporal_upsampling):
+        """How a long video goes through this upsampler a chunk at a time (postprocessing.chunking)."""
+        from postprocessing.system_upsampler_handler import DLSSG_HANDLER
+        return DLSSG_HANDLER
 
     def validate_upsampling(self, temporal_upsampling, *, source_is_image=False):
         split = self.split_value(temporal_upsampling)

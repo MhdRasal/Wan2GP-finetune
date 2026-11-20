@@ -10,7 +10,7 @@ from mmgp import offload
 from shared.attention import pay_attention
 from shared.llm_engines.lmgp.models.qwen3 import Qwen3ForCausalLM
 from shared.llm_engines.lmgp.vllm_support import configure_engine_kernels
-from shared.llm_engines.lmgp.utils.context import get_context, set_context
+from shared.llm_engines.lmgp.utils.context import get_context, use_context
 
 from .modules import Attention, AudioPositionEmbedding, MLP, RMSNorm, RotaryEmbedding, TimestepEmbedder
 
@@ -35,6 +35,7 @@ class YuE2AR(Qwen3ForCausalLM):
         self.features, self.abort_fn = features, abort_fn
         self.config._prompt_enhancer_safe_legacy = not features.triton
         configure_engine_kernels(self, features)
+        self._lm_engine_mmgp = True  # MMGP manages its weights: the engine sizes its KV cache without reading the free VRAM
         self._lm_engine_mmgp_graphs = features.graphs  # the engine's decoding passes are MMGP graphs: the AR model may stream its layers
 
     @torch.inference_mode()
@@ -65,7 +66,7 @@ class YuE2AR(Qwen3ForCausalLM):
                     # Both CFG prompts share the same loaded layer, processed sequentially (prefill: their activations are large).
                     outputs, residuals = [], []
                     for span, branch in branches:
-                        set_context(**vars(branch))
+                        use_context(branch)
                         h, r = layer(positions[span], x[span], residual[span] if residual is not None else None)
                         outputs.append(h)
                         residuals.append(r)
@@ -75,7 +76,7 @@ class YuE2AR(Qwen3ForCausalLM):
                 if self.abort_fn():
                     raise InterruptedError("YuE2 AR interrupted")
         finally:
-            set_context(**vars(context))
+            use_context(context)
         return self.model.norm(x, residual)[0]
 
     @torch.inference_mode()

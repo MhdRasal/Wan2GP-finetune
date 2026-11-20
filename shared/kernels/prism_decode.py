@@ -4,6 +4,7 @@ import statistics
 
 import torch
 from torch._subclasses.fake_tensor import FakeTensor
+from tqdm import tqdm
 
 _choices = {}
 
@@ -36,17 +37,18 @@ def select_decode(input, raw, signs, bias, rows, grouped_shape, native):
             candidates[tile] = candidate
         if len(candidates) == 1:
             _choices[key] = 0
-            print(f"[GGUF][Prism] Decode {rows}x{input.shape[-1]}: Existing Kernel (Fused Numerical Check Failed).")
+            tqdm.write(f"[GGUF][Prism] Decode {rows}x{input.shape[-1]}: Existing Kernel (Fused Numerical Check Failed).")
             return 0
         graphs = {}
         outputs = {}
+        pool = torch.cuda.graph_pool_handle()  # one pool for the candidates' timing graphs: each pool reserves GPU address space
         try:
             for tile, fn in list(candidates.items()):
                 for _ in range(3):
                     fn()
                 graph = torch.cuda.CUDAGraph()
                 graphs[tile] = graph
-                with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+                with torch.cuda.graph(graph, pool=pool, capture_error_mode="thread_local"):
                     for _ in range(16):
                         outputs[tile] = fn()
                 graph.replay()
@@ -81,7 +83,9 @@ def select_decode(input, raw, signs, bias, rows, grouped_shape, native):
             captured = None
             graph = None
         _choices[key] = choice
-        print(f"[GGUF][Prism] Decode {rows}x{input.shape[-1]}: "
-              f"{'Fused, Row Tile ' + str(choice) if choice else 'Existing Kernel'} "
-              f"({medians[0]*1000:.2f} -> {medians[choice]*1000:.2f} us).")
+        from mmgp import offload
+        if offload.default_verboseLevel >= 2:  # the choice of each shape, only in verbose mode
+            tqdm.write(f"[GGUF][Prism] Decode {rows}x{input.shape[-1]}: "
+                       f"{'Fused, Row Tile ' + str(choice) if choice else 'Existing Kernel'} "
+                       f"({medians[0]*1000:.2f} -> {medians[choice]*1000:.2f} us).")
         return choice

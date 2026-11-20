@@ -387,7 +387,6 @@ class MotionDesignerPlugin(WAN2GPPlugin):
                     c="copy",
                     r=frame_rate,
                     **{
-                        "vsync": "cfr",
                         "fps_mode": "cfr",
                         "fflags": "+genpts",
                         "copyts": None,
@@ -427,7 +426,7 @@ class MotionDesignerPlugin(WAN2GPPlugin):
             str(video_path),
         ]
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            result = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False)
             output = (result.stdout or "").strip().splitlines()
             # Expected output: nb_read_frames, nb_frames, avg_frame_rate, r_frame_rate (all may be present)
             frame_count = None

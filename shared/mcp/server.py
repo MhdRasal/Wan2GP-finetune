@@ -21,10 +21,13 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
+from postprocessing import parameter_ui
 from shared.mesh3d.glb import MESH_EXTENSIONS
 from shared.utils.gallery_sources import GALLERY_SOURCES, WORLD_EXTENSIONS, source_for_kind
 from shared.utils.gallery_media import disambiguate_gallery_media_ids, gallery_media_ids
 from shared.utils.setting_names import settings_error, split_settings
+from shared.utils.virtual_media import VIEW_FOLDER, parse_virtual_media_path, read_view
+from shared.deepy.video_tools import view_clip
 from shared.mcp.config import DEFAULT_PORT, server_port
 
 if TYPE_CHECKING:
@@ -54,8 +57,8 @@ _AGENT_INSTRUCTIONS_HEADER = ("WanGP MCP API 2.1: generate and edit images, vide
                               "These instructions are also readable as wangp://guides/agent; wangp://guides/workflows indexes workflow sections to read on demand.")
 _AGENT_SKILLS_DIR = Path(__file__).resolve().parents[1] / "deepy" / "skills"
 _DOCS_DIR = Path(__file__).resolve().parents[2] / "docs"
-_DEEPY_VISUAL_TOOL_IDS = {"gen_image", "edit_image", "gen_video", "gen_video_with_speech", "gen_video_with_refs"}
-_DEEPY_VIDEO_TOOL_IDS = {"gen_video", "gen_video_with_speech", "gen_video_with_refs"}
+_DEEPY_VISUAL_TOOL_IDS = {"gen_image", "edit_image", "gen_video", "gen_video_with_speech", "gen_video_with_refs", "swap_video", "edit_video"}
+_DEEPY_VIDEO_TOOL_IDS = {"gen_video", "gen_video_with_speech", "gen_video_with_refs", "swap_video", "edit_video"}
 _DEEPY_AUDIO_TOOL_IDS = {"gen_song", "gen_speech_from_description", "gen_speech_from_sample"}
 _DEEPY_MODEL_DEF_STRING_LIMIT = 256
 _TOOLBOX_ACTIONS = {
@@ -66,10 +69,15 @@ _TOOLBOX_ACTIONS = {
     "inspect_media",
     "inspect_video",
     "inspect_audio",
+    "check_lip_sync",
+    "detect_video_cuts",
+    "plan_video_windows",
+    "check_video_edit",
     "extract_image",
     "extract_video",
     "extract_audio",
     "transcribe_media",
+    "advanced_transcription",
     "mute_video",
     "remove_vocals",
     "replace_audio",
@@ -88,10 +96,15 @@ _TOOLBOX_MEDIA_PARAMETERS = {
     "inspect_video": ("media_id",),
     "view_media": ("media_ids",),
     "inspect_audio": ("media_id",),
+    "check_lip_sync": ("media_id", "voice_id"),
+    "detect_video_cuts": ("media_id",),
+    "plan_video_windows": ("media_id",),
+    "check_video_edit": ("media_id", "source_id"),
     "extract_image": ("media_id",),
     "extract_video": ("media_id",),
     "extract_audio": ("media_id",),
     "transcribe_media": ("media_id",),
+    "advanced_transcription": ("media_id",),
     "mute_video": ("media_id",),
     "remove_vocals": ("media_id",),
     "replace_audio": ("video_id", "audio_id"),
@@ -113,8 +126,9 @@ _MCP_MEDIA_SETTING_KEYS = {
     "image_start", "image_end", "image_refs", "image_guide", "image_mask",
     "video_guide", "video_guide2", "video_guide3", "video_mask", "video_source",
     "audio_guide", "audio_guide2", "audio_guide3", "audio_source",
-    "replace_voice_sample", "replace_voice_sample2", "custom_guide",
+    "replace_voice_sample", "replace_voice_sample2", "custom_guide", parameter_ui.IMAGES_SETTING,
 }
+NESTED_SETTINGS = {"custom_settings", *parameter_ui.SETTINGS.values()}  # the settings holding dictionaries
 _GALLERY_LOCK = threading.RLock()
 
 
@@ -126,6 +140,7 @@ def _read_markdown_section(path: Path, start_heading: str, end_heading: str) -> 
 
 
 def _register_documentation_resources(mcp, file_access_policy=None, long_text_active: bool = False, api_version: str | int = 1) -> None:
+    from shared.deepy.config import python_apps_level
     from shared.deepy.web_search import enabled as web_search_enabled
 
     from .skills import skill_metadata
@@ -155,6 +170,8 @@ def _register_documentation_resources(mcp, file_access_policy=None, long_text_ac
         if skill_name in {"long-story-writing", "long-generation-prompts"} and not long_text_active:
             continue
         if skill_name in ("web-research", "lora-search") and not web_search_enabled():
+            continue
+        if skill_name == "web-apps" and python_apps_level() == "off" or skill_name == "progression-design" and python_apps_level() == "off" and not long_text_active:
             continue
         resource_uri = f"wangp://skills/{skill_name}"
         read_skill = document_reader(path)
@@ -562,7 +579,7 @@ def _compact_model_metadata(records: list[dict[str, Any]]) -> list[dict[str, Any
 def _compact_deepy_model_metadata(record: dict[str, Any]) -> dict[str, Any]:
     compact = {key: copy.deepcopy(record[key]) for key in ("model_type", "name", "family", "family_label", "base_model_type", "finetune", "main_output", "outputs", "inputs") if record.get(key) not in (None, "", [], {})}
     compact["capabilities"] = [key for key, enabled in record.get("capabilities", {}).items() if enabled]
-    compact.update({key: copy.deepcopy(record[key]) for key in ("accelerated", "size", "specialities", "matched_specialities", "unmatched_specialities", "word_matches", "substring_matches", "resolution_budget", "resolution_budget_tiled", "resolution_min", "max_width", "max_height", "lock_resolutions", "allowed_resolutions", "vae_block_size", "resolution_assessment") if key in record})
+    compact.update({key: copy.deepcopy(record[key]) for key in ("accelerated", "size", "specialities", "video_edit", "matched_specialities", "unmatched_specialities", "word_matches", "substring_matches", "resolution_budget", "resolution_budget_tiled", "resolution_min", "max_width", "max_height", "lock_resolutions", "allowed_resolutions", "vae_block_size", "resolution_assessment") if key in record})
     if record.get("sliding_window") and "sliding_window" not in compact["capabilities"]:
         compact["capabilities"].append("sliding_window")
     compact["media_inputs"] = {kind: copy.deepcopy(values) if kind == "custom_file" else [key for key, enabled in values.items() if enabled] for kind, values in record.get("media_inputs", {}).items() if isinstance(values, dict) and any(values.values())}
@@ -721,7 +738,8 @@ def _deepy_template_settings(session, tool_id: str, template: str) -> dict[str, 
     requested_template = str(template or "").strip()
     resolved_template = catalog["default_template"] if requested_template.casefold() == "default" else deepy_tool_settings.find_tool_variant(tool_id, requested_template, current_variant=catalog["default_template"])
     if resolved_template is None:
-        raise ValueError(f"Unknown Deepy template '{template}' for tool '{tool_id}'.")
+        owners = [tool for tool in deepy_tool_settings.GENERATION_TOOL_IDS if deepy_tool_settings.find_tool_variant(tool, requested_template)]
+        raise ValueError(f"Unknown Deepy template '{template}' for tool '{tool_id}'." + (f" It belongs to {owners[0]}: write '{owners[0]}/{requested_template}'." if owners else ""))
     template_settings = session.merge_settings_with_defaults(deepy_tool_settings.clone_tool_preset(tool_id, resolved_template))
     general_properties = _deepy_general_properties(session)
     effective_settings = session.prepare_settings_for_export(template_settings)
@@ -767,8 +785,15 @@ def _is_media_id(value: Any) -> bool:
     return str(value or "").strip().lower().startswith(tuple(source.media_ids + ":" for source in GALLERY_SOURCES))
 
 
-def _resolve_mcp_media_reference(session, value: Any, label: str, allow_read_file_system: bool, file_access_policy=None) -> str:
-    reference = str(value or "").strip()
+def _resolve_mcp_media_reference(session, value: Any, label: str, allow_read_file_system: bool, file_access_policy=None, keep_view: bool = False) -> str:
+    """The file a reference names. A view (@views/...) or a part of a file (an id or a path followed by |start_s=..., |start_frame=...)
+    comes as a real clip, cut once, unless the caller reads them: keep_view."""
+    reference, _, part = str(value or "").strip().partition("|")
+    reference, part = reference.strip(), part.strip()
+    if part:
+        resolved = f"{_resolve_mcp_media_reference(session, reference, label, allow_read_file_system, file_access_policy, keep_view=True)}|{part}"
+        parse_virtual_media_path(resolved)  # a malformed part is refused here, not at generation
+        return resolved if keep_view else view_clip(resolved, Path(file_access_policy.output_roots[0]).resolve() / VIEW_FOLDER / ".cut")  # beside the views' own clips
     if not reference:
         raise ValueError(f"{label} is empty")
     if _is_media_id(reference):
@@ -776,7 +801,8 @@ def _resolve_mcp_media_reference(session, value: Any, label: str, allow_read_fil
         return _resolve_existing_path(path, label)
     if not allow_read_file_system:
         raise PermissionError(f"Direct filesystem paths are disabled for this MCP server. Use a media_id returned by wangp_list_gallery for {label}, or restart with filesystem reads enabled.")
-    return str(file_access_policy.require_read(reference, file=True)) if file_access_policy is not None else _resolve_existing_path(reference, label)
+    resolved = str(file_access_policy.require_read(reference, file=True)) if file_access_policy is not None else _resolve_existing_path(reference, label)
+    return resolved if keep_view or read_view(resolved) is None else view_clip(resolved)
 
 
 def _resolve_mcp_media_input(session, media_id: str | None, path: str | None, allow_read_file_system: bool, file_access_policy=None) -> str:
@@ -794,8 +820,8 @@ def _resolve_mcp_media_value(session, value: Any, label: str, allow_read_file_sy
     if value is None or isinstance(value, str) and not value.strip():
         return value
     if isinstance(value, (list, tuple)):
-        return [_resolve_mcp_media_reference(session, item, label, allow_read_file_system, file_access_policy) for item in value]
-    return _resolve_mcp_media_reference(session, value, label, allow_read_file_system, file_access_policy)
+        return [_resolve_mcp_media_reference(session, item, label, allow_read_file_system, file_access_policy, keep_view=True) for item in value]
+    return _resolve_mcp_media_reference(session, value, label, allow_read_file_system, file_access_policy, keep_view=True)  # generation reads views
 
 
 def _validate_generation_media(session, settings, model_type, path):
@@ -860,7 +886,8 @@ def _validate_generation_media(session, settings, model_type, path):
     for key in sorted(supplied & checks.keys()):
         supported, active, required = checks[key]
         if not supported:
-            reject(key, "input is unsupported in this model/output mode")
+            reference = key in ("image_start", "image_end", "image_guide") and reference_choices and "image_refs" not in supplied
+            reject(key, "input is unsupported in this model/output mode" + ("; this model takes its picture in image_refs" if reference else ""))
         if not active:
             reject(key, f"input would be ignored; requires {required}")
     if "image_refs" in supplied:
@@ -878,6 +905,10 @@ def _validate_generation_media(session, settings, model_type, path):
             from postprocessing.audio_processors import method_metadata
             if image_output or not method_metadata(effective.get(method_key, ""))[capability]:
                 reject(key, f"input requires a {method_key} processor that uses it")
+    if parameter_ui.IMAGES_SETTING in supplied:  # read by the post-processors declaring an images parameter (a 3D refiner's or texturer's Object Image)
+        methods = {slot: parameter_ui.method_of(slot, effective.get("spatial_upsampling" if slot == parameter_ui.SPATIAL else "temporal_upsampling", "")) for slot in parameter_ui.SETTINGS}
+        if parameter_ui.images_parameter(*(parameter_ui.slot_parameters(slot, method) for slot, method in methods.items())) is None:
+            reject(parameter_ui.IMAGES_SETTING, "input requires a spatial or temporal post-processor that uses reference images")
 
 
 def _resolve_generation_media(session, source: dict[str, Any] | list[dict[str, Any]], allow_read_file_system: bool, file_access_policy=None):
@@ -1139,10 +1170,10 @@ def _build_mcp_postprocessing_task(source_path: str, process: dict[str, Any], pa
         task.update({"mode": "edit_audio", "audio_source": source_path, "postprocess_audio": process_id})
     parameter_defs = {str(parameter["name"]): parameter for parameter in process.get("parameters", ())}
     spatial_parameter_names = set()
-    if process_type == postprocessing_catalog.PROCESS_TYPE_SPATIAL_UPSAMPLING:
-        spatial_parameters = {name: value for name, value in parameters.items() if name != "multiplier"}
+    if process_type in (postprocessing_catalog.PROCESS_TYPE_SPATIAL_UPSAMPLING, postprocessing_catalog.PROCESS_TYPE_TEMPORAL_UPSAMPLING):
+        spatial_parameters = {name: value for name, value in parameters.items() if name not in ("multiplier", "seed")}
         spatial_parameter_names.update(spatial_parameters)
-        task.update(spatial_parameters)
+        task.update(postprocessing_catalog.task_parameters(process, spatial_parameters))
     path_task_keys = {"audio_path": "audio_source", "voice_sample_path": "replace_voice_sample", "voice_sample2_path": "replace_voice_sample2"}
     for parameter_name, task_key in path_task_keys.items():
         if parameter_name in parameters:
@@ -1214,8 +1245,16 @@ def _resolve_toolbox_arguments(session, toolbox, action: str, arguments: dict[st
         value = value.strip()
         if not value or media_registry.get_media_record(toolbox.session, value) is not None:
             return value
-        media_path = _resolve_mcp_media_reference(session, value, parameter_name, allow_read_file_system, file_access_policy)
-        record = media_registry.register_media(toolbox.session, media_path, source="gallery" if _is_media_id(value) else "filesystem")
+        base, _, part = value.partition("|")
+        base_record = media_registry.get_media_record(toolbox.session, base.strip()) if part.strip() else None
+        if base_record is not None:  # a part of the session's own media
+            media_path = f"{_resolve_existing_path(base_record['path'], parameter_name)}|{part.strip()}"
+            parse_virtual_media_path(media_path)
+        else:
+            media_path = _resolve_mcp_media_reference(session, value, parameter_name, allow_read_file_system, file_access_policy, keep_view=True)  # each action knows whether it reads views
+        if read_view(media_path) is None and parse_virtual_media_path(media_path) is not None:  # a part of a file: actions take it as a file of its own, cut once
+            media_path = view_clip(media_path, Path(file_access_policy.output_roots[0]).resolve() / VIEW_FOLDER / ".cut")
+        record = media_registry.register_media(toolbox.session, media_path, source="gallery" if _is_media_id(base.strip()) else "filesystem")
         if record is None:
             raise ValueError(f"Unsupported media file: {media_path}")
         return record["media_id"]
@@ -1370,6 +1409,8 @@ def _compact_job_snapshot(snapshot: dict[str, Any], *, keep_webui: bool = False,
             compact.setdefault("status", "done" if result.get("success") else "interrupted" if result.get("cancelled") else "error")
             if not keep_paths and {Path(path).name for path in result.get("generated_files", [])} <= {item["filename"] if "filename" in item else Path(item["path"]).name for item in result.get("gallery_items", [])}:
                 compact["result"] = {key: value for key, value in result.items() if key != "generated_files"}
+            if result.get("success") and any(item.get("media_type") == "3d" for item in result.get("gallery_items", [])):  # the way to look at a new 3D asset
+                compact["next"] = "Look at a 3D asset with wangp_toolbox render_3d_views: named views or angles, frame_no for an animation frame, turntable_s for a turntable video."
     elif isinstance(progress, dict) and isinstance(progress.get("status"), str):
         compact["progress"] = {**progress, "status": _UI_PROMPT_COUNTER.sub("", progress["status"])}  # the counter numbers the whole UI queue, not this job's tasks
     return compact
@@ -1441,6 +1482,8 @@ class _JobRecord:
                         quiet = quiet_ranges(str((self.session._root / record["path"]).resolve()))
                         if quiet and item.get("duration_seconds", 0) - quiet[-1][1] < 0.1 and quiet[-1][1] - quiet[-1][0] >= 1:
                             item["sound_ends_seconds"] = quiet[-1][0]
+                            item["note"] = (f"The sound ends at {quiet[-1][0]:g} s of {item['duration_seconds']:g} s; the rest is silence. To fill a length, read the model's "
+                                            "input guidance on its timing (wangp_model definition, property infos) or ask for more duration and trim, rather than looping the take.")
                     elif item["media_type"] == "video":  # a generated shot can cut away to another shot or go black: measured, not seen
                         from shared.deepy.video_tools import picture_checks
                         item.update(picture_checks(str((self.session._root / record["path"]).resolve())))
@@ -1647,16 +1690,18 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
 
     jobs = _JobStore(session)
     agent_instructions = None
-    plugin_instructions = ""
+    routing_instructions = ""
     if api_version == "2.1":
         from .plugin_toolbox import instructions as plugin_toolbox_instructions
-        from .skills import SkillMCP
+        from .skills import SkillStore, skill_mcp
 
-        plugin_instructions = plugin_toolbox_instructions()  # routing declared by the enabled plugins, for Prime and external agents alike
+        skills = SkillStore(session._root / "user_skills")
+        # The enabled plugins' routing and the user's skills, for Prime and external agents alike, taken once per server (a Prime session)
+        routing_instructions = "\n\n".join(part for part in (plugin_toolbox_instructions(), skills.instructions()) if part)
         if not compact_model_tools:  # Prime already carries these rules in its system prompt
             from shared.deepy import load_agent_instructions
-            agent_instructions = "\n\n".join(part for part in (_AGENT_INSTRUCTIONS_HEADER, load_agent_instructions(), plugin_instructions) if part)
-        mcp = SkillMCP("WanGP", instructions=agent_instructions, skills_root=session._root / "user_skills", **dict(settings or {}))
+            agent_instructions = "\n\n".join(part for part in (_AGENT_INSTRUCTIONS_HEADER, load_agent_instructions(), routing_instructions) if part)
+        mcp = skill_mcp("WanGP", instructions=agent_instructions, skills=skills, **dict(settings or {}))
     else:
         mcp = FastMCP("WanGP", **dict(settings or {}))
     default_job_event_limit = max(0, min(int(default_job_event_limit), _MAX_STORED_EVENTS))
@@ -1800,7 +1845,7 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
             return agent_instructions
         if api_version != "1":
             guide = f"WanGP MCP API {api_version}. Use toolbox descriptions to choose a domain. Use declared shortcuts and known call recipes directly; otherwise discover actions, read the selected contract, then execute. Reuse known contracts. Specialized workflows are available in wangp://guides/workflows."
-            return f"{guide}\n\n{plugin_instructions}" if plugin_instructions else guide
+            return f"{guide}\n\n{routing_instructions}" if routing_instructions else guide
         return _AGENT_GUIDE_PATH.read_text(encoding="utf-8")
 
     def legacy_model_tool(function):
@@ -2008,6 +2053,10 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
         media_type = _mcp_media_type(source_path)
         if not media_type:
             raise ValueError(f"Unsupported media file extension: {Path(source_path).suffix}")
+        if media_type == "3d":
+            from shared.utils.mesh_postprocessing import is_mesh_file
+            if not is_mesh_file(source_path):
+                raise ValueError("Gaussian splats can not be post-processed: only meshes can be refined or textured.")
         processes = postprocessing_catalog.query_processes(media_type)
         discovered_processes = _mcp_postprocessing_processes(media_type, allow_read_file_system, processes)
         process_id = str(process or "").strip()
@@ -2048,9 +2097,9 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
         action_name = str(action or "").strip()
         actions = _toolbox_discovery(sandbox_toolbox, allow_read_file_system)
         if api_version != "2.1":
-            actions = [action for action in actions if action["name"] != "inspect_audio"]
+            actions = [action for action in actions if action["name"] not in ("inspect_audio", "check_lip_sync", "detect_video_cuts", "plan_video_windows", "check_video_edit")]
         if not action_name:
-            compact_actions = [{"name": candidate["name"], "description": candidate.get("description", "")} for candidate in actions]
+            compact_actions = [{"name": candidate["name"], "description": candidate.get("description", "")} for candidate in actions if candidate["name"] not in ("detect_video_cuts", "plan_video_windows", "check_video_edit")]
             return {"status": "discovery", "actions": compact_actions, "count": len(compact_actions), "next": "Call again with one action and omit arguments to get its exact schema."}
         if action_name not in _TOOLBOX_ACTIONS:
             raise ValueError(f"Unknown toolbox action '{action_name}'. Call without action to discover available actions.")
@@ -2084,14 +2133,17 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
                 settings = task
                 for key in ("params", "settings"):
                     if key in task:
+                        if key == "settings" and any(name in task for name in ("model_type", "base_model_type", "prompt")):  # a settings object holding another one; queue items keep a prompt beside params
+                            raise ValueError(f"{path}.{key}: settings is one flat object. Put these values beside model_type and prompt instead of nesting them. Nothing was submitted.")
                         settings, path = task[key], f"{path}.{key}"
                         break
                 if not isinstance(settings, dict):
                     raise ValueError(f"{path} must be a settings object. Nothing was submitted.")
                 defaults_call = f' See wangp_model(model_type="{settings.get("model_type") or "<model_type>"}", action="defaults", arguments={{}}) for setting names and value formats.'
-                nested = [key for key, value in settings.items() if isinstance(value, dict) and key != "custom_settings" or key == "resolution" and not isinstance(value, str)]
+                # nested values: the model's custom_settings and the post-processing slots' parameter dictionaries
+                nested = [key for key, value in settings.items() if isinstance(value, dict) and key not in NESTED_SETTINGS or key == "resolution" and not isinstance(value, str)]
                 if nested:
-                    expected = f'must be a "WIDTHxHEIGHT" string such as "1280x720", not {json.dumps(settings["resolution"])}' if nested[0] == "resolution" else "must be a single value, not an object; only custom_settings holds nested values"
+                    expected = f'must be a "WIDTHxHEIGHT" string such as "1280x720", not {json.dumps(settings["resolution"])}' if nested[0] == "resolution" else "must be a single value; only custom_settings and *_postprocessing_parameters hold objects"
                     raise ValueError(f"{path}.{nested[0]} {expected}.{defaults_call} Nothing was submitted.")
                 if str(settings.get("mode", "") or "").startswith("edit_"):
                     continue
@@ -2100,6 +2152,8 @@ def build_server_for_session(session, settings: dict[str, Any] | None = None, to
                 if not isinstance(model_type, str) or not model_type.strip():
                     template_hint = "" if api_version == "1" else ', or the settings must name a template ("template": "<task>")'
                     raise ValueError(f"{path}.{model_key} must be a non-empty string for generation{template_hint}. Nothing was submitted.")
+                if session.get_model_metadata(model_type.strip()) is None:  # a retired model type becomes its new type (settings converted in place)
+                    model_type = session._ensure_runtime().module.convert_retired_model_type(settings)
                 if session.get_model_metadata(model_type.strip()) is None:
                     template_call = 'wangp_templates(task="...", template="default")' if api_version == "2.1" else 'wangp_deepy_templates(tool_id="...")'
                     known = [str(item.get("model_type") or "") for item in session.list_model_defs()]
@@ -2238,7 +2292,7 @@ def call_tool_inline(mcp, name: str, arguments: dict[str, Any]) -> dict[str, Any
 def _build_python_sandbox(session, toolbox, file_access_policy, call_tool=None):
     """The session's Python sandbox (toolbox wangp_python) when the configuration enables it: its folder lies in the agent's documents workspace; call_tool(name, arguments) serves scripts' WanGP tool calls."""
     from shared.deepy import media_registry
-    from shared.deepy.config import DEEPY_PYTHON_SANDBOX_DEFAULT, DEEPY_PYTHON_SANDBOX_KEY, get_deepy_config_value, normalize_deepy_python_sandbox
+    from shared.deepy.config import DEEPY_PYTHON_SANDBOX_DEFAULT, DEEPY_PYTHON_SANDBOX_KEY, get_deepy_config_value, normalize_deepy_python_sandbox, python_apps_level
     from shared.deepy.python_sandbox import PythonSandbox
 
     if normalize_deepy_python_sandbox(get_deepy_config_value(DEEPY_PYTHON_SANDBOX_KEY, DEEPY_PYTHON_SANDBOX_DEFAULT)) != "enabled" or file_access_policy.workspace is None:
@@ -2247,15 +2301,31 @@ def _build_python_sandbox(session, toolbox, file_access_policy, call_tool=None):
     def resolve_path(reference):
         record = media_registry.get_media_record(toolbox.session, reference)
         if record is not None:
-            return _resolve_existing_path(record["path"], "ref")
+            path = _resolve_existing_path(record["path"], "ref")
+            return path if read_view(path) is None else view_clip(path)
         return _resolve_mcp_media_reference(session, reference, "ref", file_access_policy.read_enabled, file_access_policy)
+
+    def resolve_part(reference):
+        """What wangp.video_frames reads: a video file, and the frames a view or a part (|start_s=..., |start_frame=...) keeps of it."""
+        record = media_registry.get_media_record(toolbox.session, reference)
+        path = _resolve_existing_path(record["path"], "ref") if record is not None else _resolve_mcp_media_reference(session, reference, "ref", file_access_policy.read_enabled, file_access_policy, keep_view=True)
+        view = read_view(path)
+        if view is None and (spec := parse_virtual_media_path(path)) is not None:
+            from shared.utils.video_decode import probe_video_stream_metadata
+            metadata = probe_video_stream_metadata(path)  # seconds read as frames at the file's real rate
+            return {"path": spec.source_path, "start_frame": metadata["virtual_start_frame"], "end_frame": metadata["virtual_end_frame"]}
+        return {"path": path, "start_frame": 0, "end_frame": None} if view is None else {"path": view["source"], "start_frame": view["start_frame"], "end_frame": view["end_frame"]}
 
     def compact(record):
         return None if record is None else _output_record(_compact_gallery_record(record), record["path"])
 
+    apps = None
+    if python_apps_level() != "off":
+        from shared.apps.dev import AppWorkshop
+        apps = AppWorkshop(file_access_policy.workspace / "sandbox", resolve_path=resolve_path, publish_app=lambda package, description: compact(toolbox.publish_sandbox_app(package, description)), virtualize=file_access_policy.virtualize_path)
     return PythonSandbox(file_access_policy.workspace / "sandbox", resolve_path=resolve_path, publish_media=lambda path, description: compact(toolbox.publish_sandbox_media(path, description)),
                          publish_frames=lambda frames, fps, name, description: compact(toolbox.publish_sandbox_frames(frames, fps, name, description)), virtualize=file_access_policy.virtualize_path,
-                         call_tool=call_tool, list_dir=lambda reference: file_access_policy.require_read(reference, directory=True))
+                         call_tool=call_tool, list_dir=lambda reference: file_access_policy.require_read(reference, directory=True), apps=apps, resolve_part=resolve_part)
 
 
 def _http_settings(transport: str, host: str | None, port: int | None, oauth) -> dict[str, Any]:

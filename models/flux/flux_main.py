@@ -18,6 +18,7 @@ from transformers import Qwen2_5_VLForConditionalGeneration, Qwen2VLProcessor
 from .modules.autoencoder_flux2 import AutoencoderKLFlux2, AutoEncoderParamsFlux2
 from shared.qtypes import nunchaku_int4 as _nunchaku_int4
 from shared.utils.text_encoder_cache import TextEncoderCache
+from shared.attention_kit import PrefixCache
 
 from .util import load_ae, load_clip, load_flow_model, load_t5, preprocess_flux_state_dict
 from .flux2_adapter import (
@@ -125,7 +126,10 @@ class model_factory:
             with torch.device("meta"):
                 self.vae  = AutoencoderKLFlux2(AutoEncoderParamsFlux2())
 
-            offload.load_model_data(self.vae, fl.locate_file("flux2_vae.safetensors"), writable_tensors=False, default_dtype=None)
+            offload.load_model_data(self.vae, fl.locate_file(model_def.get("vae_filename", "flux2_vae.safetensors")), writable_tensors=False, default_dtype=None)
+            if self.model.reference_kv:
+                self.vae._convertWeightsFloatTo = None
+                self.vae.bn._lock_dtype = torch.float32
             self.vae_scale_factor = 8
         else:
             self.t5 = load_t5(torch_device, text_encoder_filename, max_length=512)
@@ -260,6 +264,10 @@ class model_factory:
             input_masks= None,
             width= 832,
             height=480,
+            model_mode=None,
+            NAG_scale=1.0,
+            NAG_tau=3.5,
+            NAG_alpha=0.5,
             embedded_guidance_scale: float = 2.5,
             guide_scale = 2.5,
             fit_into_canvas = None,
@@ -273,13 +281,13 @@ class model_factory:
             masking_strength = 1.,
             vae_upsampler = None,
             set_progress_status=None,
+            VAE_tile_size = None,
             **bbargs
     ):
             if self._interrupt:
                 return None
             device="cuda"
             flux2 = self.is_flux2
-            model_mode = bbargs.get("model_mode", None)
             def _vae_upsampler_progress(_phase, current_step=None, total_steps=None):
                 if callable(set_progress_status):
                     progress_label = getattr(vae_upsampler, "progress_label", "VAE Spatial Upsampling")
@@ -298,9 +306,7 @@ class model_factory:
             lanpaint_enabled = model_mode_int in (2, 3, 4, 5)
             if self.guidance_max_phases < 1: guide_scale = 1
             if n_prompt is None or len(n_prompt) == 0: n_prompt = "low quality, ugly, unfinished, out of focus, deformed, disfigure, blurry, smudged, restricted palette, flat colors"
-            nag_scale = bbargs.get("NAG_scale", 1.0)
-            nag_tau = bbargs.get("NAG_tau", 3.5)
-            nag_alpha = bbargs.get("NAG_alpha", 0.5)
+            nag_scale, nag_tau, nag_alpha = NAG_scale, NAG_tau, NAG_alpha
             NAG = None
             if nag_scale > 1 and guide_scale <= 1:
                 NAG = {"scale": nag_scale, "tau": nag_tau, "alpha": nag_alpha, "prefix_len": 0}
@@ -517,26 +523,37 @@ class model_factory:
 
             del contexts
             # denoise initial noise
-            x = denoise(
-                self.model,
-                **inp,
-                timesteps=timesteps,
-                guidance=embedded_guidance_scale,
-                real_guidance_scale=guide_scale,
-                final_step_size_scale=0.5 if self.is_piflux2 else None,
-                callback=callback,
-                pipeline=self,
-                loras_slists=loras_slists,
-                unpack_latent=unpack_latent,
-                joint_pass=joint_pass,
-                denoising_strength=denoising_strength,
-                masking_strength=masking_strength,
-                model_mode=model_mode,
-                height=height,
-                width=width,
-                vae_scale_factor=8,
-                NAG=NAG,
-            )
+            kv_cache = None
+            try:
+                if self.model.reference_kv and "img_cond_seq" in inp:
+                    kv_cache = []
+                    for blocks in (self.model.double_blocks, self.model.single_blocks):
+                        kv_cache.append(PrefixCache(blocks, dynamic=True, name="Klein Reference KV Cache"))
+                x = denoise(
+                    self.model,
+                    **inp,
+                    timesteps=timesteps,
+                    guidance=embedded_guidance_scale,
+                    real_guidance_scale=guide_scale,
+                    final_step_size_scale=0.5 if self.is_piflux2 else None,
+                    callback=callback,
+                    pipeline=self,
+                    loras_slists=loras_slists,
+                    unpack_latent=unpack_latent,
+                    joint_pass=joint_pass,
+                    denoising_strength=denoising_strength,
+                    masking_strength=masking_strength,
+                    model_mode=model_mode,
+                    height=height,
+                    width=width,
+                    vae_scale_factor=8,
+                    NAG=NAG,
+                    kv_cache=kv_cache,
+                )
+            finally:
+                if kv_cache is not None:
+                    for cache in kv_cache:
+                        cache.clear()
             if x==None: return None
             # decode latents to pixel space
             vae_upsampler_lq_latent = torch.cat(scatter_ids(x, inp["img_ids"])).squeeze(2) if flux2 and vae_upsampler is not None else None
@@ -545,7 +562,7 @@ class model_factory:
                 vae_latent = x
                 lq_latent = vae_upsampler_lq_latent if vae_upsampler_lq_latent is not None else vae_latent
                 with torch.autocast(device_type=device, dtype=torch.bfloat16):
-                    x = self.vae.decode(vae_latent)
+                    x = self.vae.decode(vae_latent, VAE_tile_size or 0)  # by tiles when the whole picture exceeds the VAE Tiling budget
 
                 img_msk_rebuilt = inp.get("img_msk_rebuilt") if isinstance(inp, dict) else None
                 if img_msk_rebuilt is not None and (lanpaint_enabled or (masking_strength == 1 and not flux2)):

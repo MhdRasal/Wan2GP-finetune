@@ -76,6 +76,7 @@ class family_handler:
         return {
             "image_outputs": True,
             "device_explicit": True,
+            "no_model_swap": True,  # one managed model: kept loaded between samples and queued tasks of the same model
             "cuda_graphs": ["transformer"],
             "dtype": "bf16",
             "no_negative_prompt": True,
@@ -161,6 +162,12 @@ class family_handler:
             resampling_module = getattr(Image, "Resampling", Image)
             preview = preview.resize((max(1, int(round(preview.width * scale))), 200), resample=getattr(resampling_module, "BILINEAR", Image.BILINEAR))
         return preview
+
+    @staticmethod
+    def query_retired_files(model_type):
+        """Checkpoints that earlier releases of a model type downloaded and its current definition no longer names (Models Manager
+        lists them with the model, to delete them)."""
+        return {"sensenova_u1_5_8b_mot": ["SenseNova_U1.5_8B_MoT_int8_convrot.safetensors"]}.get(model_type, [])
 
     @staticmethod
     def query_model_files(computeList, base_model_type, model_def=None):

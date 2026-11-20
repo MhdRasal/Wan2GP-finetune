@@ -71,8 +71,7 @@ class Attention(nn.Module):
 
     def forward(self, x_list):
         """Self-attention of x (handed off in x_list), (batch, tokens, dim)."""
-        out = attention_kit.qkv_attention(x_list, self.to_q, self.to_k, self.to_v, self.heads, self.head_dim, self._norm_)
-        return self.to_out[0](out.flatten(2))
+        return attention_kit.qkv_attention(x_list, self.to_q, self.to_k, self.to_v, self.heads, self.head_dim, self._norm_, out_proj=self.to_out[0])
 
     def keys_values(self, context):
         """Normalized keys and values (1, tokens, heads, head_dim) of a context (1, tokens, context_dim)."""
@@ -158,6 +157,9 @@ class TripoSGDiT(nn.Module):
         self.blocks = nn.ModuleList([DiTBlock(width, num_attention_heads, cross_attention_dim, skip=layer > num_layers // 2) for layer in range(num_layers)])
         self.norm_out = nn.LayerNorm(width)
         self.proj_out = nn.Linear(width, in_channels)
+        # It holds no weights itself: its lock keeps MMGP from rounding the float32 timestep to FP16 before the FP32 sinusoid (the
+        # pipeline passes FP16 latents, whose dtype the embedding is cast to, and FP16 contexts)
+        self._lock_dtype = torch.float32
 
     def forward(self, x, t, contexts, part_ids=None):
         """x (batch, latents, channels) and t (batch,) shared by the guidance branches; contexts: the image conditioning of each branch,

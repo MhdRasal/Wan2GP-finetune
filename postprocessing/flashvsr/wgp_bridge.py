@@ -226,6 +226,10 @@ class FlashVSRBridge:
     def method_visible(self, method: str) -> bool:
         return self.METHOD_MODELS[method] == self.model()
 
+    def preferred_method(self, method: str) -> str:
+        two_pass = self.is_two_pass_upsampling(method)
+        return next(key for key in self.METHOD_MODELS if self.method_visible(key) and self.is_two_pass_upsampling(key) == two_pass)
+
     @classmethod
     def query_upsampler_def(cls) -> dict[str, Any]:
         return {
@@ -271,6 +275,11 @@ class FlashVSRBridge:
     def is_upsampling(self, spatial_upsampling) -> bool:
         return self.scale_for_upsampling(spatial_upsampling) is not None
 
+    def query_chunking(self, spatial_upsampling):
+        """How a long video goes through this upsampler a chunk at a time (postprocessing.chunking)."""
+        from .process_handler import HANDLER
+        return HANDLER
+
     def validate_upsampling(self, spatial_upsampling, image_mode: int) -> str:
         if not self.is_upsampling(spatial_upsampling):
             return ""
@@ -308,7 +317,16 @@ class FlashVSRBridge:
             return None
         _, variant = self.settings()
         model = self.model() if spatial_upsampling is None else self.model_for_upsampling(spatial_upsampling)
-        files = [self.transformer_filename(model, self.quantization()), self.lq_proj_filename(model), self.POSI_PROMPT_FILENAME]
+        return self._model_download_def(model, self.quantization(), variant)
+
+    def query_checkpoint_inventory(self):
+        for label, model in self.MODEL_CHOICES:
+            for _, quant in self.QUANTIZATION_CHOICES:
+                for mode in ("tiny", "full"):  # Tiny-Long uses the same files as Tiny.
+                    yield {"name": label.split(" (")[0], "variant": f"{quant.upper()} {mode.title()}", "download_defs": [self._model_download_def(model, quant, mode)]}
+
+    def _model_download_def(self, model, quant, variant):
+        files = [self.transformer_filename(model, quant), self.lq_proj_filename(model), self.POSI_PROMPT_FILENAME]
         if variant != "full":
             files.append(self.TCDECODER_FILENAME)
         return {
@@ -333,11 +351,17 @@ class FlashVSRBridge:
         )
 
     def vae_tile_size(self, vae_config: int, output_height: int | None = None, output_width: int | None = None) -> int:
+        """The decoder's tile for the VAE Tiling setting: the Wan VAE's for the full variant, else the TCDecoder's from its own costs
+        (exact tiles of any size: the largest the budget holds)."""
         import torch
         from models.wan.modules.vae import WanVAE
+        from postprocessing.flashvsr.runtime import TCDECODER_COSTS
+        from shared.image_vae import tiling
 
         device_mem_capacity = torch.cuda.get_device_properties(0).total_memory / 1048576 if torch.cuda.is_available() else 0
-        return WanVAE.get_VAE_tile_size(vae_config, device_mem_capacity, False, output_height=output_height, output_width=output_width)
+        if self.settings()[1] == "full":
+            return WanVAE.get_VAE_tile_size(vae_config, device_mem_capacity, False, output_height=output_height, output_width=output_width)
+        return tiling.largest_tile(vae_config, device_mem_capacity, TCDECODER_COSTS, output_height, output_width, step=64, minimum=256)
 
     def download(self, process_files: Callable[..., Any], send_cmd=None, status_text: str | None = None, spatial_upsampling=None) -> bool:
         from shared.utils.download import process_files_def_if_needed

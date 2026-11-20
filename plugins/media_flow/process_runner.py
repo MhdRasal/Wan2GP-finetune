@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import shutil
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import gradio as gr
@@ -12,7 +12,7 @@ from PIL import Image
 
 from shared.utils.hdr import VIDEO_PROMPT_HDR_OUTPUT_FLAG
 from shared.utils.utils import has_image_file_extension
-from postprocessing.spatial_upsamplers import PARAMETER_PREFIX
+from postprocessing import parameter_ui
 
 from .chunk_executor import ChunkExecutor, ChunkProgress, ProcessContext, build_task_settings
 from . import batch_queue
@@ -86,7 +86,7 @@ class RunRequest:
             sliding_window_overlap=sliding_window_overlap,
             start_seconds="" if start_seconds in (None, "") else str(start_seconds),
             end_seconds="" if end_seconds in (None, "") else str(end_seconds),
-            spatial_upsampler_parameters={str(key): value for key, value in dict(spatial_upsampler_parameters or {}).items() if str(key).startswith(PARAMETER_PREFIX)},
+            spatial_upsampler_parameters={parameter_ui.LEGACY_NAMES.get(str(key), str(key)): value for key, value in dict(spatial_upsampler_parameters or {}).items()},
         )
 
 
@@ -208,6 +208,16 @@ class ProcessRunner:
         return sum(1 for item in list(state.get("items") or []) if str(item.get("status") or "") == "failed")
 
     @staticmethod
+    def _batch_completion_status(state: dict, media_kind: str, message: str):
+        items = state["items"]
+        elapsed_seconds = sum(item["elapsed_seconds"] for item in items)
+        if media_kind == "image":
+            return status_ui.render_process_status_html("Batch Completed", message, elapsed_seconds=elapsed_seconds, eta_seconds=0)
+        total = sum(item["chunks_total"] for item in items)
+        completed = sum(item["chunks_completed"] for item in items)
+        return status_ui.render_chunk_status_html(total, completed, total, "Batch Completed", message, elapsed_seconds=elapsed_seconds, eta_seconds=0)
+
+    @staticmethod
     def _batch_resume_index(state: dict, total_items: int) -> int:
         for index, item in enumerate(list(state.get("items") or [])[:total_items]):
             if str(item.get("status") or "") not in {"success", "failed"}:
@@ -284,7 +294,8 @@ class ProcessRunner:
                 settings["video_guide_outpainting_ratio"] = str(target_ratio or "").strip()
         if not self._is_spatial_upsampling_task(settings):
             settings["resolution"] = output_paths.choose_resolution(output_resolution)
-        settings["spatial_upsampler_parameters"] = dict(spatial_upsampler_parameters)
+        spatial = parameter_ui.SETTINGS[parameter_ui.SPATIAL]  # the process's own values completed with the user's
+        settings[spatial] = {**dict(settings.get(spatial) or {}), **dict(spatial_upsampler_parameters)}
         api_settings = settings.get("_api")
         settings["_api"] = dict(api_settings) if isinstance(api_settings, dict) else {}
         for key in ("return_media", "return_video_uint8", "return_audio", "return_flashvsr_continue_cache", "flashvsr_continue_cache"):
@@ -471,6 +482,9 @@ class ProcessRunner:
         if len(items) == 0:
             yield self.info_exit(f"Batch has no source {media_kind}s to process.")
             return
+        batch_process_definition = process_definition if process_definition.get("info", {}).get("use_configured_model") else None
+        if batch_process_definition is not None:
+            request = replace(request, target_ratio=system_handler.normalize_target_control_for_process(request.target_ratio, process_definition["settings"]))
         self._reset_generated_artifacts()
         signature = batch_queue.build_signature(request, items, batch_name=batch_name, process_model_type=model_type, media_kind=media_kind)
         signature_hash = batch_queue.signature_hash(signature)
@@ -518,7 +532,7 @@ class ProcessRunner:
             message = "Batch already completed. Nothing to do."
             gr.Info(message)
             yield self.ui_update(
-                status_ui.render_process_status_html("Batch Completed", message) if media_kind == "image" else status_ui.render_chunk_status_html(0, 0, 0, "Batch Completed", message),
+                self._batch_completion_status(batch_state, media_kind, message),
                 self.ui_skip,
                 self.ui_skip,
                 batch_status=status_ui.render_batch_status_html(len(items), completed_files, len(items), "", message, failed_files),
@@ -591,6 +605,7 @@ class ProcessRunner:
                         batch_source_path=batch_source_path,
                         spatial_upsampler_parameters=request.spatial_upsampler_parameters,
                         batch_internal=True,
+                        batch_process_definition=batch_process_definition,
                     )
                     result = self.active_job.get("last_process_result")
                     if not isinstance(result, ProcessRunResult):
@@ -599,7 +614,7 @@ class ProcessRunner:
                     result = ProcessRunResult(source_path=item.source_path, output_path=item.output_path, success=False, message=common.get_error_message(exc) or str(exc))
                 elapsed_seconds = max(0.0, time.time() - file_started_at)
                 item_state["ended_at"] = batch_queue.now_iso()
-                item_state["elapsed_seconds"] = elapsed_seconds
+                item_state["elapsed_seconds"] += elapsed_seconds
                 item_state["actual_output_path"] = result.output_path
                 item_state["chunks_completed"] = int(result.chunks_completed)
                 item_state["chunks_total"] = int(result.chunks_total)
@@ -627,7 +642,7 @@ class ProcessRunner:
             batch_queue.write_state(files.state_path, batch_state)
             batch_queue.append_log(files.log_path, "completed", batch_name=batch_name, total_files=len(items), completed_files=completed_files, failed_files=failed_files)
             yield self.ui_update(
-                status_ui.render_process_status_html("Batch Completed", f"Batch completed. {completed_files} file(s) processed.") if media_kind == "image" else status_ui.render_chunk_status_html(0, 0, 0, "Batch Completed", f"Batch completed. {completed_files} file(s) processed."),
+                self._batch_completion_status(batch_state, media_kind, f"Batch completed. {completed_files} file(s) processed."),
                 self.ui_skip,
                 self.ui_skip,
                 batch_status=status_ui.render_batch_status_html(len(items), completed_files, len(items), "", "Completed.", failed_files),
@@ -639,11 +654,11 @@ class ProcessRunner:
         finally:
             self.active_job["batch_running"] = False
 
-    def start_process(self, state=None, process_name="", user_refs=None, source_path="", source_image_path=None, process_strength=None, output_path="", prompt_text="", continue_enabled=True, preview_enabled=True, source_audio_track="", output_resolution="720p", target_ratio="", chunk_size_seconds=10.0, sliding_window_overlap=1, start_seconds="", end_seconds="", batch_mode="single", batch_name="", batch_source_path="", batch_image_source_path=None, spatial_upsampler_parameters=None, batch_internal=False):
+    def start_process(self, state=None, process_name="", user_refs=None, source_path="", source_image_path=None, process_strength=None, output_path="", prompt_text="", continue_enabled=True, preview_enabled=True, source_audio_track="", output_resolution="720p", target_ratio="", chunk_size_seconds=10.0, sliding_window_overlap=1, start_seconds="", end_seconds="", batch_mode="single", batch_name="", batch_source_path="", batch_image_source_path=None, spatial_upsampler_parameters=None, batch_internal=False, batch_process_definition=None):
         self.active_job[catalog.PREVIEW_OUTPUT_STORAGE_KEY] = catalog.normalize_preview_enabled(preview_enabled)
         if not self._preview_enabled():
             self.preview_state["image"] = None
-        process_definition = self.library.process_definition(str(process_name or "").strip(), state, list(user_refs or []))
+        process_definition = batch_process_definition or self.library.process_definition(str(process_name or "").strip(), state, list(user_refs or []))
         selected_source_path = source_path
         selected_batch_source_path = batch_source_path
         if process_definition is not None and self._process_is_image(process_definition):
@@ -797,10 +812,12 @@ class ProcessRunner:
         self.active_job["running"] = True
         try:
             video.clear_process_full_video_source()
+            upsampler_metadata = {"spatial_upsampling": system_target_control} if process_definition.get("info", {}).get("use_configured_model") else {}
             yield self.ui_update(status_ui.render_chunk_status_html(1, 0, 1, "Initializing", "Preparing processing job..."), self.ui_skip, str(time.time_ns()), start_enabled=False, abort_enabled=False)
             started_ui = True
             try:
                 prepared_run = prepare_run(
+                    expected_spatial_upsampling=upsampler_metadata.get("spatial_upsampling", ""),
                     plugin=self.plugin,
                     get_model_def=self.get_model_def,
                     process_name=request.process_name,
@@ -813,6 +830,7 @@ class ProcessRunner:
                     source_audio_track=source_audio_track,
                     chunk_size_seconds=chunk_size_seconds,
                     sliding_window_overlap=sliding_window_overlap,
+                    sliding_window_size=process_settings.get("sliding_window_size"),
                     start_seconds=start_seconds,
                     end_seconds=end_seconds,
                     model_type=model_type,
@@ -1064,6 +1082,7 @@ class ProcessRunner:
                 "video_length": int(resumed_unique_frames),
                 "frame_count": int(resumed_unique_frames),
                 process_metadata.PROCESS_FULL_VIDEO_METADATA_KEY: {
+                    **upsampler_metadata,
                     "process": process_display_name,
                     "written_unique_frames": int(resumed_unique_frames),
                     "chunks": int(total_chunks_display),
@@ -1243,6 +1262,7 @@ class ProcessRunner:
                     raise gr.Error(f"Final output contains {actual_output_frames} readable frame(s), but {total_written_unique_frames} frame(s) were written.")
             total_generation_time = existing_output_generation_time + process_metadata.read_metadata_generation_time(metadata_source_path) if merged_continuation else process_metadata.read_metadata_generation_time(metadata_source_path)
             output_process_metadata = {
+                **upsampler_metadata,
                 "process": process_display_name,
                 "written_unique_frames": int(total_written_unique_frames),
                 "chunks": int(total_chunks_display),
@@ -1337,4 +1357,6 @@ class ProcessRunner:
             self.active_job["running"] = False
             self.active_job["write_state"] = None
             video.clear_process_full_video_source()
+            if system_handler is not None and callable(getattr(system_handler, "release_continue_cache", None)):
+                system_handler.release_continue_cache()  # the in-memory stream a system process carried from chunk to chunk, however the run ended
 

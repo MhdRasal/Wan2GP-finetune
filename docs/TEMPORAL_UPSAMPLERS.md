@@ -1,6 +1,6 @@
 # Temporal Upsampler Plugin API
 
-Temporal upsamplers (RIFE, frame interpolation plugins, ...) are registered in
+Temporal upsamplers (RIFE, frame interpolation Plugins, ...) are registered in
 `postprocessing/temporal_upsamplers.py`. Each upsampler declares its methods and
 supported multipliers through a handler object; the registry owns dropdown state,
 value parsing, validation helpers, config nesting, downloads, and dispatch.
@@ -35,6 +35,7 @@ class MyTemporalUpsampler:
     def download(self, process_files, send_cmd=None, status_text=None, temporal_upsampling=None): ...
     def query_download_def(self, *, enabled_only=True): ...    # -> one process_files definition
     def query_download_defs(self, *, enabled_only=True): ...   # -> list of process_files definitions
+    def query_checkpoint_inventory(self): ...                  # all checkpoint variants, independent of the selected settings; see PLUGINS.md
     def load_upsampler(self, value, **kwargs): ...             # optional pre-dispatch load hook
     def supports_loaded_model(self, value, context): ...       # optional core-model borrowing
     def release_private_runtime(self): ...                     # optional before borrowing core model
@@ -89,8 +90,14 @@ lists registered handlers using `description` and any per-method details from
 `method_descriptions`.
 Each `method_parameters` entry is a list of dictionaries with at least `name`;
 it may also define `type`, `description`, `required`, `default`, `enum`, and a
-queue-setting override named `setting`. These fields are optional so older and
-third-party handlers remain compatible.
+keyword override named `setting`. These fields are optional so older and
+third-party handlers remain compatible. Parameters are declared as for spatial
+upsamplers: `name` is the id of the value in the slot's
+`temporal_postprocessing_parameters` setting, `ui` lists the contexts where the
+inputs below the slot's selector show it, an images parameter reads the reference
+images shared with the spatial slot, and the processor receives each value under
+its `setting` name. See
+[Spatial Upsampler Plugin API](SPATIAL_UPSAMPLERS.md).
 
 ## Runtime Contract
 
@@ -111,6 +118,30 @@ the next chunk can continue smoothly.
 Do not assume a different frame layout than the one passed by WanGP. Convert
 dtypes or layouts only when the handler implementation requires it, and keep the
 returned sample layout compatible with the surrounding WanGP postprocessing flow.
+
+### Long videos
+
+A long video is interpolated a chunk at a time, so that it never has to fit in
+memory. A handler declares how through `query_chunking(value)`, with the fields
+described in
+[Spatial Upsampler Plugin API](SPATIAL_UPSAMPLERS.md#long-videos-chunk-rules).
+A frame interpolator typically shares one frame between chunks and keeps every
+output frame but the last one, which opens the next chunk:
+
+```python
+class MyChunkRules:
+    overlap_frames = 1
+    minimum_requested_frames = 2
+
+    def get_overlap_frames(self, chunk_frames):
+        return min(self.overlap_frames, chunk_frames - 1)
+
+    def output_write_range(self, returned_frames, *, source_write_start, source_write_end, next_overlap_frames):
+        return source_write_start, returned_frames - next_overlap_frames
+```
+
+Each chunk is one `temporal_upsample(...)` call without `previous_last_frame`.
+A handler without `query_chunking` receives its video in one piece.
 
 `postprocessing/temporal_upsamplers.py` wraps dispatch in shared attention state,
 unloads the main generation offload object before running the temporal upsampler,
@@ -141,9 +172,9 @@ temporal_upsampler_handlers = [
 `temporal_upsampler_api.register_temporal_upsamplers(server_config, fl)`; it
 should not import or keep one explicit variable per temporal upsampler.
 
-Enabled plugins can expose temporal upsamplers without editing core code by
+Enabled Plugins can expose temporal upsamplers without editing core code by
 adding `temporal_upsampler_handlers` to `plugin_info.json`. Entries that start
-with `.` are relative to the plugin package root; entries without a leading `.`
+with `.` are relative to the Plugin package root; entries without a leading `.`
 are absolute import paths:
 
 ```json
@@ -157,7 +188,7 @@ are absolute import paths:
 }
 ```
 
-Only enabled/loaded plugins are considered. The plugin manager reuses cached
+Only enabled/loaded Plugins are considered. The Plugin manager reuses cached
 `plugin_info.json` metadata when registering those handlers.
 
 ## Configuration
@@ -183,7 +214,7 @@ RIFE v4.26 is implemented by `postprocessing/rife/temporal_upsampler.py`:
 - no model-version configuration; all multipliers use RIFE v4.26
 
 For a minimal external handler, see the
-[Temporal Blend reference plugin](https://github.com/deepbeepmeep/wan2gp-blender-upsampler).
+[Temporal Blend reference Plugin](https://github.com/deepbeepmeep/wan2gp-blender-upsampler).
 It exposes `blend*2` and supplies the description displayed by the Temporal
 Upsampling information button.
 
@@ -199,7 +230,7 @@ offload_registry.unregister_offloadobj("MyTemporalUpsampler", offloadobj)  # in 
 ```
 
 This lets WanGP track every extension offload object and release all extension
-resources centrally: the toolbar "Unload Models" tool and Configuration plugin
+resources centrally: the toolbar "Unload Models" tool and Configuration Plugin
 release button call `offload_registry.release_all()`.
 
 Alternative methods can be available without appearing in the normal dropdown.
@@ -214,4 +245,4 @@ own memory requirements.
 
 ---
 
-> Applies to: Developing temporal upsampler plugins: handlers, registration and shared configuration. Installed frame-interpolation options are available through WanGP's post-processing controls and API.
+> Applies to: Developing temporal upsampler Plugins: handlers, registration and shared configuration. Installed frame-interpolation options are available through WanGP's post-processing controls and API.

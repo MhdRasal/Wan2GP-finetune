@@ -6,15 +6,18 @@ plugin's request in its own session and workspace (shown in the UI meanwhile), t
 """
 from __future__ import annotations
 
+import contextlib
 import os
 import queue
 import re
 import shutil
 import threading
+import time
 import traceback
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Iterator
 
 from shared.api import ProgressUpdate, SessionEvent, WanGPSession, extract_status_phase_label
@@ -31,6 +34,7 @@ from shared.utils.workspaces import load_gallery
 WORKSPACE_MODES = ("isolated", "temporary", "current")
 MEDIA_MODES = ("copy", "link")
 TERMINAL_EVENTS = ("done", "cancelled", "error")
+LIVE_INTERVAL = 1 / 3  # seconds between the updates of a thought being written or of the speed
 _MEDIA_ID_RE = re.compile(r"^(?:" + "|".join(re.escape(source.media_ids) for source in GALLERY_SOURCES) + r"):[0-9a-f]{12}$")
 _service = None
 _open_scratch: set[Path] = set()
@@ -59,6 +63,7 @@ class DeepyResult:
     outputs: tuple[dict[str, Any], ...] = ()    # media Deepy wrote: id, path, kind, name
     session_dir: str | None = None
     error: str | None = None
+    reply: str = ""                             # its last message alone: text holds all it said during the job
 
     @property
     def cancelled(self) -> bool:
@@ -98,13 +103,15 @@ class DeepyJob:
         self._done = threading.Event()
         self._result = None
         self._phase = "waiting"
-        self._text, self._tools, self._status, self._outputs = "", {}, None, {}
+        self._text, self._reply, self._tools, self._status, self._outputs = "", "", {}, None, {}
+        self._thoughts, self._thought_due, self._stats, self._stats_due = {}, 0.0, None, 0.0
         self._known, self._steers = set(), 0
+        self.chat_events = False  # a page showing Deepy's window sets it: "chat" events then bring what that window needs
         self._thread = threading.Thread(target=self._run, name=f"Deepy job ({owner})", daemon=True)
         self._thread.start()
 
     def events(self, timeout: float | None = None) -> Iterator[SessionEvent]:
-        """Events until the job ends: queued, started, status, text, tool, progress, output, then done, cancelled or error."""
+        """Events until the job ends: queued, started, status, text, thought, stats, tool, progress, output, chat when `chat_events` is set, then done, cancelled or error."""
         while True:
             event = self._events.get(timeout=timeout)
             yield event
@@ -150,7 +157,7 @@ class DeepyJob:
         self._events.put(SessionEvent(kind, data))
 
     def _finish(self, status, error=None):
-        self._result = DeepyResult(status, self._text, tuple(self._outputs.values()), None if self.session_dir is None else str(self.session_dir), error)
+        self._result = DeepyResult(status, self._text, tuple(self._outputs.values()), None if self.session_dir is None else str(self.session_dir), error, self._reply)
         self._done.set()
         self._emit(status, self._result)
 
@@ -186,6 +193,8 @@ class DeepyJob:
                         instance = event["data"]["instance"]
                     elif event["type"] == "progress" and event["data"] is not None and self._phase == "started":
                         self._emit("progress", _progress_update(event["data"]))
+                    elif event["type"] == "chat" and self.chat_events and event["data"] is not None and self._phase == "started":
+                        self._emit("chat", event["data"])
                 with service._condition:
                     state = service._request_states[self._submission_id]
                     # Deepy answers some requests without running them (unavailable, resetting): nothing will start.
@@ -196,9 +205,9 @@ class DeepyJob:
                 self._scan(session, known)
                 if state["phase"] == "cancelled":
                     return True
-                if state["phase"] == "finished":
-                    # Steering interrupts the turn to continue with the new message: that is not a stop.
-                    return bool(state["interrupted"]) and (self._cancel.is_set() or not self._steers)
+                if state["phase"] == "finished" and (not self._steers or service._plugin_idle()):
+                    # Steering interrupts the turn to continue with the new message: that is not a stop, and the job follows that work until Deepy is done.
+                    return self._cancel.is_set() if self._steers else bool(state["interrupted"])
                 if self._cancel.is_set() and not stopping:
                     stopping = True
                     service.control("stop", {})
@@ -206,7 +215,7 @@ class DeepyJob:
             with service._condition:
                 del service._request_states[self._submission_id]
 
-    def _scan(self, session, known):
+    def _scan(self, session, known, final=False):
         with session.turn_lock:
             transcript = session.chat_transcript
             start = next((index for index in range(len(transcript) - 1, -1, -1) if transcript[index].get("client_submission_id") == self._submission_id), None)
@@ -216,19 +225,31 @@ class DeepyJob:
                 for record in transcript[start + 1:]:
                     if record.get("role") != "user":
                         blocks.extend(dict(block) for block in record.get("blocks", []) if isinstance(block, dict))
-            status = session.chat_status
+            status, stats = session.chat_status, session.chat_stats or session.remote_usage_stats
             written = [(record["path_key"], record["path"], record["media_type"], record.get("label", "")) for record in session.media_registry if "write" in record.get("access", []) and record.get("path_key") not in known and record.get("path")]
-        text = "\n\n".join(block["text"] for block in blocks if block.get("type") == "markdown" and block.get("text"))
+        said = [block["text"] for block in blocks if block.get("type") == "markdown" and block.get("text")]
+        text = "\n\n".join(said)
         if text != self._text:
-            self._emit("text", {"text": text, "delta": text[len(self._text):] if text.startswith(self._text) else text})
+            self._reply = said[-1]
+            self._emit("text", {"text": text, "delta": text[len(self._text):] if text.startswith(self._text) else text, "last": self._reply})
             self._text = text
+        now = float("inf") if final else time.monotonic()  # the last pass holds nothing back
         for block in blocks:
+            if block.get("type") == "reasoning":
+                thought, streaming, before = block["text"], bool(block.get("streaming")), self._thoughts.get(block["id"], ("", True))
+                if (thought, streaming) != before and (not streaming or now >= self._thought_due):  # a finished thought is never held back
+                    self._thoughts[block["id"]], self._thought_due = (thought, streaming), now + LIVE_INTERVAL
+                    self._emit("thought", {"id": block["id"], "text": thought, "delta": thought[len(before[0]):] if thought.startswith(before[0]) else thought, "streaming": streaming})
             if block.get("type") == "tool" and self._tools.get(block["id"]) != (block["status"], block["status_text"]):
                 self._tools[block["id"]] = (block["status"], block["status_text"])
-                self._emit("tool", {key: block[key] for key in ("id", "name", "label", "status", "status_text")})
+                failure = str((block.get("result") or {}).get("error") or "")[:400] if block["status"] == "error" else ""  # what went wrong, for the plugin's page
+                self._emit("tool", {**{key: block[key] for key in ("id", "name", "label", "status", "status_text")}, **({"error": failure} if failure else {})})
         if status is not None and status != self._status:
-            self._emit("status", {"kind": status["kind"], "text": status["text"]})
+            self._emit("status", {"kind": status["kind"], "text": status["text"], **({"progress": status["progress"]} if "progress" in status else {})})
         self._status = status
+        if stats and stats != self._stats and now >= self._stats_due:
+            self._stats, self._stats_due = stats, now + LIVE_INTERVAL
+            self._emit("stats", {key: value for key, value in stats.items() if key != "visible"})
         for path_key, path, kind, label in written:
             if path_key not in self._outputs:
                 self._outputs[path_key] = {"id": gallery_media_ids(path, source_for_kind(kind).media_ids)[0], "path": path, "kind": kind, "name": Path(path).name, "label": label}
@@ -333,7 +354,7 @@ class PluginJobSupport:
                 while not self._plugin_idle():
                     self._condition.wait(timeout=1)
             if job._phase == "started":  # a late steering message can start one more turn: its reply and media belong to the job
-                job._scan(self._session, job._known)
+                job._scan(self._session, job._known, final=True)
             self._plugin_restore(job, parked)
 
     def _plugin_acquire(self, job):
@@ -398,7 +419,11 @@ class PluginJobSupport:
             for workspace_id in self.workspaces.records:
                 if self.workspaces.media_dir(workspace_id) == folder:
                     return workspace_id
-            workspace_id = self.workspaces.create(name, folder=folder)
+            taken, unique, number = {record['name'].casefold() for record in self.workspaces.records.values()}, name, 1
+            while unique.casefold() in taken:  # another folder of the same name, such as two productions with one title
+                number += 1
+                unique = f'{name[:112]} ({number})'
+            workspace_id = self.workspaces.create(unique, folder=folder)
             self.workspaces.protect(workspace_id, True)  # a plugin's own folder is not archived for inactivity
         self.publish_workspaces()
         return workspace_id
@@ -524,6 +549,53 @@ class DeepyClient:
         paths = self._service.plugin_resolve_media(list(media))
         return DeepyJob(self._service, self.owner, prompt, paths, media_mode=media_mode, session_dir=session_dir, workspace=workspace, title=title,
                         instructions=str(instructions or "").strip())
+
+    def release_vram(self, timeout: float = 120.0) -> bool:
+        """Take Deepy's model out of VRAM (its conversation stays, and comes back at its next request) once Deepy is idle: no job, request
+        or generation running. Waits up to timeout seconds for that; returns whether it released."""
+        service = self._service
+        deadline = time.monotonic() + timeout
+        with service._condition:
+            while not (service._plugin_job is None and service._plugin_idle()):
+                if time.monotonic() > deadline:
+                    return False
+                service._condition.wait(timeout=1)
+        with service._mutation_lock:
+            if service._plugin_job is not None or not service._plugin_idle():
+                return False
+            service._deps.controller.release_vram(service._state)
+        return True
+
+    @contextlib.contextmanager
+    def turn(self, cancelled=lambda: False):
+        """Deepy's turn, for a plugin's work on the GPU without Deepy (its own renders): it waits for the jobs and generations before it, in
+        order with the jobs waiting, takes Deepy's model out of VRAM, and jobs started meanwhile wait until it ends. When cancelled() turns
+        true while it waits, the body runs at once without the turn: check the cancel there."""
+        service, holder = self._service, SimpleNamespace(owner=self.owner)
+        with service._condition:
+            service._plugin_waiters.append(holder)
+        held = False
+        try:
+            while not held and not cancelled():
+                with service._condition:
+                    if not (service._plugin_waiters[0] is holder and service._plugin_job is None and service._plugin_idle()):
+                        service._condition.wait(timeout=1)
+                        continue
+                with service._mutation_lock:  # as a job starts: idle checked here stays idle
+                    if service._plugin_job is None and service._plugin_idle():
+                        service._plugin_job, held = holder, True
+                        service._deps.controller.release_vram(service._state)
+        finally:
+            with service._condition:
+                service._plugin_waiters.remove(holder)
+                service._condition.notify_all()
+        try:
+            yield
+        finally:
+            if held:
+                with service._condition:
+                    service._plugin_job = None
+                    service._condition.notify_all()
 
     def ensure_workspace(self, name: str, folder: str | os.PathLike) -> str:
         """The id of the workspace keeping its media in folder, created (with this name) the first time."""

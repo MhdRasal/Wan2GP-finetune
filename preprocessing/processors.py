@@ -5,6 +5,18 @@ import torch
 from shared.utils import files_locator as fl
 from shared.utils.download import process_files_def_if_needed
 
+DEPTH_VARIANT_CHOICES = [
+    ("Depth Anything 2 Large (more precise, slower)", "vitl"),
+    ("Depth Anything 2 Big (less precise, faster)", "vitb"),
+    ("Depth Anything 3 Metric Large (better temporal stability ?)", "da3_metric_large"),
+]
+
+
+def depth_checkpoint_inventory():
+    for label, variant in DEPTH_VARIANT_CHOICES:
+        yield {"name": "Depth Anything", "variant": label.removeprefix("Depth Anything ").split(" (")[0],
+               "download_defs": [query_preprocessor_download_def("depth", {"depth_anything_v2_variant": variant})]}
+
 
 def query_preprocessor_download_def(process_type, server_config=None):
     if process_type in ("pose", "pose_align"):
@@ -105,8 +117,8 @@ def prepare_generation_assets(model_def, base_model_type, settings, server_confi
     has_guide = guide is not None or settings.get("image_guide") is not None
     definitions = []
     if settings.get("image_refs") and settings.get("remove_background_images_ref", 0) > 0 and not model_def.get("no_background_removal", False):
-        from preprocessing.rembg.assets import ensure_assets
-        ensure_assets()
+        from preprocessing.rembg.assets import ensure_assets, selected_model
+        ensure_assets(model_name=selected_model(model_def.get("background_removal_model", "u2net"), server_config))
     if has_guide and not model_def.get("skip_video_guide_preprocess", False):
         if not model_def.get("custom_preprocessor"):
             kinds = [kind for letter, kind in guide_processes.items() if letter in video_mode]

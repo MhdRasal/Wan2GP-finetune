@@ -22,10 +22,10 @@ Model links below select a model when this guide is opened inside WanGP. When re
 | Short audio-video clips with a smaller model | [Kandinsky 6 Lite Distilled](modeltype:k6_lite_distill) | A 3B generator for text or a start image, with speech, music and effects. Start with five seconds and the supplied ten-step settings. |
 | A planned camera move from an image | [Fun Control-Camera 1.3B](modeltype:fun_camera_1.3B), [Uni3C 14B](modeltype:uni3c) | Pick a camera preset or supply a custom path. Fun is smaller; Uni3C uses the start image's estimated geometry to guide the shot. |
 | Video following reference subjects, scenes or voices | [MiniMax H3 Ref2VA Pruned](modeltype:minimax_h3_ref2va_pruned), [LTX 2.5 MSR](modeltype:ltx2_25_22B_msr) | Ref2VA accepts image, video and audio references. MSR combines subject/object references, with an optional background reference. |
-| Character animation and replacement | [SCAIL-2](modeltype:scail2_14B), [Wan 2.2 Animate 2](modeltype:animate2), [Viggle Animate](modeltype:viggle_animate) | SCAIL-2 and Animate 2 are Wan-derived workflows. Viggle is H3-derived and needs an edited frame from the original driving video. |
+| Character animation and replacement | [SCAIL-2](modeltype:scail2_14B), [Wan 2.2 Animate 2](modeltype:animate2), [Viggle Animate](modeltype:viggle_animate), [Viggle Remake Pruned 20B Swap](modeltype:viggle_remake) | SCAIL-2 and Animate 2 are Wan-derived workflows. The Viggle models are H3-derived and need an edited frame from the original video. Viggle Remake also takes a prompt, keeps the soundtrack and recasts several people at once. |
 | General text-to-video or image-to-video | [Wan 2.2 T2V](modeltype:t2v_2_2), [Wan 2.2 I2V](modeltype:i2v_2_2) | General-purpose generation with a broad choice of LoRAs and specialist variants. |
 | Connected stories with recurring characters | [JoyAI-Echo Surgical](modeltype:joyai_echo_surgical) | This LTX-2 variant reuses character, voice, object and location memories between shots. |
-| Video editing and outpainting | [H3 ControlNet-Union Pruned](modeltype:minimax_h3_control_pruned), [Wan VACE](modeltype:vace_14B), [Bernini-R](modeltype:bernini) | Pick H3 for controlled audio-video generation, VACE for mask/control editing, or Bernini for video edits and multiple references. |
+| Video editing and outpainting | [H3 ControlNet-Union Pruned](modeltype:minimax_h3_control_pruned), [Wan VACE](modeltype:vace_14B), [Bernini-R](modeltype:bernini), [Viggle Remake Pruned 20B Edit](modeltype:viggle_remake_edit) | Pick H3 for controlled audio-video generation, VACE for mask/control editing, Bernini for video edits and multiple references, or Viggle Remake Edit to change objects, setting, weather or light from a painted frame while keeping the people, motion and soundtrack. |
 | Talking characters and longer dialogue | [LongCat Avatar 1.5](modeltype:longcat_avatar_v1_5), [InfiniteTalk](modeltype:infinitetalk), [Magi Human Distill](modeltype:magi_human_distill) | LongCat Avatar and InfiniteTalk follow speech audio. Magi Human can generate speech with motion or follow supplied audio. |
 | General image generation | [Krea 2 Turbo](modeltype:krea2_turbo), [Z-Image Turbo](modeltype:z_image), [Flux 2 Klein 4B](modeltype:flux2_klein_4b) | Distilled choices for iteration. Compare their appearance, reference support and memory use on your own prompts. |
 | Image editing and references | [Qwen Image 2.1](modeltype:qwen_image_21_7B), [Qwen Image Edit Plus 2511](modeltype:qwen_image_edit_plus2_20B), [Krea 2 Identity Edit](modeltype:krea2_raw_edit) | Qwen 2.1 combines generation and editing with up to ten references. Edit Plus emphasizes image edits and identity. Krea Identity Edit accepts up to two references. |
@@ -36,9 +36,12 @@ Model links below select a model when this guide is opened inside WanGP. When re
 | Songs with lyrics | [YuE2](modeltype:yue2), [MiniMax Music 3](modeltype:minimax_music3), [ACE-Step 1.5 XL](modeltype:ace_step_v1_5_xl) | YuE2 adds composition, cover and score workflows. MiniMax Music 3 generates songs from lyrics and a description. ACE-Step offers fast music generation with optional planning models. |
 | A song from a hummed melody | [YuE2 Hum-to-Song](modeltype:yue2_hum) | Supply a clear hum, your lyrics and a musical style. It follows the melody, not the humming voice's identity. |
 | Instrumentals, ambience and sound effects | [Stable Audio 3](modeltype:stable_audio3_small), [YuE2](modeltype:yue2) in instrumental mode | Stable Audio covers descriptive sound and music prompts; YuE2 supports structured instrumental composition. |
-| A textured 3D asset from one image | [TRELLIS.2](modeltype:trellis2), [Hunyuan3D 2.1](modeltype:hunyuan3d_21) | Both create meshes with PBR materials. Hunyuan3D can also texture a mesh you already have. |
+| Transcripts that say who spoke, subtitles or a translation | [Nemotron 3.5 Transcribe](modeltype:nemotron_transcribe), [Q4 Experts](modeltype:nemotron_transcribe_q4) | Turns a recording or a video's soundtrack into text with speaker labels, word timings and subtitles, in 40 languages. Q4 Experts needs about half the memory. |
+| A textured 3D asset from one image | [TRELLIS.2 Shape](modeltype:trellis2_shape), [Pixal3D](modeltype:pixal3d) or [Hunyuan3D 2.1 Shape](modeltype:hunyuan3d_21_shape), with a Texturer preset | The shape model makes the mesh; a **preset** adds a Texturer in the same generation. SUPRA-Tex keeps the picture's colours and print exactly on the visible side. |
+| PBR textures for a mesh you already have | [SUPRA-Tex Texture](modeltype:supratex_texture), [Pixal3D Texture](modeltype:pixal3d_texture), [Hunyuan3D 2.1 Paint](modeltype:hunyuan3d_21_paint), [TRELLIS.2 Texture](modeltype:trellis2_texture) | Give the mesh and a picture of the same object; the same texturers run on gallery meshes from the late **Post Processing** tab. Pixal3D Texture also accepts a four-view turnaround. |
 | An untextured mesh or separate object parts | [TripoSG](modeltype:triposg), [PartCrafter](modeltype:partcrafter) | TripoSG produces one detailed shape; PartCrafter generates separate part meshes from the same image. |
 | A 3D scene from photos or video | [WorldMirror 2.0](modeltype:worldmirror_2), [MapAnything](modeltype:mapanything), [Depth Anything 3 Points](modeltype:da3_points) | Use overlapping views of a static scene. Choose Gaussian splats for viewing or point clouds with camera information for further work. |
+| Add fine detail to a coarse mesh | [Hi3D](modeltype:hi3d) | Refines a Hunyuan3D, TripoSG or TRELLIS.2 shape into high-resolution geometry from the same picture; texture it afterwards with Hunyuan3D or SUPRA-Tex, or chain all three in post-processing. |
 | Split or animate an existing mesh | [GeoSAM2](modeltype:geosam2), [AnimateAnyMesh](modeltype:animate_any_mesh) | GeoSAM2 separates parts; AnimateAnyMesh creates a short animation from a motion description without a rig. |
 
 <a id="video-models"></a>
@@ -140,7 +143,7 @@ Other specialist entries remain in the selector. Use their own Help for required
 
 **[Qwen Image 2.1 7B](modeltype:qwen_image_21_7B)** combines image generation and editing. It accepts up to ten references and supports masked editing, LanPaint, outpainting, pose/depth/edge guidance and resolutions up to 4K. Enable **RGBA** and request a transparent background to save cutouts as PNG with an alpha channel.
 
-Its optional **KV Cache** trades extra GPU memory for faster denoising; its **INT8** choice gives the same speedup in about half that memory. **Viggle Turbo** and **Pruna** acceleration profiles apply the matching adapter, scheduler and step settings; these image accelerators are unrelated to the H3-based Viggle Animate video workflow. Prefer short text in Qwen 2.1 images and proofread it; use a design-oriented model for dense infographics.
+Its optional **KV Cache** (INT8) trades extra GPU memory for faster denoising. **Viggle Turbo** and **Pruna** acceleration profiles apply the matching adapter, scheduler and step settings; these image accelerators are unrelated to the H3-based Viggle Animate video workflow. Prefer short text in Qwen 2.1 images and proofread it; use a design-oriented model for dense infographics.
 
 The older 20B family remains useful:
 
@@ -149,6 +152,12 @@ The older 20B family remains useful:
 - **[Qwen Image Layered](modeltype:qwen_image_layered_20B)** for decomposing an image into editable RGBA layers.
 
 Selected 20B variants have Nunchaku checkpoints for supported hardware. Qwen 2.1 uses its own model and adapter formats: do not assume older Qwen Image LoRAs or VAEs are interchangeable.
+
+### H3
+
+**[MiniMax H3-Image 33B](modeltype:minimax_h3_image)** is MiniMax's image model on the H3 architecture. It generates a single image from text, or edits and combines up to 16 input images, in six steps without guidance. It works best around 16 megapixels and follows long, detailed descriptions much better than short requests: write them out or use the optional **Write** button, which produces the detailed captions and edit descriptions the model expects. **[H3-Image Pruned 20B](modeltype:minimax_h3_image_pruned)** is a smaller download that loads faster for nearly identical images. H3-Image shares the MiniMax H3 LoRA list: style, realism or character LoRAs made for the video models can carry over, often with a weaker or different effect, while LoRAs for video motion, control or fewer steps do not suit it.
+
+**[P-H3-Image](modeltype:minimax_p_h3_image)** is Pruna's image model derived from H3 FL2VA. It generates a single image from text, or edits an image with up to eight input images, in eight steps, or in two to four steps with its pDMD accelerator profiles. It works best at 8 megapixels and is strongest at photorealism, film and editorial looks and graphic styles with short quoted text. It also renders full, specific prompts much better than short requests. It shares the MiniMax H3 LoRA list.
 
 ### Ming Image
 
@@ -179,7 +188,7 @@ Choose LoRAs and reference workflows for the exact Flux architecture and variant
 
 ### Z-Image
 
-**[Z-Image Turbo](modeltype:z_image)** is a distilled 6B generator. **Base**, **Fun ControlNet**, **TwinFlow** and supported **Nunchaku** variants offer different control, sampling and memory choices. Use a ControlNet variant when you need its particular pose/depth/edge or editing workflow, rather than expecting those controls on every Z-Image entry.
+**[Z-Image Turbo](modeltype:z_image)** is a distilled 6B generator. **Base**, **Fun ControlNet**, **TwinFlow** and supported **Nunchaku** variants offer different control, sampling and memory choices. **[NitroFusion2](modeltype:z_image_nitrofusion2)** needs only 1 to 4 steps (2 by default): pick the step count with its Accelerator profiles, which also set the matching Shift Scale and De-distillation LoRA strengths. Use a ControlNet variant when you need its particular pose/depth/edge or editing workflow, rather than expecting those controls on every Z-Image entry.
 
 ### Ideogram 4
 
@@ -230,23 +239,31 @@ For supported three-voice modes in **H3 Audio, Qwen3 TTS Base, OmniVoice, KugelA
 
 FLAC import and 16-bit lossless export let you keep audio quality and embedded generation settings. WAV/MP3 and other offered output choices remain available.
 
+### Transcription
+
+**[Nemotron 3.5 Transcribe](modeltype:nemotron_transcribe)** turns an audio file or a video's soundtrack into text, offline, in 40 languages and for recordings of up to an hour. It labels who said what (up to eight speakers, which **Speaker Names** can name), times every word, writes subtitles, and translates to or from English. Add the names and jargon that the recording contains as **Context Terms** so that they are spelled correctly, and choose **Verbatim** to keep hesitations and fillers or **Readable** for cleaner text. The transcript appears under the player of the Audio gallery, as text or as a **Timeline** with one lane per speaker: clicking a line or a turn plays the recording from there, and the text can be copied or downloaded. It is also saved in a `.txt` file beside the audio, one line per turn with its time span and speaker, together with `.srt` subtitles. A video's soundtrack is read from the **Video to Transcribe** input that appears when **Video File (Its Soundtrack)** is chosen; its **Output** can then be **Video with Subtitles**: the video itself, unchanged, with the transcript or the translation as subtitles, shown in the Video gallery where the **CC** button switches them on and off. With **Timestamps and Subtitles**, which can also time every word (**Per Word**), a translation is timed too: each sentence is translated from its own stretch of audio, which takes longer than a single translation of the whole recording. Speaker numbers distinguish the voices of one recording; they do not identify people. The **[Q4 Experts](modeltype:nemotron_transcribe_q4)** variant needs about half the memory and suits computers with 32 GB of RAM, at a possible small loss of accuracy.
+
 <a id="3d-models"></a>
 
 ## 3D models
 
 WanGP supports creating objects from images, reconstructing scenes from photos or video, and working on existing meshes. Choose the output for your next step: a **mesh** has surfaces you can edit or texture; **Gaussian splats** render a scene from coloured 3D points and need a compatible viewer; a **point cloud** records sampled geometry and colour.
 
+The model selector starts with what you want to do: **Create** a 3D asset from an image, **Texture**, **Refine**, **Split** or **Animate** a mesh, or **Reconstruct** a scene from photos or video. The second list then offers the models for that goal.
+
 ### Create an object from one image
 
 | Model | Output and when to use it |
 | --- | --- |
-| **[TRELLIS.2](modeltype:trellis2)** | A GLB mesh with PBR textures, including base colour, metallic and roughness. Start with **1024 Cascade** for a balance of shape and detail; 512 is faster, while 1536 Cascade needs more time and memory. Vertex-colour and shape-only outputs are also available. |
-| **[Hunyuan3D 2.1](modeltype:hunyuan3d_21)** | Generate **Shape + PBR Texture**, generate **Shape Only**, or **Texture a Mesh** to paint a supplied mesh from the reference image. The separate [Shape model](modeltype:hunyuan3d_21_shape) produces geometry only. Texturing replaces the mesh's existing UVs and materials. |
+| **[TRELLIS.2 Shape](modeltype:trellis2_shape)** | An untextured GLB mesh that keeps thin and intricate structures. Start with **1024 Cascade** for a balance of shape and detail; 512 is faster, while 1536 Cascade needs more time and memory. Its presets add a Texturer in the same generation: *SUPRA-Tex PBR*, *Hunyuan3D 2.1 Paint PBR* or *TRELLIS.2 Texture PBR* (the former textured TRELLIS.2 model: the fastest, with approximate colours). |
+| **[Hunyuan3D 2.1 Shape](modeltype:hunyuan3d_21_shape)** | An untextured GLB mesh. Its preset **Hunyuan3D 2.1 Paint PBR** adds Hunyuan3D's PBR textures in the same generation (the former textured Hunyuan3D 2.1 model); [Hunyuan3D 2.1 Paint](modeltype:hunyuan3d_21_paint) paints a mesh you supply. Texturing replaces the mesh's existing UVs and materials. |
 | **[TripoSG](modeltype:triposg)** | A detailed, untextured GLB mesh. Useful when you want to edit the shape or texture it separately. Higher mesh resolution preserves finer detail but increases extraction time and face count. |
 | **[PartCrafter](modeltype:partcrafter)** | A GLB containing separate, untextured part meshes generated together. Choose the number of parts to suit the object. Parts can be moved or edited individually, but their order and colours are arbitrary and small parts may overlap or be missing. |
+| **[Pixal3D](modeltype:pixal3d)** + SUPRA-Tex | [Pixal3D](modeltype:pixal3d) builds the mesh in the picture's own camera, so it fits the image exactly; its preset **SUPRA-Tex PBR** adds PBR textures that keep the picture's colours, print and patterns on the side the picture shows, the hidden side completed to match (the former SUPRA-Tex model). [SUPRA-Tex Texture](modeltype:supratex_texture) textures a mesh you supply. SUPRA-Tex reuses Qwen Image 2.1 to read the picture's materials, which is for **non-commercial use only** (Qwen Research License). |
 | **[TripoSplat](modeltype:triposplat)** | A Gaussian-splat PLY for viewing objects with fine, fuzzy or thin details. It produces splats rather than an editable mesh, so choose another model for mesh texturing or rigging. |
+| **[Idol](modeltype:triposplat_idol)** | A TripoSplat variant that turns one render or photograph into a Gaussian-splat PLY. Choose the photograph crop for real objects and up to one million Gaussians for finer detail. |
 
-Use one whole, uncropped object on a plain or transparent background, preferably in a three-quarter view with even lighting. Hidden sides are inferred and may differ from the real object. For these models, **Asset Name / Description** names the output; the reference image determines its appearance. To start from text, generate an image first, then use it as the 3D reference.
+Use one whole, uncropped object on a plain or transparent background, preferably in a three-quarter view with even lighting. The background of a picture without transparency is removed automatically, cast shadows included (the 3D models use BiRefNet, a one-time download of about 1 GB). Hidden sides are inferred and may differ from the real object. For these models, **Asset Name / Description** names the output; the reference image determines its appearance. To start from text, generate an image first, then use it as the 3D reference.
 
 ### Reconstruct a scene from photos or video
 
@@ -259,23 +276,42 @@ Use one whole, uncropped object on a plain or transparent background, preferably
 
 Sharp, overlapping views with a moving camera and a static scene work best. Moving subjects, reflections and textureless surfaces are harder to reconstruct. More views and higher working resolution increase memory use and processing time. The text field names the scene; it does not alter the reconstruction.
 
-### Split and animate existing meshes
+### Refine, split and animate existing meshes
+
+- **[Hi3D](modeltype:hi3d)** refines a coarse mesh into high-resolution geometry from a picture of the same object: seams, buttons, scales and engravings that image-to-3D models only suggest. Use the **To Input Mesh** button of a Hunyuan3D Shape, TripoSG or TRELLIS.2 result together with its picture. **1024** gives a strong improvement in a few minutes on a fast GPU; **512** is quicker and **1536** adds the finest relief for about twice the time of 1024. The result keeps the input's position and scale but has no textures: texture it afterwards with [SUPRA-Tex Texture](modeltype:supratex_texture), [Pixal3D Texture](modeltype:pixal3d_texture), [Hunyuan3D 2.1 Paint](modeltype:hunyuan3d_21_paint) or [TRELLIS.2 Texture](modeltype:trellis2_texture), or select a Texturer in Hi3D's own Post Processing tab, keeping enough faces that the detail survives. Hi3D keeps the overall shape, so fix missing or merged parts in the coarse mesh first. Its detail goes to solid parts: thin sheets such as leaves, fabric or paper are finer than its grid, so where it would perforate or lose them it keeps the coarse mesh's surface there, without added relief.
+
+**Pixal3D Multi-View Shape** builds a mesh from four equally framed eye-level images, spaced 90 degrees apart. Upload the front, right (camera on +X), back and left views in order, or upload one horizontal sheet of four square panels. Keep the object centred at the same scale. The **Pixal3D Native PBR** preset uses those same four views to colour the mesh, including visible markings on its back.
+
+**Pixal3D Native Texture** paints base colour, roughness and metallic maps on a supplied mesh. Use a single matching image, four ordered views or a turnaround sheet. It bakes the result into a new UV atlas. It is also available as **Pixal3D Texture** in Post Processing and Late Post Processing. Supply a matching front or three-quarter image for an imported mesh so the texturer can align the two.
+
+#### 3D post-processing: refine and texture in one go
+
+The **Post Processing** tab of untextured mesh models (Hunyuan3D Shape, TripoSG, TRELLIS.2 Shape, Pixal3D, Hi3D) offers two 3D steps, run on each generated mesh with the generation's object image. Their **presets** choose ready-made combinations, for example *SUPRA-Tex PBR* or *Hi3D + SUPRA-Tex PBR*:
+
+- **3D Refiner** (Hi3D): adds fine geometric detail first.
+- **Texturer**: then paints PBR textures. Choose a method for the available references:
+  - **SUPRA-Tex** keeps the picture's colours, print and patterns on the visible side and completes the hidden side to match. The picture must line up with the mesh: the front or a three-quarter view, at most moderately from above (a steep top-down photo misplaces the colours). Its material stage is for non-commercial use only.
+  - **Pixal3D Texture** uses one image or all four views of a turnaround to generate pixel-aligned materials.
+  - **Hunyuan3D 2.1 Paint** paints all around from generated views: colours follow the picture, fine print comes out blurred. The safe choice when the picture and the mesh differ.
+  - **TRELLIS.2 Texture** is several times faster than the others: plausible materials whose colours only approximate the picture and change with the seed, without its print or patterns.
+
+Combining them gives a shape, its fine relief and its textures in one generation. A model that already textures its meshes cannot take a Texturer, and a textured mesh cannot be refined (refining replaces the geometry and drops its textures). In late post-processing, select a mesh in the gallery and add its **Object Image**: one field, used by both steps. With **Embed Source Images** enabled in Configuration, new 3D assets keep their object image inside the GLB (about the size of the picture): late post-processing uses it when you add none, and loading the asset's settings restores it. SUPRA-Tex places the mesh from the picture's silhouette, so the picture must show the same object; regions the picture does not show are completed and can come out plainer than the visible side.
 
 - **[GeoSAM2](modeltype:geosam2)** splits an input mesh into separate parts within one GLB. Use automatic segmentation or optional point prompts to guide it. Existing textures are retained; small or hidden parts can be merged.
 - **[AnimateAnyMesh](modeltype:animate_any_mesh)** animates an input mesh from an English motion description, such as `The dragon flaps its wings and flies`. It needs no skeleton or rig and retains the mesh's textures. Motion is limited to 16 generated frames, with an optional forward-and-backward loop. It deforms the existing shape, so it cannot split a closed mesh into new pieces. Start with an upright mesh and try a few seeds.
 
 ### Reuse 3D assets
 
-Open results in the **3D gallery** to rotate, zoom and inspect them. Save a view at your chosen resolution, then use that image as a reference or the start of a video. Compatible mesh results can also become inputs for texturing, segmentation or animation. [Deepy](DEEPY.md) can inspect 3D assets from different angles and help turn a character into a turnaround sheet.
+Open results in the **3D gallery** to rotate, zoom and inspect them. Gaussian splats can also be walked through: W A S D to move, R and F to rise and sink, the arrows or a drag to look, Shift to go faster and the wheel to change the speed. On a touch screen, drag to look, pinch to go forward or back and slide two fingers to step aside or rise. Scenes reconstructed from photos or video open this way, at their first camera; other splats open for turning around, and the **Walk** button switches between the two. Splats made elsewhere can arrive tilted: while walking, Q and E turn the scene around your line of sight to level it, and your browser remembers the result. Save a view at your chosen resolution, then use that image as a reference or the start of a video. Compatible mesh results can also become inputs for texturing, refinement, segmentation or animation: select one in the 3D gallery and press **To Input Mesh**, shown for models that take a mesh (those under Texture, Refine, Split and Animate). [Deepy](DEEPY.md) can inspect 3D assets from different angles and help turn a character into a turnaround sheet.
 
 ## Upscaling and finishing
 
 Generation models and finishing tools are separate choices. Select a processor in **Post Processing**, use **Late Post Processing** on a gallery result, or use **Media Flow** for supported batch workflows.
 
-- **Spatial upscaling and detail**: SeedVR2, FlashVSR and LTX-based upscaling offer different appearance and memory trade-offs. LTX 2.5 Detail Refiner can restore texture in soft or compressed video. Lanczos provides conventional resizing; latent/VAE upsamplers apply only to compatible generation workflows.
+- **Spatial upscaling and detail**: SeedVR2, FlashVSR, RelayVSR and LTX-based upscaling offer different appearance, speed and memory trade-offs; RelayVSR is the fast choice for x2 and x4 upscaling (its X2 model serves ratios up to x2). LTX 2.5 Detail Refiner can restore texture in soft or compressed video. Lanczos provides conventional resizing; latent/VAE upsamplers apply only to compatible generation workflows.
 - **Smoother motion**: RIFE supports x2/x3/x4 interpolation. Optional DLSS Frame Generation offers hardware-dependent multipliers on compatible RTX GPUs.
 - **Neural refinement**: optional DLSS 5 can refine lighting, material appearance and detail at native or enlarged resolution, on supported hardware. See the [DLSS 5 guide](DLSS5.md) for setup and limits.
-- **Faces**: H3 Face Refiner can refine up to five detected, tracked faces in a video.
+- **Faces**: H3 Face Refiner and TaoMate-FVSR Face Refiner refine up to five detected, tracked faces in a video, both using the soundtrack; TaoMate-FVSR pushes the mouth toward it much harder. See [Processing](PROCESSING.md#face-refinement).
 - **Audio**: remove vocals, replace voices with SeedVC, add a soundtrack with MMAudio or PrismAudio, or remux existing tracks. Deepy Prime can also mix audio and package selectable audio/subtitle tracks.
 
 See [Processing](PROCESSING.md) for input preparation, masks, control media and finishing workflows.
@@ -293,18 +329,27 @@ For a new workflow:
 5. Use sliding windows for supported long-video workflows, and tiling where the model exposes it. Look for seams or continuity changes when tuning these options.
 6. Add compatible LoRAs, controls and upsampling one feature at a time so their effects are easy to compare.
 
+### VAE Tiling
+
+The last step of a generation turns the result into pixels with the model's VAE; large pictures and frames can need several GB of VRAM there. **VAE Tiling** (Configuration > RAM/VRAM Management) sets the VRAM this step may use, the VAE itself included:
+
+- **Auto** (default): all the VRAM that other programs leave free when the generation starts. The fastest choice, but not a predictable one: with a browser or a game open, the same job can be cut into smaller tiles than the day before.
+- **Up to 3/4**, **1/2** or **1/3 of the VRAM**: a fixed share of your GPU, whatever else is running. The same job is always cut the same way. Choose a smaller share when other programs need VRAM, or if you see out of memory errors while decoding.
+
+WanGP estimates what each tile size needs at your resolution and picks the largest that fits. When the whole picture or frame fits, it is not tiled at all, which is both the fastest and free of any tile blending. Smaller tiles take longer, and very small ones can show slight differences where tiles meet. A few models still use fixed tile sizes. MiniMax H3 always works in 256-pixel tiles, the only size its video VAE handles; for it the setting decides how many tiles are decoded together: more at once is a little faster and needs more VRAM.
+
 INT8, FP8, GGUF, NVFP4, NF4 and Nunchaku are checkpoint/quantization choices, not separate creative model families. Availability, memory savings, speed and output can vary with the model, GPU and installed kernels. Follow the [installation guide](INSTALLATION.md) or [AMD guide](AMD-INSTALLATION.md) for hardware-specific setup.
 
 ## Model switching and custom models
 
-WanGP downloads models on demand. Optional preprocessing and postprocessing files also download only when a workflow needs them. Switching models does not require a restart; the previous model is unloaded as needed to recover memory.
+WanGP downloads models on demand. Optional preprocessing and postprocessing files also download only when a workflow needs them. Switching models does not require a restart; the previous model is unloaded as needed to recover memory. A model normally leaves the VRAM after each generation. A few models that run as a single piece for their whole generation (Nemotron 3.5 Transcribe, HiDream O1, SenseNova U1, KugelAudio, the 3D reconstruction models and GeoSAM2) stay loaded instead when the next sample or the next queued task uses the same model, so a batch of short jobs does not reload them each time. With the *MMGP Optimized VRAM Allocator* (the default), other models and programs still get that VRAM back as soon as they need it; with PyTorch's allocator, these models are unloaded after each generation as usual.
 
 Use the model selector or toolbar search, save reusable settings, and organize media in [Workspaces](WORKSPACES.md). The refreshed browser interface lets you check progress, inspect galleries and add generation jobs from another device connected to the same running WanGP server. The queue and galleries stay synchronized; each Gradio page keeps its own unsent prompts and draft settings. See [Authentication and network access](AUTHENTICATION.md) for remote setup.
 
 [Deepy](DEEPY.md) can help select models and connect generation/editing steps. Its language-model engine is a separate choice from the image, video, audio or 3D model doing the generation; the phone-friendly Deepy Web App controls that same local workspace.
 
-User-provided checkpoints belong in `finetunes/`, while model plugins can add other families. Refresh the model list after adding definitions. See [Finetunes](FINETUNES.md), [LoRAs](LORAS.md) and [Plugins](PLUGINS.md) for compatibility and setup.
+User-provided checkpoints belong in `finetunes/`, while model Plugins can add other families. Refresh the model list after adding definitions. See [Finetunes](FINETUNES.md), [LoRAs](LORAS.md) and [Plugins](PLUGINS.md) for compatibility and setup.
 
 ---
 
-> Applies to: Choosing WanGP video, image, speech, music, sound and 3D models; model-family and variant relationships; compatible references and workflows; image-to-3D generation, scene reconstruction, mesh segmentation and animation; upscaling and finishing choices; hardware-dependent memory and acceleration trade-offs. The model selector and model Help provide the current available variants and settings.
+> Applies to: Choosing WanGP video, image, speech, music, sound, transcription and 3D models; model-family and variant relationships; compatible references and workflows; image-to-3D generation, scene reconstruction, mesh segmentation and animation; upscaling and finishing choices; hardware-dependent memory and acceleration trade-offs. The model selector and model Help provide the current available variants and settings.

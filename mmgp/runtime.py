@@ -1,7 +1,7 @@
 # Copyright (c) 2026 DeepBeepMeep - part of WanGP, WanGP Community License 2.0 (see LICENSE.txt)
 """Model-facing execution services, independent of MMGP's offload/compilation hooks."""
 import weakref
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 
 import torch
@@ -156,23 +156,34 @@ def ensure_loaded(module):
         manager.ensure_model_loaded(model_id)
 
 
-def state_ring(blocks, name="state", resident=False):
+def state_ring(blocks, name="state", resident=False, minimal=False):
     """A state ring (mmgp.state_ring.StateRing) for tensors a model computes once per block and reads at every pass (a cached attention
-    prefix), blocks: the model's blocks (a ModuleList, called one by one). Kept in RAM and streamed block by block on the transfer stream of
+    prefix), blocks: the model's blocks (a ModuleList, called one by one), or a list of some of them in their order of use (blocks of one
+    kind whose state has its own layout; the ring of each kind then fetches the next block of its kind). Kept in RAM and streamed block by block on the transfer stream of
     the model's offload object, with the weights, following MMGP's schedule for these blocks (its prefetch window; records locked for the
     blocks whose weights are pinned, then, for a model MMGP pins, for those kept in VRAM, as far as the reserved RAM allows; the others moved
     ahead through MMGP's staging ring with their blocks): each block's forward fetches its state. The model calls store(block, tensors) once per block, and release() at the end.
     resident: blocks whose weights MMGP keeps in VRAM may keep their state there too, in the room their preload leaves (see mmgp.state_ring;
-    the model then reads the lists store() returns at each pass)."""
+    the model then reads the lists store() returns at each pass). resident="dynamic" (where dynamic_state(blocks)): a cache the model
+    computes on the GPU stays in VRAM first, the model's dynamic preload planning it with its weights, and goes to RAM only for the blocks
+    that do not stay there. minimal: the least VRAM, the state of the block running only (one slot, released after each block, no
+    prefetch)."""
     from .state_ring import StateRing
-    owner = _owner(blocks)
+    owner = _owner(blocks if isinstance(blocks, torch.nn.Module) else blocks[0])
     if owner is None:
-        return StateRing(len(blocks), torch.device("cuda", torch.cuda.current_device()), None, name, modules=blocks)
+        return StateRing(len(blocks), torch.device("cuda", torch.cuda.current_device()), None, name, modules=blocks, minimal=minimal)
     manager, model_id = owner
-    prefix = next(name for name, module in manager.models[model_id].named_modules() if module is blocks) + "."
-    entries = [f"{model_id}/{prefix}{index}" for index in range(len(blocks))]  # the blocks' entries: the ring follows their schedule
+    names = {module: name for name, module in manager.models[model_id].named_modules()}
+    entries = [f"{model_id}/{names[block]}" for block in blocks]  # the blocks' entries: the ring follows their schedule
     return StateRing(len(blocks), torch.device("cuda", torch.cuda.current_device()), manager, name, modules=blocks, model_id=model_id, entries=entries,
-                     resident=resident)
+                     resident=resident, minimal=minimal)
+
+
+def dynamic_state(module):
+    """Whether a state ring of these blocks (a module, or a list of blocks) can place its state dynamically (state_ring(blocks,
+    resident="dynamic")): their model is managed by MMGP with its VRAM allocator, which reports the VRAM shortages."""
+    from . import allocator
+    return _owner(module if isinstance(module, torch.nn.Module) else module[0]) is not None and allocator.active == "vmm"
 
 
 def weights_resident(module):
@@ -200,6 +211,87 @@ def weights_resident(module):
 
 _block_names = weakref.WeakKeyDictionary()  # an offload manager -> (model id, id of a module of the model) -> the names of its blocks
 _tower_entries = weakref.WeakKeyDictionary()  # a tower (ModuleList) -> (model id, the entry name of each of its blocks)
+JOINT_PASS_COMPUTE_SHARE = 0.5  # of one prediction's compute estimated at the probed BF16 rate: the transfers above which a joint pass saves time (INT8 GEMMs run about twice as fast)
+_compute_rates = {}  # device name -> multiply-adds per second of a large BF16 GEMM (probed once)
+_tower_params = weakref.WeakKeyDictionary()  # an offload manager -> model id -> (blocks of its towers, their parameters)
+_joint_notices = set()
+
+
+def _compute_rate(device):
+    """Multiply-adds per second of a large BF16 GEMM on this device, probed once (a few milliseconds) and kept under ~/.triton/autotune."""
+    import json
+    from pathlib import Path
+    name = torch.cuda.get_device_name(device)
+    rate = _compute_rates.get(name)
+    if rate is not None:
+        return rate
+    path = Path.home() / ".triton" / "autotune" / "mmgp_compute_rate.json"
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        saved = {}
+    rate = saved.get(name)
+    if rate is None:
+        a = torch.randn(4096, 4096, device=device, dtype=torch.bfloat16)
+        best = float("inf")
+        for _ in range(4):
+            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(4):
+                torch.mm(a, a)
+            end.record()
+            end.synchronize()
+            best = min(best, start.elapsed_time(end) / 4)
+        del a
+        rate = saved[name] = 4096 ** 3 / (best / 1000)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(saved, indent=1), encoding="utf-8")
+        except OSError:
+            pass
+    _compute_rates[name] = rate
+    return rate
+
+
+def joint_pass_useful(module, tokens, features, predictions=2):
+    """Whether computing the predictions of a step together, in one pass over the blocks of a managed model (WanGP's Boost: each
+    block loaded once for all of them, their activations held together, a few GB at a hundred thousand tokens), still saves time with
+    the model's current residency. It saves the transfers of the blocks streamed at each pass (not preloaded, not kept by its
+    automatic preload), but only where they are not hidden behind the compute of one prediction (MMGP transfers the next block while
+    one runs): a pass of many tokens is bound by its compute, and a model kept in VRAM transfers nothing. tokens: the tokens of one
+    prediction; features: the model's width (self-attention's share of the compute: 2 x tokens^2 x features multiply-adds per block).
+    The transfer rate is MMGP's measured host-to-GPU rate, the compute that of the blocks' linears (tokens x their parameters) and
+    attention at a probed BF16 rate; the joint pass is kept while the transfers exceed JOINT_PASS_COMPUTE_SHARE of that compute.
+    Unmanaged modules, or a single prediction: False."""
+    owner = _owner(module)
+    if owner is None or predictions < 2:
+        return False
+    manager, model_id = owner
+    from .offload import _pcie_rate
+    per_model = _tower_params.setdefault(manager, {})
+    towers = per_model.get(model_id)
+    if towers is None:  # the blocks MMGP streams (entries model_id/name) and their parameters, tied ones and buffers once
+        names = [name[len(model_id) + 1:] for name, size in manager.blocks_of_modules_sizes.items() if size and name.startswith(model_id + "/")]
+        params = sum(p.numel() for name in names for _, _, p, is_buffer, tied in manager.blocks_of_modules[model_id + "/" + name] if not is_buffer and tied is None)
+        towers = per_model[model_id] = (names, params)
+    names, params = towers
+    preloaded, plan = manager.preloaded_blocks_per_model[model_id], None if manager.auto_preload is None else manager.auto_preload.plans.get(model_id)
+    streamed = sum(manager.blocks_of_modules_sizes[model_id + "/" + name] for name in names
+                   if name not in preloaded and not (plan is not None and manager.auto_preload.own_buffer(model_id, name)))
+    if streamed == 0:
+        useful = False
+    else:
+        device = torch.device("cuda", torch.cuda.current_device())
+        compute_s = (tokens * params + 2 * tokens * tokens * features * len(names)) / _compute_rate(device)  # multiply-adds
+        transfer_s = streamed / _pcie_rate()
+        useful = transfer_s > JOINT_PASS_COMPUTE_SHARE * compute_s
+    key = (model_id, tokens, predictions, useful)
+    if not useful and key not in _joint_notices:
+        _joint_notices.add(key)
+        from tqdm import tqdm
+        tqdm.write(f"[mmgp] Boost off for '{model_id}' ({tokens} tokens, {predictions} predictions): "
+                   + ("its blocks stay in VRAM, nothing to save." if streamed == 0 else "its transfers hide behind the compute; the predictions run one after the other, with less VRAM."))
+    return useful
 
 
 def resident_runs(module, blocks):
@@ -246,6 +338,49 @@ def place_experts(module):
     return residency is None or residency.place()
 
 
+def adapt_experts(module):
+    """To be called at each decoding pass of a model replayed by graphs, outside their recording: lets its GPU expert copies follow the routing (Residency.adapt)."""
+    owner = _owner(module)
+    if owner is not None:
+        residency = owner[0].expert_residency.get(owner[1])
+        if residency is not None:
+            residency.adapt()
+
+
+def plan_experts(module):
+    """To be called while the host waits for a decoding pass: the numbers of a round of its GPU expert copies (Residency.plan_round), which the GPU then does not wait for."""
+    owner = _owner(module)
+    if owner is not None:
+        residency = owner[0].expert_residency.get(owner[1])
+        if residency is not None and residency.elastic:
+            residency.plan_round()
+
+
+def free_vram():
+    """VRAM free now on the current GPU, in bytes: what an allocation can still take without pressure on anyone."""
+    from . import allocator
+    if allocator.active == "vmm":
+        state = allocator.stats()
+        return allocator.room() + state["reserved"] - state["allocated"]
+    return torch.cuda.mem_get_info()[0]
+
+
+def lendable_experts(module):
+    """VRAM of the GPU expert copies that a prompt pass may take over for its duration, in bytes: those of a placement that follows the routing, which gives them back in place while decoding."""
+    owner = _owner(module)
+    residency = None if owner is None else owner[0].expert_residency.get(owner[1])
+    return residency.nbytes if residency is not None and residency.elastic else 0
+
+
+def stream_experts(module, banks, tokens, nbytes=0):
+    from . import expert_stream
+    """A context for a pass of tokens over banks of experts (in their order of use) of a managed model: those out of VRAM stream ahead of their use through a ring instead of being uploaded by each bank (mmgp.expert_stream). nbytes: the VRAM the pass will allocate
+    beside its ring, which a placement following the routing lends if it is not free. A plain context for models without a residency."""
+    owner = _owner(module)
+    residency = None if owner is None else owner[0].expert_residency.get(owner[1])
+    return nullcontext() if residency is None or not expert_stream.ENABLED else residency.streaming(banks, tokens, nbytes)
+
+
 def dynamic_preload(module):
     """Whether an automatic VRAM preload manages this model's blocks: it keeps as many as fit and releases some when another allocation
     needs VRAM (a co-tenant loaded beside it then takes only what it needs), keeping them again later as they run."""
@@ -272,3 +407,67 @@ def requires_layer_offload(module):
     if manager.auto_preload is not None and model_id in manager.auto_preload.plans:
         return True
     return any(name.startswith(model_id + "/") and size for name, size in manager.blocks_of_modules_sizes.items())
+
+
+DISPOSABLE_PRIORITY = 2  # in the VRAM pressure order (mmgp.memory_pressure): after expert copies and ring state (0) and preloaded blocks (1)
+
+
+class Disposable:
+    """VRAM held by a managed model's own code beside its weights (a cache, a workspace) that it can do without and rebuild: see
+    disposable()."""
+
+    def __init__(self, manager, model_id, name, release):
+        self.manager, self.model_id, self.name, self._release = manager, model_id, name, release
+        self.released, self.idle_thread, self.idle_depth = False, None, 0
+        if manager is not None:
+            from . import memory_pressure
+            memory_pressure.register(self, DISPOSABLE_PRIORITY)
+
+    def close(self):
+        """The asset is gone (freed by its owner): no more release."""
+        self.released = True
+        if self.manager is not None:
+            from . import memory_pressure
+            memory_pressure.unregister(self)
+
+    @contextmanager
+    def idle(self):
+        """Its owner does not use it meanwhile (code on this thread that runs other models): MMGP may release it if VRAM runs short."""
+        import threading
+        self.idle_thread, self.idle_depth = threading.get_ident(), self.idle_depth + 1
+        try:
+            yield
+        finally:
+            self.idle_depth -= 1
+
+    def on_pressure(self, need, parked=False):
+        """mmgp.memory_pressure: released when VRAM runs short, while its model's offload object is parked (any thread) or while its owner
+        declared it idle (its thread), never during a CUDA graph capture. Returns the bytes the allocator got back."""
+        import threading
+        from . import allocator
+        if need <= 0 or self.released or torch.cuda.is_current_stream_capturing() or not (parked or self.idle_depth and threading.get_ident() == self.idle_thread):
+            return 0
+        before = allocator.stats()["allocated"]
+        self.close()
+        try:
+            self._release()
+        except Exception as exc:  # the owner's code, inside an allocation: the allocation goes on with what was freed
+            from tqdm import tqdm
+            tqdm.write(f"VRAM short: the release of {self.name} failed: {exc}")
+        freed = max(0, before - allocator.stats()["allocated"])
+        if freed:
+            from tqdm import tqdm
+            tqdm.write(f"VRAM short, {freed / 2**20:0.0f} MB of {self.name} released")
+        return freed
+
+
+def disposable(module, name, release):
+    """Declare VRAM that the code of a managed model holds beside its weights and can do without (e.g. the KV cache of a language model, a
+    workspace): MMGP releases it, calling release(), only when an allocation finds the VRAM short (the automatic preloads of other models do
+    not plan with it), in its pressure order: after the expert copies, the state kept in VRAM and the preloaded blocks, and only while it is
+    not in use, i.e. while the model's offload object is parked (offload.park) or inside the returned Disposable's idle() scope on the
+    owner's thread. release() frees the asset (it may copy it to RAM; it must not allocate VRAM) and runs at most once: the owner checks
+    `released` before its next use and rebuilds it (declaring it again). close() when the owner frees it itself. Unmanaged modules get a
+    Disposable that is never released."""
+    owner = _owner(module)
+    return Disposable(None, None, name, release) if owner is None else Disposable(owner[0], owner[1], name, release)

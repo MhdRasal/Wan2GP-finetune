@@ -130,9 +130,8 @@ class Attention(nn.Module):
     def forward(self, h_list: list, freqs_cis: torch.Tensor, NAG= None) -> torch.Tensor:
         """Compute self-attention with RoPE. h_list is cleared to free memory early."""
         if NAG is None:
-            out = attention_kit.qkv_attention(h_list, self.to_q, self.to_k, self.to_v, self.n_heads, self.head_dim,
-                                              lambda query, key, group: self._norm_rope_(query, key, freqs_cis))
-            return self.to_out(out.flatten(2, 3))
+            return attention_kit.qkv_attention(h_list, self.to_q, self.to_k, self.to_v, self.n_heads, self.head_dim,
+                                               lambda query, key, group: self._norm_rope_(query, key, freqs_cis), out_proj=self.to_out[0])
         h = h_list.pop()
         query = self.to_q(h)
         key = self.to_k(h)
@@ -537,6 +536,8 @@ class ZImageTransformer2DModel(nn.Module):
             ]
         )
         self.t_embedder = TimestepEmbedder(min(dim, ADALN_EMBED_DIM), mid_size=1024)
+        # It holds no weights itself: its lock keeps MMGP from rounding `t * t_scale` (computed in FP32 below) to BF16 before the FP32 sinusoid
+        self.t_embedder._lock_dtype = torch.float32
         self.cap_embedder = nn.Sequential(
             RMSNorm(cap_feat_dim, eps=norm_eps),
             nn.Linear(cap_feat_dim, dim, bias=True),

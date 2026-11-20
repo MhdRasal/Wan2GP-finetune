@@ -8,7 +8,8 @@ from typing import Any, Callable
 
 from shared.utils.audio_metadata import save_audio_metadata
 from shared.utils.audio_video import save_image_metadata
-from shared.utils.gallery_sources import AUDIO, MESH, VIDEO, WORLD, source_for_path
+from shared.utils.gallery_sources import APP, AUDIO, MESH, WORLD, source_for_path
+from shared.utils.side_files import remove_side_files
 from shared.utils.video_metadata import save_video_metadata
 from shared.utils.workspace_storage import recording_gallery
 
@@ -27,13 +28,15 @@ def _ensure_creation_metadata(configs: Any) -> Any:
     return saved_configs
 
 
-def record_file_metadata(video_path: str | list[str], configs: Any, is_image: bool, audio_only: bool, gen: dict[str, Any], *, get_processed_queue: Callable[[dict[str, Any]], dict[str, tuple[list[Any], list[Any]]]], metadata_choice: str = "metadata", embedded_images: Any = None, replace_last_file: bool = False, lock: Any = None, verbose_level: int = 0, write_metadata: bool = True, output_role: str = "final") -> None:
+def record_file_metadata(video_path: str | list[str], configs: Any, is_image: bool, audio_only: bool, gen: dict[str, Any], *, get_processed_queue: Callable[[dict[str, Any]], dict[str, tuple[list[Any], list[Any]]]], metadata_choice: str = "metadata", embedded_images: Any = None, replaced_file: str | None = None, lock: Any = None, verbose_level: int = 0, write_metadata: bool = True, output_role: str = "final") -> None:
+    """replaced_file: a file of this generation that the new one stands for from now on (the previous sliding window, when only the
+    last one is kept). The new file takes its place in the gallery, then it is deleted with its companions: always that file, and
+    only once the new one is written and listed."""
     galleries = get_processed_queue(gen)
     paths = [video_path] if not isinstance(video_path, list) else video_path
     queue_lock = lock if lock is not None else nullcontext()
     for no, path in enumerate(paths):
         source = AUDIO if audio_only else source_for_path(path)
-        previous_path = None
         saved_configs = _ensure_creation_metadata(configs)
         if configs is not None and write_metadata:
             saved_configs["output_role"] = output_role
@@ -46,9 +49,12 @@ def record_file_metadata(video_path: str | list[str], configs: Any, is_image: bo
                 elif source is WORLD:
                     from shared.utils.world_outputs import save_world_metadata
                     save_world_metadata(path, saved_configs)
+                elif source is APP:
+                    from shared.utils.app_outputs import save_app_metadata
+                    save_app_metadata(path, saved_configs)
                 elif source is MESH:
                     from shared.utils.mesh_outputs import save_mesh_metadata
-                    save_mesh_metadata(path, saved_configs)
+                    save_mesh_metadata(path, saved_configs, embedded_images)
                 elif is_image:
                     save_image_metadata(path, saved_configs)
                 else:
@@ -61,24 +67,26 @@ def record_file_metadata(video_path: str | list[str], configs: Any, is_image: bo
                 print(f"3D asset {action} Path: {path}")
             elif source is WORLD:
                 print(f"World {action} Path: {path}")
+            elif source is APP:
+                print(f"App {action} Path: {path}")
             elif is_image:
                 print(f"Image file {action} Path: {path}")
             else:
                 print(f"Video file {action} Path: {path}")
         with queue_lock:
             file_list, file_settings_list = galleries[source.id]
-            if replace_last_file and source is VIDEO and not is_image and no == 0 and len(file_list) > 0:
-                previous_path = file_list[-1]
-                file_list[-1] = path
-                file_settings_list[-1] = saved_configs
+            if no == 0 and replaced_file in file_list:
+                index = file_list.index(replaced_file)
+                file_list[index], file_settings_list[index] = path, saved_configs
             else:
                 file_list.append(path)
                 file_settings_list.append(saved_configs)
             recording_gallery(gen)["last_gallery_source"] = source.id
-        if previous_path is not None and previous_path != path:
+        if no == 0 and replaced_file is not None and replaced_file != path:
+            remove_side_files(replaced_file)
             if metadata_choice in ("json", "json_metadata"):
-                previous_json_path = os.path.splitext(previous_path)[0] + ".json"
+                previous_json_path = os.path.splitext(replaced_file)[0] + ".json"
                 if os.path.isfile(previous_json_path):
                     os.remove(previous_json_path)
-            if os.path.isfile(previous_path):
-                os.remove(previous_path)
+            if os.path.isfile(replaced_file):
+                os.remove(replaced_file)

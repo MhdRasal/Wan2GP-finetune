@@ -9,14 +9,14 @@ Use Deepy when you want to work toward an outcome instead of manually operating 
 ## Choose Deepy Zero or Deepy Prime
 
 - **Deepy Zero** is fast and lightweight. Use it for focused tasks such as generating one asset, editing selected media, extracting a clip, resizing a file, or producing a transcript. It works well with the smaller supported Qwen models.
-- **Deepy Prime** is for projects that need planning or several connected actions. Use it when Deepy must compare compatible models, combine multiple media assets, inspect intermediate results, manage project files, or work with external MCP services. Prime requires a local Qwen3.8 VL model (9B or 27B) or a configured remote LLM.
+- **Deepy Prime** is for projects that need planning or several connected actions. Use it when Deepy must compare compatible models, combine multiple media assets, inspect intermediate results, manage project files, or work with external MCP services. Prime requires a local Qwen3.8 VL model or a configured remote LLM.
 
-Both versions share generation features, galleries, media references, and saved sessions. Both offer a dedicated video-with-references template. Choose the assistant in **Configuration > Prompt Enhancer / Deepy**.
+Both versions share generation features, galleries, media references, and saved sessions. Both offer a dedicated video-with-references template. Choose the assistant in **Configuration > Deepy / Prompt Enhancer**.
 
 ## Enable Deepy
 
 1. Start WanGP with `python wgp.py`.
-2. Open **Configuration > Prompt Enhancer / Deepy**.
+2. Open **Configuration > Deepy / Prompt Enhancer**.
 3. Choose **Deepy Zero** or **Deepy Prime**.
 4. Choose a supported local model or, for Prime, a configured remote LLM.
 5. Save the configuration.
@@ -25,8 +25,8 @@ Supported local choices are:
 
 - `Qwen3.5VL Abliterated 4B`
 - `Qwen3.5VL Abliterated 9B`
-- `Qwen3.8VL Uncensored 9B` (supports local Deepy Prime)
 - `Qwen3.8VL Uncensored 27B` (supports local Deepy Prime)
+- `Qwen3.8VL Flash-Next 125B` (supports local Deepy Prime)
 
 For a remote Prime engine, see [Remote LLMs](REMOTE_LLMS.md). Once Deepy is enabled, **Ask Deepy** appears in the Gradio left dock. The CLI and standalone Web app use the same saved configuration.
 
@@ -80,7 +80,7 @@ You can ask Deepy to:
 - create a talking video from a still image and speech audio
 - create speech from a description or voice sample, generate songs, and generate sound from a description
 - inspect images, video frames, and 3D assets, or compare several visuals
-- report useful media details such as dimensions, duration, FPS, frame count, and audio tracks, and for 3D assets their size and animation frames
+- report useful media details such as dimensions, duration, FPS, frame count, and audio tracks, and for 3D assets their size and animation frames, and list the files a model saved beside a media item (its transcript and subtitles, the transparent frames of an RGBA video) and read the text ones, without needing file access
 - extract images, clips, or audio; transcribe audio or video; mute or replace a video soundtrack; resize or crop media; compose assets side by side; and merge videos
 - find available LoRAs, explain the active tool defaults, and answer WanGP usage questions
 
@@ -94,7 +94,7 @@ Prime can also:
 - measure audio levels and silences, separate vocals, convert or combine image channels, and mask named objects
 - run Python in a sandbox to place exact text and layouts over generated images, draw charts and infographics, assemble grids and picture-book pages, extract palettes, write subtitle files from measured timings, build animated clips frame by frame, and model procedural 3D props that join the 3D gallery
 - look things up on the web when you enable it: facts, dates, current events, references, what a real place, object or style looks like before writing a prompt about it, and LoRAs from Civitai and Hugging Face for a style or an effect, installed for the model it is about to use
-- run the workflows that enabled plugins offer, such as Media Flow's restoration, outpainting, upscaling and interpolation of long videos and whole folders (see [Plugin workflows](#plugin-workflows-prime))
+- run the workflows that enabled Plugins offer, such as Media Flow's restoration, outpainting, upscaling and interpolation of long videos and whole folders (see [Plugin workflows](#plugin-workflows-prime))
 
 Zero keeps a shorter tool list so that it stays fast and leaves most of its context for the conversation.
 
@@ -107,36 +107,79 @@ Deepy Prime can write and run small Python programs when a result needs exact te
 
 Those programs can also call WanGP's own media tools, one by one, as Deepy would: scan a folder of photos and ask the visual inspector about each one, transcribe every clip, make a variation of each image, then report only the result. This keeps long loops out of the conversation, where each step would otherwise cost time and context, and each call still runs on the same loaded models with the same access rules.
 
-The programs run in a separate interpreter on the CPU, inside a sandbox folder of the session (`documents/sandbox`). They can read Gallery media and the session's documents, write only inside that folder, and have no network, no child processes and no access to the GPU or to WanGP's models. Memory and running time are limited, and Deepy can restart the interpreter when an experiment breaks its state. On Windows the operating system itself refuses writes outside the sandbox folder; reads of other files are refused by the interpreter. Turn the sandbox off with **Configuration > Prompt Enhancer / Deepy > Python > Enable Python Sandbox** if you prefer Deepy to work with its media tools only.
+The programs run in a separate interpreter on the CPU, inside a sandbox folder of the session (`documents/sandbox`). They can read Gallery media and the session's documents, write only inside that folder, and have no network, no child processes and no access to the GPU or to WanGP's models. Memory and running time are limited, and Deepy can restart the interpreter when an experiment breaks its state. On Windows the operating system itself refuses writes outside the sandbox folder; reads of other files are refused by the interpreter. Turn the sandbox off with **Configuration > Deepy / Prompt Enhancer > Python > Enable Python Sandbox** if you prefer Deepy to work with its media tools only.
+
+Notes, tables, JSON and SVG files that a program saves as deliverables open as previews in the chat. With **App Development (Advanced)** set to **Web Apps** in the same tab, Deepy can also build interactive animations, games and three.js scenes that you play in WanGP and keep in the Apps gallery: see the Apps documentation.
+
+## Advanced transcription (Prime)
+
+Deepy uses Whisper by default. Choose a Nemotron model in **Configuration > Deepy / Prompt Enhancer > Transcription > Transcription Model** (**Nemotron Q4 Experts** is recommended) to let Deepy Prime transcribe recordings with NVIDIA Nemotron 3.5 Transcribe: who said what (up to eight speakers), when each word was spoken, subtitles with the speaker named at each change, a translation to or from English, and names or jargon spelled the way you give them. Ask for example "transcribe this interview with speaker names as subtitles" or "translate what they say into English". Deepy runs it as a normal WanGP generation, so it waits in the queue like other jobs, the model downloads on first use (about 19 GB for **Q4 Experts**, which suits 32 GB of RAM, about 33 GB for **INT8 Experts**, best with 64 GB), and the transcribed audio joins the Audio gallery with the transcript beside it: a `.txt` file with one line per turn, its time span and its speaker, plus `.srt` subtitles. Once a Nemotron model is chosen, **Names and Jargon** takes the names, places, products and terms that come up in your recordings, separated by commas or lines: Deepy passes them to every transcription, besides the terms it picks for each recording. Speaker numbers tell the voices of one recording apart; Deepy cannot tell who a speaker is unless the recording or you say so: once you tell it who is who, it can name them in the transcript. Ask for word-level timing when you need it (one timed line per word), or for a copy of a video with the transcript or translation as subtitles that players switch on and off; Deepy reads long transcripts part by part without needing file access. For a quick transcript without speakers, Deepy keeps using its fast Whisper transcription.
 
 ## Web search (Prime)
 
-Off by default. With **Configuration > Prompt Enhancer / Deepy > Enable Web Search**, Deepy Prime can search the web for facts, dates, names, current events, references and documentation it does not know, look at news, image and video results, and read the text of a public page before quoting it. This helps with prompts about real subjects (a landmark, a breed, a product, a period style) and with questions whose answer changes over time. Deepy names the pages it used so you can check them.
+Off by default. With **Configuration > Deepy / Prompt Enhancer > Enable Web Search**, Deepy Prime can search the web for facts, dates, names, current events, references and documentation it does not know, look at news, image and video results, and read the text of a public page before quoting it. This helps with prompts about real subjects (a landmark, a breed, a product, a period style) and with questions whose answer changes over time. Deepy names the pages it used so you can check them.
 
 Searches go to free public search engines (DuckDuckGo, Bing, Brave, Google, Mojeek, Startpage, Wikipedia and others, whichever answer) directly from this machine, without an account or API key, so your queries leave the computer like a search typed in a browser. Deepy treats everything it reads on the web as information to weigh, never as instructions, and tells you when a page contains directions aimed at an assistant. It can only open public web addresses, never local or private network ones. Public engines occasionally rate-limit or change; Deepy then waits or falls back to another engine.
 
 Deepy can also download a file from the web (a reference picture, a sound, a clip, a PDF) into the `documents/web` folder of the session, where it can inspect it, use it as a generation input or add it to the Gallery when you ask. Downloads are limited in size, are never run or unpacked, and Deepy says where each file came from: the rights belong to the file's owners, so use them as you would any file you save from a browser.
 
-Deepy can also find and install LoRAs. Ask for a style, a subject or an effect ("make it look like a watercolor", "add a dolly zoom") and it searches Civitai and Hugging Face for LoRAs made for the model it is about to use, tells you which ones fit, with their trigger words, size, popularity and page, and installs the one you choose into that model's LoRA folder, ready to use in the next generation. Downloads and LoRA installs show their progress in the chat and the status bar. Searching needs no account. Downloading from Civitai requires a Civitai API key, which you create in your Civitai account settings (Account settings, then API Keys) and paste into **Configuration > Prompt Enhancer / Deepy > Civitai API Key**; it is sent to civitai.com only and kept in your operating system's credential manager, like the notification destinations, unless you choose to store it in plaintext. Hugging Face needs no token for public LoRAs, which is nearly all of them; the optional **Hugging Face Token** field, stored the same way, is only for LoRAs in gated or private repositories (a wrong token blocks public downloads too until it is corrected). LoRAs carry their authors' licenses, so check the page Deepy names before using one commercially; adult-rated LoRAs are left out unless you ask for them.
+Deepy can also find and install LoRAs. Ask for a style, a subject or an effect ("make it look like a watercolor", "add a dolly zoom") and it searches Civitai and Hugging Face for LoRAs made for the model it is about to use, tells you which ones fit, with their trigger words, size, popularity and page, and installs the one you choose into that model's LoRA folder, ready to use in the next generation. Downloads and LoRA installs show their progress in the chat and the status bar. Searching needs no account. Downloading from Civitai requires a Civitai API key, which you create in your Civitai account settings (Account settings, then API Keys) and paste into **Configuration > Deepy / Prompt Enhancer > Civitai API Key**; it is sent to civitai.com only and kept in your operating system's credential manager, like the notification destinations, unless you choose to store it in plaintext. Hugging Face needs no token for public LoRAs, which is nearly all of them; the optional **Hugging Face Token** field, stored the same way, is only for LoRAs in gated or private repositories (a wrong token blocks public downloads too until it is corrected). LoRAs carry their authors' licenses, so check the page Deepy names before using one commercially; adult-rated LoRAs are left out unless you ask for them.
 
 Sites that set cookies (consent choices, preferences) get them back on later visits during the same session, and the jar is saved with the session. For a site where you are signed in, export your browser's cookies as a `cookies.txt` file (browser extensions do this), put it in the session documents and ask Deepy to import it: Deepy then reads and downloads from that site as you, without ever seeing your password. Cookie values are never shown to Deepy or in its answers, and you can ask it to list or clear the jar at any time. Pages read with your cookies may contain your private information, so import cookies only for the sites a task needs.
 
 ## Plugin workflows (Prime)
 
-Enabled plugins can offer Deepy Prime their own workflows. With the bundled Media Flow plugin, Deepy can process existing videos and images with Media Flow's ready-made templates: remove blur, compression artifacts or a stylized color grade, convert SDR to HDR, add detail, outpaint to a new aspect ratio, upscale, or add frames for smoother motion. It handles what single post-processing treatments do not: videos of any length, processed in chunks with the original audio kept, and whole folders, lists or wildcard patterns as one batch.
+Enabled Plugins can offer Deepy Prime their own workflows. With the bundled Media Flow Plugin, Deepy can process existing videos and images with Media Flow's ready-made templates: remove blur, compression artifacts or a stylized color grade, convert SDR to HDR, add detail, outpaint to a new aspect ratio, upscale, or add frames for smoother motion. It handles what single post-processing treatments do not: videos of any length, processed in chunks with the original audio kept, and whole folders, lists or wildcard patterns as one batch.
 
-Describe the job, for example "remove the blur from @documents/interview.mp4", "upscale every video in @test/clips by 2 as one resumable batch" or "outpaint this clip to 16:9", or name the plugin ("with Media Flow"). Deepy picks a plugin when the request fits it, lists the plugin's templates for the task, chooses the recommended one unless you name another, and can tell you which settings a template accepts.
+Describe the job, for example "remove the blur from @documents/interview.mp4", "upscale every video in @test/clips by 2 as one resumable batch" or "outpaint this clip to 16:9", or name the Plugin ("with Media Flow"). Deepy picks a Plugin when the request fits it, lists the Plugin's templates for the task, chooses the recommended one unless you name another, and can tell you which settings a template accepts.
 
-- **Progress:** each plugin action shows a card named after the plugin, such as "Media Flow: Run", with live progress (files done, chunk of the current file) in the card and on the status bar.
-- **GPU:** while a plugin action runs, Deepy unloads its own model so that the action's generations have the GPU, and reloads it to answer.
+- **Progress:** each Plugin action shows a card named after the Plugin, such as "Media Flow: Run", with live progress (files done, chunk of the current file) in the card and on the status bar.
+- **GPU:** while a Plugin action runs, Deepy unloads its own model so that the action's generations have the GPU, and reloads it to answer.
 - **Stopping and resuming:** the chat **Stop** button stops a Media Flow run after its current chunk. Ask Deepy to run the same job again and it continues where it stopped, also after a restart.
 - **Outputs:** results go next to each source when Deepy may write in that folder, otherwise into the outputs folder (`media_flow`), or where you ask. Deepy links them in its answer. Its usual file access rules apply: it can only process media it may read and write into folders it may write.
 - **One run at a time:** Media Flow runs one process at a time, shared with its tab. If the tab is already busy, Deepy says so, and can report that run's progress or stop it when you ask.
-- **Python:** Python scripts can call plugin workflows too, for example to process a selection of files found by a script.
+- **Python:** Python scripts can call Plugin workflows too, for example to process a selection of files found by a script.
 
-Only plugins that offer workflows to Deepy appear, and only while they are enabled; changes take effect after a restart. Deepy Zero does not use plugin workflows. External MCP agents connected to WanGP can use the same workflows.
+Only Plugins that offer workflows to Deepy appear, and only while they are enabled; changes take effect after a restart. Deepy Zero does not use Plugin workflows. External MCP agents connected to WanGP can use the same workflows.
 
-Plugin developers: see [Plugin toolboxes for agents](PLUGINS.md#plugin-toolboxes-for-agents) in the plugin guide.
+Plugin developers: see [Plugin toolboxes for agents](PLUGINS.md#plugin-toolboxes-for-agents) in the Plugin guide.
+
+## Your own skills (Prime)
+
+A skill teaches Deepy Prime a method it should follow for a kind of task: your brand's ad format, how you like character sheets laid out, the checks to run before delivering a music video. Prime sees the short description of each of your skills in every session, and reads the whole skill when a request matches it, so a skill costs little until it is needed. Skills use the Agent Skills format that other AI agents use too, so a skill written for another agent can often be reused here.
+
+A skill is a folder named after the skill, holding a `SKILL.md` file:
+
+```markdown
+---
+name: brand-ads
+description: Make 15-second product ads with our colours, logo end card and voice-over. Use for ads, promos and product clips.
+---
+
+# Brand ads
+
+1. Generate the product shots with the default video template, 16:9, 5 seconds each.
+2. End on the logo card: see references/end-card.md for its exact wording and colours.
+3. ...
+```
+
+- **name:** lowercase words joined by hyphens, the same as the folder's name.
+- **description:** what the skill does and when to use it, in one or two sentences. It decides when Prime reads the skill, and it is added to every Prime session, so keep it short and specific.
+- **Instructions:** the Markdown that follows, written as steps Prime should take. Keep it focused; move long reference material (wording, palettes, examples) into other text files of the folder, such as `references/end-card.md`, and name them in the instructions: Prime reads them only when it needs them.
+
+Manage your skills in **Configuration > Deepy / Prompt Enhancer > Skills**:
+
+- **New Skill** opens a popup for a file name and description. Use a lowercase name with hyphens, such as `brand-ads` or `brand-ads.md`; the skill is stored as `user_skills/brand-ads/SKILL.md`. **Start Editing** opens a draft with its name and description already filled in. Add your instructions and choose **Save Skill**; cancelling the draft creates no files.
+- **Import Skill** adds a skill from its `SKILL.md` or from a `.zip` of its folder (a `SKILL.md` at the archive's root or in one top folder). Tick **Replace an Installed Skill of the Same Name** to update a skill you already have.
+- The list shows each skill with the description Prime sees, and why a folder is not used (no `SKILL.md`, a name that breaks the rules, a missing description). Select a skill to read its `SKILL.md` and see its other files, or delete it.
+- **Edit Skill** opens its `SKILL.md` inline. Update the description or instructions, keep `name` unchanged, then choose **Save Skill**. Other files in the skill's folder are preserved. **Cancel Editing** discards the draft and reloads the saved version. Leaving the tab keeps your draft; moving focus away does not save it.
+- Invalid edits stay in the editor so you can correct them. If the skill changed elsewhere while you were editing, saving is refused to protect the newer version; copy your draft before cancelling and reopening the skill.
+- **Delete Skill** asks for confirmation, then moves the whole folder, including supporting files, into `user_skills/.archive` with a unique name. Archived skills are excluded from Deepy's skill list and skill-reading API. To restore one, move its archived folder back into `user_skills` under the name in its `SKILL.md`.
+- Import, Save and Delete act at once, without **Apply Changes**. Prime uses the changes from its next session.
+
+The tab works on the `user_skills` folder of your WanGP installation, so copying a skill's folder there yourself does the same thing; WanGP updates leave this folder alone. You can also ask Prime to save what it has just learnt as a skill ("save this method as a skill"), and to improve a skill later. External MCP agents connected to WanGP see and use the same skills. Deepy Zero does not use skills.
+
+**Read a skill from elsewhere before importing it.** A skill is a set of instructions Prime will follow, like standing guidance. Skills written for coding agents may also assume tools Deepy does not have, such as a terminal. Prime reads a skill's text files only: it never runs the scripts a skill may include.
 
 ## Everyday workflow
 
@@ -153,9 +196,11 @@ You can override supported values in a request, including width, height, frame c
 
 ### Import and attach media
 
-In Gradio, either use the chat **+** button or open **Media Info / Late Post Processing / Import Media > Import Media to Galleries**. In the Web app, use the chat **+** for media needed by the next request, or import files from a gallery.
+In Gradio, either use the chat **+** button or open **Media Info / Late Post Processing / Import Media > Import Media to Galleries**. In the Web app, use the chat **+** for media needed by the next request, or import files from a gallery. The chat **+** accepts images, videos and audio.
 
-The attachment counter shows how many files are waiting for the next request. Sending the request consumes those attachments. Removing an attachment from the composer does not delete its workspace file.
+Files waiting for the next request appear as thumbnails above the message box: click one to view it, or its **×** to remove it. Sending the request consumes those attachments, and your message keeps them above its text, so you can see what each request used without searching the gallery. Removing an attachment from the composer does not delete its workspace file.
+
+Importing a file that is already in the gallery moves it to the end of the gallery, beside your latest creations, instead of jumping back to its old place.
 
 ### Select media and refer to it naturally
 
@@ -198,6 +243,8 @@ The chat and generation progress bars show what Deepy and WanGP are doing.
 - **Abort** cancels the active WanGP generation.
 
 You can send a new instruction while Deepy is working. Use this to steer the current task, or queue the instruction for afterward when the interface offers that choice.
+
+Deepy's generations run after the current task and ahead of the tasks you added to the queue yourself, so a request to Deepy does not wait behind a long queue. Several of them run in the order Deepy requested them.
 
 **Compacted View of Thoughts and Actions** keeps long turns readable. A collapsed turn shows its latest useful statement, generated media, and final answer; expand it to review individual thoughts and actions. The preference is shared between Gradio and Web.
 
@@ -246,8 +293,9 @@ Deepy uses **Video Generator with Ref.** when images or videos supply subject id
 
 WanGP includes built-in templates. To reuse your own model setup:
 
-1. Configure and save normal WanGP generation settings.
-2. Select that user settings file in WanGP's **Lora / Settings** dropdown.
+1. Configure normal WanGP generation settings.
+2. Save them as a preset: in the preset list at the top of the generator (beside **Apply** and **Save**), type a name, press **Save** and
+   confirm. Keep that preset selected.
 3. Open Deepy settings.
 4. Click **+** beside the Deepy tool that should use it.
 5. Confirm the link and save Deepy settings.
@@ -306,16 +354,16 @@ The lock protects a workspace from automatic archiving. The broom sets an inacti
 
 See [Gallery Workspaces](WORKSPACES.md) for the relationship between workspaces and galleries, the complete workspace-manager workflow, synchronization rules, dedicated Deepy workspaces, safe deletion, archiving, restoration, and backups.
 
-### When a plugin asks Deepy
+### When a Plugin asks Deepy
 
-Plugins can send Deepy requests of their own, with media, for example to edit the selected picture and turn it into a video. The bundled **Sample Plugin** shows one once enabled in the plugin manager: its **Ask Deepy to add a red hat and to make a singing video** button sends the selected picture with that request and puts a download link to the video beside the button.
+Plugins can send Deepy requests of their own, with media, for example to edit the selected picture and turn it into a video. The bundled **Sample App** shows one once enabled in **Apps & PlugIn Manager**: its **Ask Deepy to add a red hat and to make a singing video** button sends the selected picture with that request and puts a download link to the video beside the button.
 
-- **Waiting:** a plugin's request starts when Deepy and the generation queue are free.
-- **While it runs:** Deepy shows the plugin's own conversation, its requests marked with the plugin's name. The gallery shows the workspace the plugin chose: a new workspace that stays in the list so you can browse the results later, a temporary one removed when the plugin is done, a workspace the plugin keeps for its project, or the one you had open, in which case the results join your gallery.
-- **Control:** you can follow, pause and stop the plugin's work as any Deepy turn, and a message you send goes to the plugin's conversation. Changing conversation or workspace is refused until the plugin's request ends.
-- **Afterwards:** your conversation and workspace come back, also when saved sessions are disabled; Deepy reloads your conversation as when resuming a session. Plugin conversations are kept by their plugin and do not appear in the session list.
+- **Waiting:** a Plugin's request starts when Deepy and the generation queue are free.
+- **While it runs:** Deepy shows the Plugin's own conversation, its requests marked with the Plugin's name. The gallery shows the workspace the Plugin chose: a new workspace that stays in the list so you can browse the results later, a temporary one removed when the Plugin is done, a workspace the Plugin keeps for its project, or the one you had open, in which case the results join your gallery.
+- **Control:** you can follow, pause and stop the Plugin's work as any Deepy turn, and a message you send goes to the Plugin's conversation. Changing conversation or workspace is refused until the Plugin's request ends.
+- **Afterwards:** your conversation and workspace come back, also when saved sessions are disabled; Deepy reloads your conversation as when resuming a session. Plugin conversations are kept by their Plugin and do not appear in the session list.
 
-Plugin developers: see [Running Deepy Jobs](PLUGINS.md#running-deepy-jobs) in the plugin guide.
+Plugin developers: see [Running Deepy Jobs](PLUGINS.md#running-deepy-jobs) in the Plugin guide.
 
 ## Use Deepy on a phone
 
@@ -391,16 +439,16 @@ inspect the selected frame and tell me whether the subject is centered
 
 ## Important configuration choices
 
-The settings under **Configuration > Prompt Enhancer / Deepy** determine Deepy's capabilities, quality, speed, memory use, and access to your files. The recommendations below are starting points; change them when your hardware or workflow has a different priority.
+The settings under **Configuration > Deepy / Prompt Enhancer** determine Deepy's capabilities, quality, speed, memory use, and access to your files. The recommendations below are starting points; change them when your hardware or workflow has a different priority.
 
-### Prompt Enhancer / Deepy LLM Engine
+### Deepy / Prompt Enhancer LLM Engine
 
 This selects the language and vision model that understands requests, plans work, and writes responses.
 
 - **Qwen3.5VL Abliterated 4B** starts quickly and uses the least memory, but is less reliable with long instructions and multi-step decisions. **Recommended for:** Deepy Zero on limited hardware and simple, direct requests.
 - **Qwen3.5VL Abliterated 9B** understands more complex instructions and media better than 4B, with higher VRAM and RAM use. **Recommended for:** the best general Deepy Zero experience when it fits comfortably.
-- **Qwen3.8VL Uncensored 9B** runs local Deepy Prime in about 6.5 GB of VRAM with its default GGUF Q4_K_M, or about 11 GB with GGUF Q8_0, which stays closest to the full-precision model. It follows instructions and multi-step tool use about as well as the 27B and remembers earlier parts of long conversations reliably, but has less general knowledge, thinks longer before answering, and understands images less accurately than the 27B. **Recommended for:** local Prime on 8 to 12 GB GPUs.
-- **Qwen3.8VL Uncensored 27B** offers the strongest local planning, knowledge and image understanding for Deepy Prime, but needs considerably more memory and takes longer to load. **Recommended for:** local Prime and complex multimedia projects when it fits.
+- **Qwen3.8VL Uncensored 27B** offers the strongest local planning, knowledge and image understanding for Deepy Prime, but needs considerably more memory and takes longer to load. On GPUs with less than 16 GB of VRAM, choose its **Bonsai 2 PTQ1_0** quantization (see below), whose weights take less than 6 GB. **Recommended for:** local Prime and complex multimedia projects.
+- **Qwen3.8VL Flash-Next 125B** is much larger than the VRAM of a PC: it keeps in VRAM what the current conversation uses and leaves the rest in RAM and on the drive, so it stays usable on 12 GB GPUs and gets faster as a conversation goes on. It needs an 80 GB download on a fast SSD and about 64 GB of RAM: with less, it spends its time reading the drive. Long prompts take longer to read than with the 27B. **Recommended for:** local Prime on a PC with plenty of RAM, when you want the largest local model.
 - **A remote LLM** avoids loading the language model on the WanGP GPU and may provide stronger reasoning, but adds network latency and sends conversation content to the configured provider. Remote engines require Prime. **Recommended for:** Prime when local memory is insufficient or a supported remote engine is preferred. Review [Remote LLMs](REMOTE_LLMS.md) before using one with private media or instructions.
 
 Changing the engine can require new model downloads and a runtime reload.
@@ -418,7 +466,10 @@ For Qwen3.8 27B:
 
 - **GGUF Q4** has the highest quality and memory use. **Recommended for:** quality-first work when it fits without forcing excessive unloading. Usually this will require a 24 GB VRAM GPU.
 - **GGUF IQ3_S** is the middle ground for quality and memory. **Recommended for:** most local Prime installations. You may run this version with a 16 GB VRAM GPU.
-- **GGUF Q2** has the lowest memory use and the largest quality loss. **Recommended for:** this version can be also used with a 16 GB VRAM GPU but the advantage over Q3 is that you will be able to expand the context window.
+- **GGUF Q2** has lower memory use and a larger quality loss. **Recommended for:** this version can be also used with a 16 GB VRAM GPU but the advantage over Q3 is that you will be able to expand the context window.
+- **Bonsai 2 PTQ1_0** has the lowest memory use. **Recommended for:** GPUs with less than 16 GB of VRAM. It needs the GGUF kernels 1.0.22 or newer; without them, a first launch below 16 GB stays on Qwen3.5 4B and WanGP suggests Q2 if you choose Qwen3.8.
+
+On first launch, WanGP sets up Deepy Prime on the Qwen3.8 version that suits your NVIDIA GPU, with nothing to configure, so that Showrunner works right away: Q4 from 24 GB of VRAM, IQ3_S from 16 GB, Bonsai below that, with a 64K context from 10 GB of VRAM and 32K below. Settings you have already saved are never changed. You can pick another version, but if it is less compressed than the one suited to your GPU, or if a Speculative Decoding you chose pushes the model out of VRAM, WanGP warns you that Deepy may perform poorly: in **Configuration > Deepy / Prompt Enhancer**, at the first request of a Deepy chat, and in Showrunner. The same places tell you when Speculative Decoding is Disabled although your version of Qwen3.8 fits in VRAM with MTP on your GPU, as Deepy could then run about twice as fast.
 
 Deepy keeps as much of its local model in VRAM as fits beside its context cache. When the whole model does not fit, it streams the remaining layers from RAM at each step: it keeps working, but it answers more slowly the more layers are streamed, and it frees VRAM by itself when an image is inspected or another component needs memory. Deepy always uses the fastest kernels that are installed; there is no decoder setting to choose.
 
@@ -438,10 +489,12 @@ Speculative decoding can generate Deepy's text faster by predicting several toke
 
 Choose a method and **Number of Tokens** on the row above **KV Cache Quantization**. Only compatible methods appear; switching to an incompatible model or quantization resets the method to **Auto**.
 
-- **Auto** enables MTP on supported models when it speeds Deepy up: when the model fits in VRAM with it, or when part of the model has to stream from RAM anyway (MTP then predicts several tokens for each pass over the streamed weights). It stays off when MTP would push a model that otherwise fits in VRAM partly out of it, and on GPUs with 8 GB or less. For GGUF models, WanGP reads the checkpoint, context size and KV Cache Quantization to decide; for other quantizations Auto needs at least 12 GB for Qwen3.5 9B. The token count is automatic, and the console reports the choice Auto made.
+**Number of Tokens** starts on **Auto** when you pick a method: you choose how Deepy predicts and WanGP chooses how far. Pick a number instead to use exactly that many draft tokens on every prediction.
+
+- **Auto** enables MTP on supported models when it speeds Deepy up: when the model fits in VRAM with it, or when part of the model has to stream from RAM anyway (MTP then predicts several tokens for each pass over the streamed weights). It stays off when MTP would push a model that otherwise fits in VRAM partly out of it, and on GPUs with 8 GB or less. From 13 to 16 GB, it enables MTP only when the whole model fits in VRAM with it. On Qwen3.8 27B, it uses 4 draft tokens from 24 GB of VRAM, or from 12 GB with Bonsai, and 2 below. With 4 draft tokens, it predicts up to 7 while Deepy writes text that is easy to predict (tool calls, summaries, lists), which makes those parts faster, and keeps 4 on the rest. How readily it does so follows what the longer prediction costs on your GPU, measured while Deepy runs. For GGUF models, WanGP reads the checkpoint, context size and KV Cache Quantization to decide; for other quantizations Auto needs at least 12 GB for Qwen3.5 9B. The token count is automatic, and the console reports the choice Auto made.
 - **Disabled** adds no draft-model VRAM and disables the token control. Use it when memory is tight or prediction is slower for your workload.
-- **MTP** supports 1–8 draft tokens on Qwen3.5 9B and Qwen3.8/Bonsai 27B. Start with 2.
-- **DSpark** supports 1–7 draft tokens on Qwen3.8/Bonsai 27B when Triton and FlashAttention 2 are installed.
+- **MTP** keeps MTP on whatever the VRAM, on Qwen3.5 9B and Qwen3.8/Bonsai 27B. With **Number of Tokens** on **Auto** it uses the draft count Auto would choose for your model and GPU, including the longer prediction on easy text, and the console reports that count. It also supports a fixed 1–8 draft tokens; more are not always faster.
+- **DSpark** supports 1–7 draft tokens on Qwen3.8/Bonsai 27B when Triton and FlashAttention 2 are installed. **Auto** uses its recommended count, as it does for DFlash2 and DSpine.
 - **DFlash2** supports 1–7 draft tokens on Qwen3.8 Q2, Q3 and Q4, and 1–5 on Bonsai PTQ1, when Triton and FlashAttention 2 are installed. WanGP selects the Qwen drafter for Q2/Q3/Q4 and the Bonsai-adapted drafter for PTQ1 automatically.
 
 Each method label includes its estimated additional VRAM: approximately 0.5–1 GiB for MTP and 4–5 GiB for DSpark or DFlash2 at roughly 32K context. Auto adds between zero and the MTP cost. Longer context, draft count, and model choice affect actual usage. Compare representative prompts before choosing a prediction method: Disabled can be fastest, especially with Bonsai.
@@ -473,9 +526,11 @@ This controls how long a local Deepy model stays in GPU memory. It is not shown 
 
 - **Unload from VRAM as soon as possible** frees memory after Deepy becomes idle, but the next request must reload the model and starts more slowly. **Recommended for:** GPUs that need nearly all available VRAM for image or video generation; this is the safest default.
 - **Unload if VRAM is requested by another WanGP component** keeps Deepy responsive between requests but gives its memory back when another operation needs it. **Recommended for:** most systems with enough VRAM to hold Deepy during normal browsing and light generation.
-- **Always loaded in VRAM** gives the fastest Deepy response times but permanently reduces the memory available to generation models. **Recommended for:** high-VRAM systems primarily used for Deepy, or remote/heavily offloaded generation workflows.
+- **Always loaded in VRAM** gives the fastest Deepy response times. A generation still gets the memory it needs: it takes the parts of Deepy it requires, and Deepy's conversation memory only when nothing else is left (it is then saved to RAM, not lost). Deepy's next answer brings them back without starting the conversation over. **Recommended for:** systems where you alternate between Deepy and generations, or where Deepy asks for progress while a generation runs.
 
-If generations fail to fit after changing this setting, move one level toward earlier unloading.
+In every mode, quick tools that need little memory (image and video inspection, transcription, masks, vocal removal) keep Deepy loaded while they run and take from it only the memory they need, so Deepy continues right after them. With **Always loaded in VRAM**, a prompt enhancement runs beside Deepy's conversation instead of interrupting it.
+
+These partial releases need the *MMGP Optimized VRAM Allocator* (the default, see [CLI.md](CLI.md#vram-allocator)); with PyTorch's allocator, Deepy is released whole as described above. If generations fail to fit after changing this setting, move one level toward earlier unloading.
 
 ### Context Window Tokens
 
@@ -492,7 +547,7 @@ The context window is how much recent conversation, tool output, and project sta
 
 The KV cache holds the active conversation context in GPU memory. Quantizing it reduces that memory cost without changing the model checkpoint.
 
-- **Auto** uses fast INT8 caching when compatible GGUF kernels are installed and otherwise uses BF16. **Recommended for:** most users.
+- **Auto** chooses for your installation: Q4 when the GGUF and Triton kernels are installed and the GPU is an RTX 30XX or newer, fast INT8 with the GGUF kernels alone, and BF16 otherwise. **Recommended for:** most users.
 - **Disabled (BF16)** uses more VRAM and avoids cache quantization. **Recommended for:** quality-sensitive troubleshooting, or systems where INT8 cache performance is worse.
 - **INT8** uses about half the KV-cache VRAM and makes larger context windows practical. **Recommended for:** long Prime sessions or tight VRAM, provided the installed kernels support it efficiently.
 - **Below INT8** (INT8 keys with Q4 values, Q6, Q6 keys with Q4 values, Q4.1, Q4) shrinks the cache further, by a quarter to almost a half of the INT8 size. The first page of the conversation and the most recent tokens always stay in INT8; only the older middle of the context uses the smaller format. Q6 and INT8 keys with Q4 values are practically indistinguishable from INT8 on long texts; Q4.1 and Q4 cost a little precision on the oldest part of the context. Decoding speed is unchanged; reading a long prompt is 5 to 12 percent slower. **Recommended for:** very long Prime sessions on cards where the cache, not the model, is what no longer fits.
@@ -500,6 +555,14 @@ The KV cache holds the active conversation context in GPU memory. Quantizing it 
 **Exact Sink and Recent Tokens** appears with a cache below INT8 and chooses which tokens keep the INT8 precision: the first page plus the last 1024 tokens (recommended), the first page plus the last 256 tokens, the last 1024 tokens alone, or none for a uniformly quantized cache.
 
 The context-window label displays an estimated cache size. Treat that estimate as VRAM reserved before image or video model requirements.
+
+### KV Caches Kept in RAM
+
+When you go back to a conversation you left (your chat after a Showrunner request, or a production you worked on last), Deepy continues from its saved cache instead of rebuilding its context, so it answers in seconds rather than up to a minute. Each conversation keeps one cache, restored when it next needs Deepy; the oldest makes way once the limit is reached, and that conversation simply rebuilds its context on its next request.
+
+- **2** (default) keeps your chat and your last production ready.
+- **More** keeps more productions ready, at the cost of RAM: 64K tokens of context take about 1.2 GB in Q4, 2.1 GB in INT8 and 4 GB in BF16.
+- **Disabled** frees that RAM, and every conversation you come back to rebuilds its context. **Recommended for:** low RAM.
 
 ### Compaction Type When Context is Full
 
@@ -509,7 +572,21 @@ Compaction decides what happens when the live conversation no longer fits in the
 - **Summarize** condenses older work while preserving important goals, decisions, completed actions, file references, and next steps. It requires at least 32K context. **Recommended for:** most long sessions and all local Prime use.
 - **Summarize with Thinking** lets Deepy reason before creating the summary, improving preservation in complicated projects at the cost of more time and a minimum 48K context. **Recommended for:** long Prime workflows with many dependencies, not routine one-step requests.
 
-Summaries help but cannot guarantee perfect recall. Keep critical specifications in your request or in a workspace document when mistakes would be costly.
+Summaries help but cannot guarantee perfect recall. Keep critical specifications in your request (one longer than about a fifth of the context window is summarized too) or in a workspace document when mistakes would be costly.
+
+### Faster Context Reading
+
+Available with the local Qwen models when **KV Cache Quantization** is INT8 or below. Before it can answer, Deepy reads everything new in the conversation: your message, tool results, documents, or a whole conversation you come back to. When enabled, that reading is up to twice as fast, and the gain grows with the length of the conversation.
+
+- **Disabled** reads with the most reproducible arithmetic and no extra memory. **Recommended for:** cards where graphics memory is tight during long conversations.
+- **Enabled** favors speed. It takes up to about 140 MB of graphics memory while reading, whatever the length of the conversation, released afterwards. The wording of answers can differ from what the disabled setting gives; quality measured the same in our tests. **Recommended for:** long conversations and work with many tool results.
+
+### Skip Low-Ranked Experts
+
+Available with Qwen3.8 Flash-Next. When enabled, the model leaves out the least important part of its work when that part is not already in graphics memory. Answers come faster, about 15-30% on a 32 GB card in our tests, and slightly less precise.
+
+- **Disabled** keeps full quality. **Recommended for:** careful work, where a precise answer matters more than speed.
+- **Enabled** favors speed. **Recommended for:** long answers and exploration, where you would rather have the text sooner.
 
 ### Repetition Penalty
 
@@ -520,7 +597,7 @@ When enabled, this reduces rambling and repeated phrases across Deepy's response
 
 ### Filesystem access
 
-Under **Configuration > Prompt Enhancer / Deepy**, Prime groups its options into **Filesystem**, **Guidance**, **MCP Servers**, **Python**, and **Internet Access** tabs. Deepy Zero shows only **Filesystem**. The **Internet Access** tab contains Web Search, the Civitai API key, the Hugging Face token, and their OS Credential Manager options.
+Under **Configuration > Deepy / Prompt Enhancer**, Prime groups its options into **Filesystem**, **Guidance**, **Skills**, **MCP Servers**, **Python**, **Internet Access**, and **Transcription** tabs. Deepy Zero shows only **Filesystem**. The **Internet Access** tab contains Web Search, the Civitai API key, the Hugging Face token, and their OS Credential Manager options. The **Transcription** tab chooses the transcription model (Whisper only, or a Nemotron model for Advanced Transcription) and, for Nemotron, your names and jargon.
 
 Filesystem access determines which local files Deepy can inspect or create. Use the smallest scope that supports the task.
 
@@ -558,6 +635,12 @@ This allows Deepy to read absolute paths anywhere the WanGP process can access. 
 The **Guidance** tab's **Deepy Prime User Guidance** field provides standing instructions applied to future interactions. Use it for durable project preferences such as quality priorities, approval points, naming conventions, or how to choose models.
 
 **Impact:** broad or conflicting instructions affect every request and can make otherwise simple tasks less predictable. **Recommendation:** keep guidance short, specific, and reusable. Put one-off requirements in the request itself. Do not paste secrets into this field, especially with a remote engine.
+
+### Skills
+
+The **Skills** tab creates, lists, edits, imports and archives your skills: see [Your own skills](#your-own-skills-prime).
+
+**Impact:** each skill's description is added to every Prime session (a few dozen tokens each, shown under the list), and Prime follows a skill's instructions whenever a request matches its description. **Recommendation:** keep descriptions short and specific, put standing preferences that apply to every request in Guidance instead, delete skills you no longer use, and read a skill from elsewhere before importing it.
 
 ### External MCP Servers
 
@@ -618,4 +701,4 @@ Create a portrait for an introduction video, generate a short speech explaining 
 
 ---
 
-> Applies to: Choosing, enabling, launching, configuring, and using Deepy Zero or Deepy Prime in Gradio, CLI, and the standalone Web app, including media, templates, plugin workflows, sessions, workspaces, phone access, voice input, and network protection.
+> Applies to: Choosing, enabling, launching, configuring, and using Deepy Zero or Deepy Prime in Gradio, CLI, and the standalone Web app, including media, templates, Plugin workflows, sessions, workspaces, phone access, voice input, and network protection.

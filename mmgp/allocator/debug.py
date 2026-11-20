@@ -21,6 +21,12 @@ Without debug mode the tags cost nothing (a plain attribute, an empty context).
 The origin is asked from inside the allocation, which takes the GIL: a thread holding the GIL while waiting for a lock that the
 allocating thread holds would deadlock (PyTorch's own memory history has the same constraint).
 
+Chunk log, for memory that two owners share (a different question: not what fills the VRAM, but who wrote over what). MMGP_VRAM_CHUNK_LOG=<file> starts it
+with the process; or start_chunk_log(path). It keeps the history of every chunk (up to 6 M events, about 430 MB of RAM), and writes to the file, with the Python
+stack, when a chunk gets two owners, with the chunk's history and the pools (the first REPORTED_VIOLATIONS times). MMGP_VRAM_WATCH_SIZES=4325376,... adds a line with
+thread, stream and stack for allocations of exactly these sizes (4325376 bytes: a cuBLAS workspace). chunk_report(tensor) writes what the allocator knows of a tensor's
+chunk, at the moment damage is seen; pools_report(label) lists the pools and their live blocks. Off, each event costs one relaxed load.
+
 Command line: python -m mmgp.allocator.debug summary report.json | diff before.json after.json"""
 import contextlib
 import ctypes
@@ -30,8 +36,10 @@ import re
 import sys
 import threading
 import time
+import traceback
 
 import torch
+from tqdm import tqdm
 
 from . import events as _events
 
@@ -70,6 +78,7 @@ class _Recording:
         self.patched = []
         self.t0 = 0.0  # the library's recording clock starts with start()
         self.event_cursor = self.release_cursor = 0  # the MMGP events (events.py) and releases already reported
+        self.ranges, self.ranges_at = {}, None  # per phase: seconds spent in it and what the large address ranges did meanwhile (_range_marks)
 
 
 def _library():
@@ -195,6 +204,51 @@ def _watch_mmgp(rec):  # a phase per model that mmgp's offload loads to the GPU,
         rec.patched.append((offload.offload, attribute, original))
 
 
+_CHUNK_CALLBACK = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_uint64, ctypes.c_uint64)
+REPORTED_VIOLATIONS = 3
+_chunk_log = None
+_chunk_violations = 0
+
+
+def start_chunk_log(path, watch_sizes=()):
+    """See the module's description. The callback runs from inside the allocation, without the allocator's lock."""
+    global _chunk_log
+    lib = _library()
+    lib.vmm_chunk_log_report.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_char_p)
+    lib.vmm_chunk_log_pools.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p)
+
+    @_CHUNK_CALLBACK
+    def event(reason, pointer, size):
+        global _chunk_violations
+        reason = reason.decode()
+        stack = " < ".join(f"{os.path.basename(frame.filename)}:{frame.lineno} {frame.name}" for frame in reversed(traceback.extract_stack(limit=16)[:-1]))
+        with open(path, "a", encoding="utf-8") as out:
+            out.write(f"{reason}: allocation at {pointer:#x}, size {size}, thread {threading.current_thread().name}, stream {torch.cuda.current_stream().cuda_stream:#x}, from {stack}\n")
+        if reason.startswith("watched"):
+            return
+        _chunk_violations += 1
+        if _chunk_violations <= REPORTED_VIOLATIONS:
+            tqdm.write(f"[MMGP] VRAM chunk log: {reason}, written to {path}")
+            lib.vmm_chunk_log_report(None, _device(), os.fsencode(path))
+            lib.vmm_chunk_log_pools(_device(), os.fsencode(path), f"at violation {_chunk_violations}".encode())
+
+    watched = (ctypes.c_size_t * len(watch_sizes))(*watch_sizes)
+    _chunk_log = event, path
+    lib.vmm_chunk_log_start.argtypes = (_CHUNK_CALLBACK, ctypes.POINTER(ctypes.c_size_t), ctypes.c_int)
+    lib.vmm_chunk_log_start(event, watched, len(watch_sizes))
+
+
+def chunk_report(target, path=None):
+    """What the allocator knows of the chunk behind a tensor or an address: its owners and mappings now, its history, every violation and the end of the log."""
+    pointer = target if isinstance(target, int) else target.untyped_storage().data_ptr()
+    _library().vmm_chunk_log_report(ctypes.c_void_p(pointer), _device(), os.fsencode(path or _chunk_log[1]))
+
+
+def pools_report(label, path=None):
+    """The allocator's pools now: their chunks, and the sizes of their live blocks."""
+    _library().vmm_chunk_log_pools(_device(), os.fsencode(path or _chunk_log[1]), label.encode())
+
+
 def start(min_mb=16, stacks=True, max_stacks_per_s=0, watch_mmgp=True):
     """Starts recording the allocations of min_mb or more (a new recording if one is in progress)."""
     global _rec
@@ -232,11 +286,30 @@ def active():
     return _rec is not None
 
 
+_RANGE_COUNTERS = ("created", "created_bytes", "reserve_us", "reused", "released", "unmapped", "unmap_us")
+
+
+def _range_marks(rec):
+    """Adds to the phase that ends what the large address ranges did since the last mark, and the time spent in it."""
+    from . import range_stats
+    now, counters = time.perf_counter(), range_stats()
+    if counters is None:
+        return
+    if rec.ranges_at is not None and rec.phase is not None:
+        since, before = rec.ranges_at
+        totals = rec.ranges.setdefault(rec.phase, dict.fromkeys(("seconds",) + _RANGE_COUNTERS, 0))
+        totals["seconds"] += now - since
+        for key in _RANGE_COUNTERS:
+            totals[key] += counters[key] - before[key]
+    rec.ranges_at = (now, counters)
+
+
 def mark(name):
     """The allocations that follow count for the peak of phase `name` (a phase seen before continues its peak)."""
     rec = _rec
     if rec is None:
         return
+    _range_marks(rec)
     if name not in rec.phase_ids:
         rec.phase_ids[name] = len(rec.phase_names)
         rec.phase_names.append(name)
@@ -279,6 +352,7 @@ def reset():
     lib.vmm_debug_reset()
     lib.vmm_reset_peaks(_device())
     rec.phase = None
+    rec.ranges, rec.ranges_at = {}, None
     mark("start")
 
 
@@ -431,9 +505,16 @@ def report(path=None):
                          "files": {model_id: info["files"] for model_id, info in release["models"].items() if info["files"]},
                          "vram_still_held_gb": round(sum(group["mb"] for group in held) / 1024, 3), "groups": held})
     rec.release_cursor = len(_events.releases)
-    from . import stats
+    from . import stats, range_stats
+    _range_marks(rec)
+    now = range_stats()
+    ranges = None if now is None else {
+        "phases": [{"name": name, "seconds": round(totals["seconds"], 2), "created": totals["created"], "created_gb": round(totals["created_bytes"] / GB, 1), "reused": totals["reused"],
+                    "released": totals["released"], "reserve_ms": round(totals["reserve_us"] / 1000, 1), "unmapped": totals["unmapped"], "unmap_ms": round(totals["unmap_us"] / 1000, 1)}
+                   for name, totals in rec.ranges.items()],
+        "free_ranges": now["free_ranges"], "free_gb": round(now["free_bytes"] / GB, 1), "unmaps_pending": now["unmaps_pending"], "budget": None if now["budget"] < 0 else now["budget"]}
     allocator = {key: round(value / GB, 3) if key not in ("chunks", "live_large", "recoveries") else value for key, value in stats().items()}
-    result = {"created": time.strftime("%Y-%m-%d %H:%M:%S"), "threshold_mb": rec.min_mb, "allocator": allocator, "phases": phases, "reserved_peaks": reserved_peaks, "out_of_memory": oom, "live_now": live, "origins": origins[:200],
+    result = {"created": time.strftime("%Y-%m-%d %H:%M:%S"), "threshold_mb": rec.min_mb, "allocator": allocator, "address_ranges": ranges, "phases": phases, "reserved_peaks": reserved_peaks, "out_of_memory": oom, "live_now": live, "origins": origins[:200],
               "releases": releases, "events": _events.as_json(entries, rec.t0),
               "stacks": {str(stack_id): [_frame_text(code, line) for code, line in rec.stack_frames[stack_id][:40]] for stack_id in sorted(used) if stack_id >= 0}}
     if path:
@@ -493,6 +574,25 @@ def _coverage_warnings(result):
     return warnings
 
 
+def _ranges_summary(ranges):
+    """The address ranges of the tensors of 256 MiB and more, per phase: a freed one keeps its addresses for the next tensor of its size;
+    beyond a budget of free ranges the oldest are released by a background thread. Time spent reserving them is host time lost."""
+    lines = ["## Address ranges of large tensors (256 MiB and more)\n\n"]
+    budget = "no budget" if ranges["budget"] is None else f"budget {ranges['budget']} ranges per pool"
+    lines.append(f"Free ranges now: {ranges['free_ranges']} holding {ranges['free_gb']:.1f} GiB of addresses ({budget}); {ranges['unmaps_pending']} waiting to be unmapped.\n\n")
+    slow = [phase for phase in ranges["phases"] if phase["reserve_ms"] >= max(500, 50 * phase["seconds"])]
+    if slow:
+        lines.append("**Reserving and mapping address ranges took " + ", ".join(f"{phase['reserve_ms'] / 1000:.1f} s of the {phase['seconds']:.0f} s of {phase['name']}" for phase in slow)
+                     + "**: host time during which the GPU waits (expected: a few ms per range).\n\n")
+    lines.append("| phase | seconds | new ranges | GiB of addresses | reused | released | reserving + mapping (ms) | ms per new range | unmapped in the background | background (ms) |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+    for phase in ranges["phases"]:
+        each = f"{phase['reserve_ms'] / phase['created']:.2f}" if phase["created"] else "-"
+        lines.append(f"| {phase['name']} | {phase['seconds']:.1f} | {phase['created']} | {phase['created_gb']:.1f} | {phase['reused']} | {phase['released']} | {phase['reserve_ms']:.0f} | {each} | "
+                     f"{phase['unmapped']} | {phase['unmap_ms']:.0f} |\n")
+    lines.append("\n")
+    return "".join(lines)
+
+
 def summary(result):
     """Markdown summary of a report."""
     text = [f"# VRAM debug report, {result['created']}: allocations of {result['threshold_mb']} MB and more\n\n"]
@@ -509,6 +609,8 @@ def summary(result):
                     + (f"**{release['vram_still_held_gb']:.2f} GiB of recorded VRAM still held by their modules**:\n\n{_table(release['groups'], 15)}\n\n" if release["groups"]
                        else "no recorded VRAM left by their modules.\n\n"))
     text.extend(_coverage_warnings(result))
+    if result.get("address_ranges"):
+        text.append(_ranges_summary(result["address_ranges"]))
     for phase in result["phases"]:
         text.append(_phase_summary(phase, f"Peak of phase {phase['name']} ({phase['time_s']:.1f} s)"))
     for phase in result.get("reserved_peaks", []):
