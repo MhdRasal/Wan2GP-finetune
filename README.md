@@ -548,6 +548,8 @@ For detailed installation instructions for different GPU generations:
 - **[Deepy Assistant](docs/DEEPY.md)** - Launch Deepy in Gradio, CLI or standalone Web mode; configure tools, media references, saved sessions and phone access
 - **[Authentication, HTTPS, and Reverse Proxies](docs/AUTHENTICATION.md)** - Protect web access, configure proxy hosting with `--public-url`, and set up MCP OAuth
 - **[Remote LLMs](docs/REMOTE_LLMS.md)** - Configure Codex, Claude Code, and OpenCode providers for Deepy and Prompt Enhancer
+- **[Cloud Execution Architecture](docs/EXECUTION_ARCHITECTURE.md)** - Decoupled generation execution with Modal and RunPod providers
+- **[Godot Studio Architecture](docs/GODOT_STUDIO_ARCHITECTURE.md)** - Evergreen Godot 4 Editor Plugin with dynamic schema reflection and direct asset auto-import
 - **[Loras Guide](docs/LORAS.md)** - Using and managing Loras for customization
 - **[Finetunes](docs/FINETUNES.md)** - Add manually new models to WanGP
 - **[VACE ControlNet](docs/VACE.md)** - Advanced video control and manipulation
