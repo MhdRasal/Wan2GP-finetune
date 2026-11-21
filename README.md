@@ -1,3 +1,17 @@
+# Wan2GP Finetune
+
+This is my working build of [WanGP](https://github.com/deepbeepmeep/WanGP), the open-source generative model suite from DeepBeepMeep. I use it to run and test finetunes, custom checkpoints and LoRAs on limited hardware, and as the generation engine behind my WanVideo / WanStudio pipeline.
+
+What I add on top of upstream:
+
+- Finetune and custom checkpoint workflows
+- Low-VRAM generation profiles for Kaggle and smaller GPUs
+- Video, image, audio and 3D generation from one queue
+- Cloud / notebook rendering used by my own products
+
+The upstream documentation follows. For installation and supported models, use the sections below.
+
+---
 # WanGP
 
 -----
