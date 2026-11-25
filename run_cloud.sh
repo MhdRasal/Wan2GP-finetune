@@ -11,6 +11,11 @@ cd "$SCRIPT_DIR"
 export PATH="$HOME/.local/bin:$PATH"
 export PYTHONPATH="$SCRIPT_DIR:${PYTHONPATH:-}"
 
+# Optimize memory on mobile / multi-core CPU
+export OPENBLAS_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OMP_NUM_THREADS=1
+
 if [ -f ".env" ]; then
     set -a
     source ".env"
@@ -22,7 +27,9 @@ echo "          Starting Wan2GP in Cloud Mode (Modal GPU)         "
 echo "============================================================"
 
 # Choose best available Python interpreter
-if [ -f "$SCRIPT_DIR/.venv/bin/python" ]; then
+if [ -f "/root/venvs/wangp-cloud/bin/python" ]; then
+    PY_BIN="/root/venvs/wangp-cloud/bin/python"
+elif [ -f "$SCRIPT_DIR/.venv/bin/python" ]; then
     PY_BIN="$SCRIPT_DIR/.venv/bin/python"
 elif [ -f "$HOME/.wan2gp_venv/bin/python" ]; then
     PY_BIN="$HOME/.wan2gp_venv/bin/python"
@@ -65,10 +72,8 @@ if [[ "$*" =~ "runpod" ]] || [ "$PROV_CHECK" = "runpod" ]; then
     fi
 elif [ ! -f ".env" ] || ! grep -q "MODAL_ENDPOINT" ".env"; then
     echo ""
-    echo "[!] Cloud Modal is not set up yet on your device."
-    echo "[*] Launching the 1-click Modal setup wizard now..."
-    echo ""
-    "$PY_BIN" cloud/modal/setup_modal.py
+    echo "[!] Note: MODAL_ENDPOINT is not configured in .env yet."
+    echo "[*] Launching Wan2GP in Cloud Client Mode (Modal). You can run 'cloud/modal/setup_modal.py' anytime to deploy."
     echo ""
 fi
 

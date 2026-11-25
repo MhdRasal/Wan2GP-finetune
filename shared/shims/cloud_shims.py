@@ -130,6 +130,10 @@ class MockMeta(type):
         if name.startswith("__"):
             raise AttributeError(name)
         return lambda *args, **kwargs: cls()
+    def __getitem__(cls, item: Any) -> Any:
+        return 0
+    def __int__(cls) -> int:
+        return 0
 
 
 class MockClass(metaclass=MockMeta):
@@ -306,6 +310,8 @@ MOCK_HEAVY_PACKAGES = {
     "timm",
     "iopath",
     "decord",
+    "gguf",
+    "tokenizers",
     "insightface",
     "facexlib",
     "pycocotools",
