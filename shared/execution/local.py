@@ -78,12 +78,27 @@ class LocalExecutionAdapter(ExecutionAdapter):
 
         start_time = time.time()
         try:
-            # Execute existing pipeline
+            # Execute existing pipeline, ensuring required signature args are present and extra args filtered
+            import inspect
+            call_kwargs = {k: v for k, v in params.items() if k not in ("task", "send_cmd", "plugin_data")}
+            try:
+                sig = inspect.signature(generation_fn)
+                has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+                if not has_var_kw:
+                    call_kwargs = {k: v for k, v in call_kwargs.items() if k in sig.parameters}
+                for arg_name, param in sig.parameters.items():
+                    if arg_name not in ("task", "send_cmd", "plugin_data") and param.kind in (
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        inspect.Parameter.KEYWORD_ONLY,
+                    ) and arg_name not in call_kwargs and param.default is inspect.Parameter.empty:
+                        call_kwargs[arg_name] = None
+            except (TypeError, ValueError):
+                pass
             success = generation_fn(
                 task,
                 fn_send_cmd,
                 plugin_data=plugin_data,
-                **{k: v for k, v in params.items() if k not in ("task", "send_cmd", "plugin_data")},
+                **call_kwargs,
             )
 
             execution_time = time.time() - start_time

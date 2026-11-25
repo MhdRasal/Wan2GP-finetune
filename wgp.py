@@ -10175,14 +10175,15 @@ def _process_tasks(state):
                 try:
                     import inspect
                     model_type = params.get('model_type')
-                    if model_type and not _is_edit_task_params(params):
-                        default_settings = get_factory_settings(model_type)
-                        expected_args = set(inspect.signature(generate_media).parameters.keys())
-                        for arg_name in expected_args:
-                            if arg_name not in params and arg_name in default_settings:
+                    sig = inspect.signature(generate_media)
+                    expected_args = set(sig.parameters.keys())
+                    default_settings = get_factory_settings(model_type) if (model_type and not _is_edit_task_params(params)) else {}
+                    for arg_name, param in sig.parameters.items():
+                        if arg_name not in params:
+                            if arg_name in default_settings:
                                 params[arg_name] = default_settings[arg_name]
-                    else:
-                        expected_args = set(inspect.signature(generate_media).parameters.keys())
+                            elif param.default is inspect.Parameter.empty and arg_name not in ("task", "send_cmd", "plugin_data"):
+                                params[arg_name] = None
                     filtered_params = {k: v for k, v in params.items() if k in expected_args}
                     if _is_edit_task_params(params):
                         filtered_params.setdefault("model_type", "")
