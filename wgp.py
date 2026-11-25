@@ -54,6 +54,7 @@ if not IS_CLOUD_MODE:
     from shared.cuda_memory import apply_startup_settings, write_vram_debug_report, write_ram_debug_report, ram_debug_mark, release_ram_cache; apply_startup_settings(sys.argv, "wgp_config.json") # VRAM allocator and CUDA stack reserve, before anything initializes CUDA
 else:
     import torch
+    is_mps = False
     def write_vram_debug_report(*a, **k): pass
     def write_ram_debug_report(*a, **k): pass
     def ram_debug_mark(*a, **k): pass

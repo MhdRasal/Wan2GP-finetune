@@ -445,7 +445,8 @@ class ModalCloudProvider(BaseCloudProvider):
 
         try:
             fn_send_cmd("status", f"Modal SDK: Looking up function '{self.function_name}' in app '{self.app_name}'...")
-            remote_fn = modal.Function.lookup(self.app_name, self.function_name)
+            lookup_fn = getattr(modal.Function, "from_name", None) or getattr(modal.Function, "lookup")
+            remote_fn = lookup_fn(self.app_name, self.function_name)
 
             fn_send_cmd("status", "Modal SDK: Spawning remote cloud GPU execution...")
             fn_send_cmd("progress", [(1, 3), "Modal: Invoking remote worker..."])

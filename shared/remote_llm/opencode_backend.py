@@ -357,7 +357,6 @@ class OpenCodeBackend:
         body: dict[str, Any] = {
             "parts": [{"type": "text", "text": str(text or "")}],
             "system": self._system_text(system_prompt, tools),
-            "tools": {"*": False, f"{OPENCODE_MCP_SERVER}_*": True},  # OpenCode's own tools stay off, including the ones later versions add
         }
         if model := self._model():
             body["model"] = model
