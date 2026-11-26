@@ -35,7 +35,7 @@ from typing import Optional, Tuple, Dict, Any, List
 
 import modal
 from fastapi import FastAPI, Request, HTTPException, Query, Header
-from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, FileResponse, PlainTextResponse, StreamingResponse
 
 # ---------------------------------------------------------------------------
 # Configuration & Volumes
@@ -1596,8 +1596,28 @@ def download_file_endpoint(job_id: str, filename: str, x_api_key: Optional[str] 
     if not target_file.exists() or not target_file.is_file():
         raise HTTPException(status_code=404, detail=f"File {filename} not found for job {job_id}")
 
-    media_type = "application/json" if filename.endswith(".json") else "application/octet-stream"
-    return FileResponse(str(target_file), media_type=media_type, filename=filename)
+    media_type = "application/json" if filename.endswith(".json") else (
+        "video/mp4" if filename.endswith(".mp4") else "application/octet-stream"
+    )
+    file_size = target_file.stat().st_size
+
+    def _iter_chunks(path: Path, chunk_size: int = 2 * 1024 * 1024):
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                yield chunk
+
+    return StreamingResponse(
+        _iter_chunks(target_file),
+        media_type=media_type,
+        headers={
+            "Content-Length": str(file_size),
+            "Accept-Ranges": "bytes",
+            "Content-Disposition": f'attachment; filename="{filename}"',
+        },
+    )
 
 @web_app.get("/logs/{job_id}")
 def logs_endpoint(job_id: str, x_api_key: Optional[str] = Header(None), authorization: Optional[str] = Header(None)):

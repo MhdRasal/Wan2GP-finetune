@@ -95,6 +95,52 @@ class ModalCloudProvider(BaseCloudProvider):
             "  - Or run 'modal setup' on your system"
         )
 
+    def _resolve_endpoint_url(self) -> str:
+        """Auto-discover the deployed Modal FastAPI URL when MODAL_ENDPOINT is not set."""
+        if self.endpoint_url:
+            return self.endpoint_url
+        try:
+            import modal
+            candidates = []
+            for name in (self.app_name, "wan2gp-cloud", "wan2gp-prod3"):
+                if name and name not in candidates:
+                    candidates.append(name)
+            for app_name in candidates:
+                try:
+                    fn = modal.Function.from_name(app_name, "fastapi_app")
+                    web_url = fn.get_web_url()
+                    if web_url:
+                        self.endpoint_url = str(web_url).rstrip("/")
+                        self.app_name = app_name
+                        return self.endpoint_url
+                except Exception:
+                    continue
+        except ImportError:
+            pass
+        return ""
+
+    @staticmethod
+    def _stream_download_file(dl_url: str, dest_file: Path, headers: Dict[str, str], chunk_size: int = 2 * 1024 * 1024) -> None:
+        """Stream a remote file to disk in chunks to handle >16 MB videos without RAM spikes."""
+        dl_req = urllib.request.Request(dl_url, headers=headers, method="GET")
+        tmp_file = dest_file.with_name(f".{dest_file.name}.part")
+        try:
+            with urllib.request.urlopen(dl_req, timeout=300.0) as dl_resp:
+                with open(tmp_file, "wb") as f_out:
+                    while True:
+                        chunk = dl_resp.read(chunk_size)
+                        if not chunk:
+                            break
+                        f_out.write(chunk)
+            os.replace(tmp_file, dest_file)
+        except Exception:
+            if tmp_file.exists():
+                try:
+                    tmp_file.unlink()
+                except OSError:
+                    pass
+            raise
+
     def execute(
         self,
         request: GenerationRequest,
@@ -109,8 +155,8 @@ class ModalCloudProvider(BaseCloudProvider):
             fn_send_cmd("error", msg)
             return ExecutionResult(success=False, status="failed", task_id=request.task_id, error=msg)
 
-        # 1. Prefer HTTP Web Endpoint if configured
-        if self.endpoint_url:
+        # 1. Prefer HTTP Web Endpoint (auto-discovered from Modal app if MODAL_ENDPOINT is unset)
+        if self._resolve_endpoint_url():
             return self._execute_http(request, fn_send_cmd, start_time)
 
         # 2. Fallback to Modal SDK
@@ -129,6 +175,10 @@ class ModalCloudProvider(BaseCloudProvider):
         """
         fn_send_cmd = send_cmd if send_cmd is not None else (lambda cmd, data=None: None)
         start_time = time.time()
+        if not self._resolve_endpoint_url():
+            msg = f"Modal Cloud Provider endpoint not found.\n\n{self.get_configuration_help()}"
+            fn_send_cmd("error", msg)
+            return ExecutionResult(success=False, status="failed", error=msg)
         resolved_gpu = gpu_type or os.environ.get("MODAL_DEFAULT_GPU", "L40S")
         resolved_save = save_path or os.environ.get("WAN2GP_OUTPUT_DIR") or "outputs"
         return self._execute_http_payload(
@@ -238,11 +288,8 @@ class ModalCloudProvider(BaseCloudProvider):
                             continue
                         dest_file = out_dir / fname
                         dl_url = f"{self.endpoint_url}/download/{job_id}/{urllib.parse.quote(fname)}"
-                        dl_req = urllib.request.Request(dl_url, headers=headers, method="GET")
                         try:
-                            with urllib.request.urlopen(dl_req, timeout=120.0) as dl_resp:
-                                with open(dest_file, "wb") as f_out:
-                                    f_out.write(dl_resp.read())
+                            self._stream_download_file(dl_url, dest_file, headers)
                             resolved_str = str(dest_file.resolve())
                             downloaded_paths.append(resolved_str)
                             downloaded_fnames.add(fname)
@@ -304,11 +351,8 @@ class ModalCloudProvider(BaseCloudProvider):
                                 continue
                             dest_file = out_dir / fname
                             dl_url = f"{self.endpoint_url}/download/{job_id}/{urllib.parse.quote(fname)}"
-                            dl_req = urllib.request.Request(dl_url, headers=headers, method="GET")
                             try:
-                                with urllib.request.urlopen(dl_req, timeout=120.0) as dl_resp:
-                                    with open(dest_file, "wb") as f_out:
-                                        f_out.write(dl_resp.read())
+                                self._stream_download_file(dl_url, dest_file, headers)
                                 downloaded_paths.append(str(dest_file.resolve()))
                                 downloaded_fnames.add(fname)
                                 fn_send_cmd("output", str(dest_file.resolve()))

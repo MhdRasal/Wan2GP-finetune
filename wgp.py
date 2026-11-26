@@ -7623,20 +7623,25 @@ def exec_prompt_enhancer_engine(state, model_type, model_def, prompt_enhancer_mo
         return _deepy.run_assistant_prompt_turn(state, model_def, prompt_enhancer_modes, original_prompts, seed, override_profile=override_profile, send_cmd=send_cmd, tools=tools)
 
     if "W" in prompt_enhancer_modes:
-        from shared.prompt_enhancer.transcription import transcribe_source_audio
+        if IS_CLOUD_MODE:
+            prompt_enhancer_modes = prompt_enhancer_modes.replace("W", "")
+        else:
+            from shared.prompt_enhancer.transcription import transcribe_source_audio
 
-        wait_for_model_unload()
-        acquire_GPU_ressources(state, "prompt_enhancer_transcription", "Source Audio Transcription")
-        try:
-            transcription_gen = get_gen_info(state) if send_cmd is not None else progress.gen
-            enhancer_kwargs["source_audio_transcript"] = transcribe_source_audio(enhancer_kwargs["audio_guide"], gen=transcription_gen, report_status=lambda text: progress((0, 1), desc=text, total=1), duration_seconds=enhancer_kwargs["duration_seconds"] if model_def.get("prompt_enhancer_transcription_use_duration", False) else None)
-            if enhancer_kwargs["source_audio_transcript"] is None:
-                prompt_enhancer_modes = prompt_enhancer_modes.replace("W", "")
-        finally:
-            release_GPU_ressources(state, "prompt_enhancer_transcription")
+            wait_for_model_unload()
+            acquire_GPU_ressources(state, "prompt_enhancer_transcription", "Source Audio Transcription")
+            try:
+                transcription_gen = get_gen_info(state) if send_cmd is not None else progress.gen
+                enhancer_kwargs["source_audio_transcript"] = transcribe_source_audio(enhancer_kwargs["audio_guide"], gen=transcription_gen, report_status=lambda text: progress((0, 1), desc=text, total=1), duration_seconds=enhancer_kwargs["duration_seconds"] if model_def.get("prompt_enhancer_transcription_use_duration", False) else None)
+                if enhancer_kwargs["source_audio_transcript"] is None:
+                    prompt_enhancer_modes = prompt_enhancer_modes.replace("W", "")
+            finally:
+                release_GPU_ressources(state, "prompt_enhancer_transcription")
 
     local_runtime = not is_remote_engine(resolve_role_engine(server_config, "prompt_enhancer"))
     if local_runtime:
+        if IS_CLOUD_MODE:
+            raise gr.Error("Local Prompt Enhancer requires a local GPU. Switch Prompt Enhancer to 'Same as Deepy' or a remote LLM in Settings.")
         wait_for_model_unload()
         acquire_GPU_ressources(state, "prompt_enhancer", "Prompt Enhancer", parks=True)
         try:
@@ -11373,6 +11378,8 @@ def mesh_to_custom_guide(state, input_file_list, choice, video_prompt_type, audi
 def explore_world_outside_queue(state, model_type, world_path):
     """An exploration started while a generation runs: it takes the GPU (the generation pauses at its next step, its models unloaded from
     VRAM) instead of waiting in the queue. The paused generation's own model serves it when it is the world's model."""
+    if IS_CLOUD_MODE:
+        raise gr.Error("Interactive World Exploration requires a local GPU and is not available in Cloud Client mode. Use the generation queue to generate worlds on the cloud.")
     from shared.attention import attention_shared_state
     acquire_GPU_ressources(state, "world_exploration", "World Exploration", gr=gr)
     explore_offloadobj = None
